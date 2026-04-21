@@ -131,14 +131,14 @@ const scenarioSpecs: ReplayScenarioSpec[] = [
     name: "open-balanced-entry",
     note: "Opening phase, empty inventory, pair-seed taker buys should open both sides quickly.",
     offsetSec: 15,
-    books: { upBid: 0.48, upAsk: 0.49, downBid: 0.48, downAsk: 0.49 },
+    books: { upBid: 0.47, upAsk: 0.48, downBid: 0.47, downAsk: 0.48 },
     inventory: { upShares: 0, upAvg: 0, downShares: 0, downAvg: 0 },
   },
   {
     name: "mid-balanced-entry",
     note: "Mid-window balanced books should still allow another pair-buy rung.",
     offsetSec: 120,
-    books: { upBid: 0.47, upAsk: 0.48, downBid: 0.48, downAsk: 0.49 },
+    books: { upBid: 0.46, upAsk: 0.47, downBid: 0.47, downAsk: 0.48 },
     inventory: { upShares: 0, upAvg: 0, downShares: 0, downAvg: 0 },
   },
   {
@@ -159,7 +159,7 @@ const scenarioSpecs: ReplayScenarioSpec[] = [
     name: "expensive-completion-blocked",
     note: "Completion should be rejected because fee-inclusive pair cost exceeds cap.",
     offsetSec: 245,
-    books: { upBid: 0.45, upAsk: 0.46, downBid: 0.54, downAsk: 0.55 },
+    books: { upBid: 0.45, upAsk: 0.46, downBid: 0.58, downAsk: 0.59 },
     inventory: { upShares: 60, upAvg: 0.46, downShares: 0, downAvg: 0 },
   },
   {
@@ -173,7 +173,7 @@ const scenarioSpecs: ReplayScenarioSpec[] = [
     name: "late-residual-hold",
     note: "When completion is too expensive late in the window, buy-only mode should avoid SELL unwind and carry only the residual.",
     offsetSec: 286,
-    books: { upBid: 0.43, upAsk: 0.44, downBid: 0.54, downAsk: 0.55 },
+    books: { upBid: 0.43, upAsk: 0.44, downBid: 0.58, downAsk: 0.59 },
     inventory: { upShares: 60, upAvg: 0.46, downShares: 0, downAvg: 0 },
   },
   {

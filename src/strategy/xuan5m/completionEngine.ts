@@ -3,6 +3,7 @@ import type { MarketOrderArgs, OutcomeSide } from "../../infra/clob/types.js";
 import { averageCost } from "./inventoryState.js";
 import type { XuanMarketState } from "./marketState.js";
 import { OrderBookState } from "./orderBookState.js";
+import { completionAllowance } from "./modePolicy.js";
 import { completionCost } from "./sumAvgEngine.js";
 
 export interface CompletionDecision {
@@ -11,6 +12,8 @@ export interface CompletionDecision {
   residualAfter: number;
   order: MarketOrderArgs;
   costWithFees: number;
+  capMode: "strict" | "soft" | "emergency";
+  negativeEdgeUsdc: number;
 }
 
 export interface UnwindDecision {
@@ -75,7 +78,8 @@ function chooseCompletion(
     }
 
     const costWithFees = completionCost(existingAverage, execution.averagePrice, config.cryptoTakerFeeRate);
-    if (costWithFees > config.completionCap) {
+    const allowance = completionAllowance(config, state, costWithFees, candidateSize);
+    if (!allowance.allowed) {
       continue;
     }
 
@@ -84,6 +88,8 @@ function chooseCompletion(
       missingShares: candidateSize,
       residualAfter: normalizeSize(Math.max(0, missingShares - candidateSize)),
       costWithFees,
+      capMode: allowance.capMode,
+      negativeEdgeUsdc: allowance.negativeEdgeUsdc,
       order: {
         tokenId: state.market.tokens[sideToBuy].tokenId,
         side: "BUY",

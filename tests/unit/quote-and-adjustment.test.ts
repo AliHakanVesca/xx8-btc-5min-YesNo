@@ -112,8 +112,8 @@ describe("entry and inventory adjustment", () => {
     const state = createMarketState(market);
     const bot = new Xuan5mBot();
     const books = new OrderBookState(
-      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.48, size: 200 }], [{ price: 0.49, size: 200 }]),
-      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.48, size: 200 }], [{ price: 0.49, size: 200 }]),
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.47, size: 200 }], [{ price: 0.48, size: 200 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.47, size: 200 }], [{ price: 0.48, size: 200 }]),
     );
 
     const decision = bot.evaluateTick({
@@ -150,7 +150,7 @@ describe("entry and inventory adjustment", () => {
         LOT_LADDER: "20,40,60,80,100",
         LIVE_SMALL_LOTS: "20,40",
         DEFAULT_LOT: "40",
-        ENTRY_TAKER_PAIR_CAP: "1.01",
+        NORMAL_PAIR_EFFECTIVE_CAP: "1.01",
       }),
     );
     const books = new OrderBookState(
@@ -203,7 +203,7 @@ describe("entry and inventory adjustment", () => {
         [{ price: 0.48, size: 200 }],
         [
           { price: 0.49, size: 30 },
-          { price: 0.54, size: 60 },
+          { price: 0.64, size: 60 },
         ],
       ),
     );
@@ -226,7 +226,7 @@ describe("entry and inventory adjustment", () => {
 
     const books = new OrderBookState(
       buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.43, size: 80 }], [{ price: 0.44, size: 80 }]),
-      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.54, size: 80 }], [{ price: 0.55, size: 80 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.58, size: 80 }], [{ price: 0.59, size: 80 }]),
     );
 
     const adjustment = chooseInventoryAdjustment(config, state, books, { secsToClose: 12 });
@@ -249,7 +249,7 @@ describe("entry and inventory adjustment", () => {
 
     const books = new OrderBookState(
       buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.43, size: 80 }], [{ price: 0.44, size: 80 }]),
-      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.54, size: 80 }], [{ price: 0.55, size: 80 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.58, size: 80 }], [{ price: 0.59, size: 80 }]),
     );
 
     const adjustment = chooseInventoryAdjustment(sellUnwindConfig, state, books, { secsToClose: 12 });

@@ -13,18 +13,29 @@ import { CtfClient } from "../infra/ctf/ctfClient.js";
 import { createLogger, writeStructuredLog } from "../observability/logger.js";
 import { renderDashboard } from "../observability/dashboard.js";
 import { OrderManager } from "../execution/orderManager.js";
+import {
+  applyPairOrderType,
+  createPairOrderGroup,
+  finalizePairExecutionResult,
+  resolvePairOrderGroupStatus,
+  type PairExecutionResult,
+  type PairOrderGroup,
+  type PairOrderGroupStatus,
+} from "../execution/pairOrderGroup.js";
 import { TakerCompletionManager } from "../execution/takerCompletionManager.js";
 import { Xuan5mBot } from "../strategy/xuan5m/Xuan5mBot.js";
 import { OrderBookState } from "../strategy/xuan5m/orderBookState.js";
 import { createMarketState, type FillRecord, type XuanMarketState } from "../strategy/xuan5m/marketState.js";
 import { applyFill, applyMerge, averageCost } from "../strategy/xuan5m/inventoryState.js";
 import { planMerge } from "../strategy/xuan5m/mergeCoordinator.js";
+import { estimateNegativeEdgeUsdc } from "../strategy/xuan5m/modePolicy.js";
 
 export interface BotSessionOptions {
   durationSec?: number;
   tickMs?: number;
   initialBookWaitMs?: number;
   balanceSyncMs?: number;
+  marketSelection?: "auto" | "current" | "next";
 }
 
 export interface ObservedTokenBalances {
@@ -79,6 +90,8 @@ export interface BotSessionReport {
     balanceSyncCount: number;
     balanceCorrectionCount: number;
     entrySubmitCount: number;
+    pairGroupCount: number;
+    partialLegCount: number;
     completionSubmitCount: number;
     unwindSubmitCount: number;
     mergeCount: number;
@@ -91,10 +104,20 @@ export interface BotSessionReport {
     downAverage: number;
     fillCount: number;
     mergeCount: number;
+    negativeEdgeConsumedUsdc: number;
   };
   finalDecision: ReturnType<Xuan5mBot["evaluateTick"]>;
   dashboard: string;
   events: Array<Record<string, unknown>>;
+}
+
+interface PendingPairExecution {
+  group: PairOrderGroup;
+  upResult: PairExecutionResult["upResult"];
+  downResult: PairExecutionResult["downResult"];
+  negativeEdgeUsdc: number;
+  deadlineAt: number;
+  status: PairOrderGroupStatus;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -329,6 +352,30 @@ function buildBooks(client: MarketWsClient, market: MarketInfo): OrderBookState 
   return new OrderBookState(client.getBook(market.tokens.UP.tokenId), client.getBook(market.tokens.DOWN.tokenId));
 }
 
+function reserveNegativeEdgeBudget(state: XuanMarketState, negativeEdgeUsdc: number): XuanMarketState {
+  if (negativeEdgeUsdc <= 0) {
+    return state;
+  }
+  return {
+    ...state,
+    negativeEdgeConsumedUsdc: Number((state.negativeEdgeConsumedUsdc + negativeEdgeUsdc).toFixed(6)),
+  };
+}
+
+function resolveActivePairExecution(
+  pending: PendingPairExecution | undefined,
+  state: XuanMarketState,
+): PendingPairExecution | undefined {
+  if (!pending) {
+    return undefined;
+  }
+  const status = resolvePairOrderGroupStatus(pending.group, state);
+  return {
+    ...pending,
+    status,
+  };
+}
+
 export async function runStatefulBotSession(
   env: AppEnv,
   options: BotSessionOptions = {},
@@ -342,6 +389,7 @@ export async function runStatefulBotSession(
     tickMs: Math.max(250, Math.floor(options.tickMs ?? 1000)),
     initialBookWaitMs: Math.max(1000, Math.floor(options.initialBookWaitMs ?? 8000)),
     balanceSyncMs: Math.max(1000, Math.floor(options.balanceSyncMs ?? 5000)),
+    marketSelection: options.marketSelection ?? "auto",
   };
 
   const logger = createLogger(env);
@@ -359,7 +407,12 @@ export async function runStatefulBotSession(
   const startedAt = clock.now();
 
   const discovery = await discoverCurrentAndNextMarkets({ env, gammaClient: gamma, clob, clock });
-  const selected = pickSessionMarket(discovery, startedAt, config.normalEntryCutoffSecToClose);
+  const selected =
+    resolvedOptions.marketSelection === "current"
+      ? { selection: "current" as const, market: discovery.current }
+      : resolvedOptions.marketSelection === "next"
+        ? { selection: "next" as const, market: discovery.next }
+        : pickSessionMarket(discovery, startedAt, config.normalEntryCutoffSecToClose);
   const market = selected.market;
   let state = createMarketState(market);
   let cachedUsdcBalance = (await readCollateralBalanceUsdc(env)) ?? Math.max(config.minUsdcBalance, 100);
@@ -370,6 +423,8 @@ export async function runStatefulBotSession(
   let balanceSyncCount = 0;
   let balanceCorrectionCount = 0;
   let entrySubmitCount = 0;
+  let pairGroupCount = 0;
+  let partialLegCount = 0;
   let completionSubmitCount = 0;
   let unwindSubmitCount = 0;
   let mergeCount = 0;
@@ -377,6 +432,7 @@ export async function runStatefulBotSession(
   const submittedPrices: Partial<Record<OutcomeSide, SubmittedIntent>> = {};
   const seenTradeIds = new Set<string>();
   const events: Array<Record<string, unknown>> = [];
+  let pendingPairExecution: PendingPairExecution | undefined;
 
   marketWs.connect([market.tokens.UP.tokenId, market.tokens.DOWN.tokenId]);
   userWs.connect([market.conditionId]);
@@ -507,7 +563,42 @@ export async function runStatefulBotSession(
         }
       }
 
-      if (Date.now() >= actionCooldownUntil) {
+      pendingPairExecution = resolveActivePairExecution(pendingPairExecution, state);
+      if (pendingPairExecution) {
+        const deadlinePassed = Date.now() >= pendingPairExecution.deadlineAt;
+        const finalized =
+          pendingPairExecution.status !== "PENDING" || deadlinePassed
+            ? finalizePairExecutionResult({
+                group: pendingPairExecution.group,
+                upResult: pendingPairExecution.upResult,
+                downResult: pendingPairExecution.downResult,
+                state,
+              })
+            : undefined;
+
+        if (finalized) {
+          if (finalized.status === "BOTH_FILLED") {
+            state = reserveNegativeEdgeBudget(state, pendingPairExecution.negativeEdgeUsdc);
+          }
+          if (finalized.status === "UP_ONLY" || finalized.status === "DOWN_ONLY") {
+            partialLegCount += 1;
+          }
+          pushEvent(events, {
+            timestamp: nowTs,
+            type: "pair_group_finalized",
+            groupId: finalized.group.groupId,
+            status: finalized.status,
+            intendedQty: finalized.group.intendedQty,
+            negativeEdgeUsdc:
+              finalized.status === "BOTH_FILLED" ? pendingPairExecution.negativeEdgeUsdc : 0,
+            upResult: pendingPairExecution.upResult,
+            downResult: pendingPairExecution.downResult,
+          });
+          pendingPairExecution = undefined;
+        }
+      }
+
+      if (!pendingPairExecution && Date.now() >= actionCooldownUntil) {
         const mergePlan = planMerge(config, state);
         if (mergePlan.shouldMerge && mergePlan.mergeable > 0) {
           const mergeResult = env.CTF_MERGE_ENABLED
@@ -562,23 +653,92 @@ export async function runStatefulBotSession(
         continue;
       }
 
+      if (pendingPairExecution && decision.entryBuys.length > 1) {
+        await sleep(resolvedOptions.tickMs);
+        continue;
+      }
+
       if (decision.entryBuys.length > 0) {
         const submittedAt = Date.now();
-        const results = await Promise.all(decision.entryBuys.map((entryBuy) => completionManager.execute(entryBuy.order)));
-        rememberSubmittedPrices(submittedPrices, market, decision.entryBuys.map((entryBuy) => entryBuy.order), submittedAt);
-        entrySubmitCount += decision.entryBuys.length;
-        actionCooldownUntil = Date.now() + config.reentryDelayMs;
-        pushEvent(events, {
-          timestamp: nowTs,
-          type: "entry_submit",
-          orders: decision.entryBuys.map((entryBuy, index) => ({
-            side: entryBuy.side,
-            size: entryBuy.size,
-            price: entryBuy.order.price,
-            reason: entryBuy.reason,
-            result: results[index],
-          })),
-        });
+        if (decision.entryBuys.length === 2) {
+          const upEntry = decision.entryBuys.find((entryBuy) => entryBuy.side === "UP");
+          const downEntry = decision.entryBuys.find((entryBuy) => entryBuy.side === "DOWN");
+          if (!upEntry || !downEntry) {
+            throw new Error("Balanced pair entry expected both UP and DOWN legs.");
+          }
+
+          const group = createPairOrderGroup({
+            conditionId: market.conditionId,
+            marketSlug: market.slug,
+            upTokenId: market.tokens.UP.tokenId,
+            downTokenId: market.tokens.DOWN.tokenId,
+            intendedQty: Math.min(upEntry.size, downEntry.size),
+            maxUpPrice: upEntry.order.price,
+            maxDownPrice: downEntry.order.price,
+            mode: config.botMode,
+            createdAt: submittedAt,
+            state,
+          });
+          const groupedEntries = applyPairOrderType(decision.entryBuys, group);
+          const [upResult, downResult] = await Promise.all(
+            groupedEntries.map((entryBuy) => completionManager.execute(entryBuy.order)),
+          );
+
+          rememberSubmittedPrices(
+            submittedPrices,
+            market,
+            groupedEntries.map((entryBuy) => entryBuy.order),
+            submittedAt,
+          );
+          const negativeEdgeUsdc = estimateNegativeEdgeUsdc(upEntry.pairCostWithFees ?? 1, group.intendedQty);
+          pairGroupCount += 1;
+          entrySubmitCount += groupedEntries.length;
+          actionCooldownUntil = Date.now() + config.reentryDelayMs;
+          pendingPairExecution = {
+            group,
+            upResult,
+            downResult,
+            negativeEdgeUsdc,
+            deadlineAt: Date.now() + Math.max(config.reentryDelayMs * 3, 3000),
+            status: "PENDING",
+          };
+          pushEvent(events, {
+            timestamp: nowTs,
+            type: "pair_group_submit",
+            groupId: group.groupId,
+            orderType: group.orderType,
+            intendedQty: group.intendedQty,
+            maxUpPrice: group.maxUpPrice,
+            maxDownPrice: group.maxDownPrice,
+            pairCostWithFees: upEntry.pairCostWithFees,
+            negativeEdgeUsdc,
+            upResult,
+            downResult,
+          });
+        } else {
+          const entryBuy = decision.entryBuys[0];
+          if (!entryBuy) {
+            throw new Error("Expected a single entry buy decision.");
+          }
+          const result = await completionManager.execute(entryBuy.order);
+          rememberSubmittedPrices(submittedPrices, market, [entryBuy.order], submittedAt);
+          state = reserveNegativeEdgeBudget(state, entryBuy.negativeEdgeUsdc ?? 0);
+          entrySubmitCount += 1;
+          actionCooldownUntil = Date.now() + config.reentryDelayMs;
+          pushEvent(events, {
+            timestamp: nowTs,
+            type: "entry_submit",
+            orders: [
+              {
+                side: entryBuy.side,
+                size: entryBuy.size,
+                price: entryBuy.order.price,
+                reason: entryBuy.reason,
+                result,
+              },
+            ],
+          });
+        }
         await sleep(resolvedOptions.tickMs);
         continue;
       }
@@ -586,6 +746,7 @@ export async function runStatefulBotSession(
       if (decision.completion) {
         const result = await completionManager.complete(decision.completion.order);
         rememberSubmittedPrices(submittedPrices, market, [decision.completion.order], Date.now());
+        state = reserveNegativeEdgeBudget(state, decision.completion.negativeEdgeUsdc);
         completionSubmitCount += 1;
         actionCooldownUntil = Date.now() + config.reentryDelayMs;
         pushEvent(events, {
@@ -595,6 +756,8 @@ export async function runStatefulBotSession(
           size: decision.completion.missingShares,
           price: decision.completion.order.price,
           costWithFees: decision.completion.costWithFees,
+          capMode: decision.completion.capMode,
+          negativeEdgeUsdc: decision.completion.negativeEdgeUsdc,
           result,
         });
         await sleep(resolvedOptions.tickMs);
@@ -672,6 +835,8 @@ export async function runStatefulBotSession(
       balanceSyncCount,
       balanceCorrectionCount,
       entrySubmitCount,
+      pairGroupCount,
+      partialLegCount,
       completionSubmitCount,
       unwindSubmitCount,
       mergeCount,
@@ -684,6 +849,7 @@ export async function runStatefulBotSession(
       downAverage: averageCost(state, "DOWN"),
       fillCount: state.fillHistory.length,
       mergeCount: state.mergeHistory.length,
+      negativeEdgeConsumedUsdc: state.negativeEdgeConsumedUsdc,
     },
     finalDecision,
     dashboard: renderDashboard(state, finalDecision, endedAt),

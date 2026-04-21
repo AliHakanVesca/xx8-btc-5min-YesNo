@@ -4,6 +4,7 @@ import type { MarketOrderArgs, OutcomeSide } from "../../infra/clob/types.js";
 import { pairCostWithBothTaker, completionCost, takerFeePerShare } from "./sumAvgEngine.js";
 import { averageCost } from "./inventoryState.js";
 import type { XuanMarketState } from "./marketState.js";
+import { completionAllowance, pairEntryCap } from "./modePolicy.js";
 import { OrderBookState } from "./orderBookState.js";
 
 export type EntryBuyReason = "balanced_pair_seed" | "balanced_pair_reentry" | "lagging_rebalance";
@@ -14,6 +15,7 @@ export interface EntryBuyDecision {
   reason: EntryBuyReason;
   expectedAveragePrice: number;
   effectivePricePerShare: number;
+  negativeEdgeUsdc?: number | undefined;
   pairCostWithFees?: number | undefined;
   order: MarketOrderArgs;
 }
@@ -80,7 +82,8 @@ export function chooseEntryBuys(
           execution.averagePrice,
           config.cryptoTakerFeeRate,
         );
-        if (repairCost <= config.entryTakerPairCap) {
+        const allowance = completionAllowance(config, state, repairCost, executableSize);
+        if (allowance.allowed) {
           return [
             buildEntryBuy(
               state,
@@ -94,6 +97,7 @@ export function chooseEntryBuys(
               "lagging_rebalance",
               config.cryptoTakerFeeRate,
               repairCost,
+              allowance.negativeEdgeUsdc,
             ),
           ];
         }
@@ -125,6 +129,7 @@ function findBalancedPairCandidate(
 
   const requestedSizes = buildCandidateSizes(config.lotLadder, maxCandidateSize, state.market.minOrderSize);
   let bestCandidate: BalancedPairCandidate | undefined;
+  const cap = pairEntryCap(config);
 
   for (const requestedSize of requestedSizes) {
     const upExecution = books.quoteForSize("UP", "ask", requestedSize);
@@ -138,7 +143,7 @@ function findBalancedPairCandidate(
       downExecution.averagePrice,
       config.cryptoTakerFeeRate,
     );
-    if (pairCost > config.entryTakerPairCap) {
+    if (pairCost > cap) {
       continue;
     }
 
@@ -187,6 +192,7 @@ function buildEntryBuy(
   reason: EntryBuyReason,
   feeRate: number,
   pairCost?: number,
+  negativeEdgeUsdc?: number,
 ): EntryBuyDecision {
   return {
     side,
@@ -194,6 +200,7 @@ function buildEntryBuy(
     reason,
     expectedAveragePrice: execution.averagePrice,
     effectivePricePerShare: execution.averagePrice + takerFeePerShare(execution.averagePrice, feeRate),
+    ...(negativeEdgeUsdc !== undefined ? { negativeEdgeUsdc } : {}),
     ...(pairCost !== undefined ? { pairCostWithFees: pairCost } : {}),
     order: {
       tokenId: state.market.tokens[side].tokenId,

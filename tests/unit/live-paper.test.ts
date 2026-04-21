@@ -28,8 +28,8 @@ describe("live paper analytics", () => {
       env,
       market,
       nowTs,
-      upBook: buildBook(market.tokens.UP.tokenId, market.conditionId, 0.48, 0.49, nowTs),
-      downBook: buildBook(market.tokens.DOWN.tokenId, market.conditionId, 0.48, 0.49, nowTs),
+      upBook: buildBook(market.tokens.UP.tokenId, market.conditionId, 0.47, 0.48, nowTs),
+      downBook: buildBook(market.tokens.DOWN.tokenId, market.conditionId, 0.47, 0.48, nowTs),
     });
 
     expect(sample.hasBooks).toBe(true);
@@ -38,9 +38,9 @@ describe("live paper analytics", () => {
     expect(sample.balancedPairEntryCount).toBe(2);
     expect(sample.laggingRebalanceCount).toBe(0);
     expect(sample.buyShares).toBe(40);
-    expect(sample.buyNotional).toBeCloseTo(19.6, 8);
+    expect(sample.buyNotional).toBeCloseTo(19.2, 8);
     expect(sample.mergeShares).toBe(20);
-    expect(sample.pairTakerCost).toBeGreaterThan(1);
+    expect(sample.pairTakerCost).toBeLessThan(1);
   });
 
   it("summarizes live paper samples", () => {
@@ -59,7 +59,7 @@ describe("live paper analytics", () => {
           balancedPairEntryCount: 2,
           laggingRebalanceCount: 0,
           buyShares: 40,
-          buyNotional: 19.6,
+          buyNotional: 19.2,
           hasCompletion: false,
           hasUnwind: false,
           mergeShares: 20,
@@ -67,9 +67,9 @@ describe("live paper analytics", () => {
           completionOnly: false,
           hardCancel: false,
           riskReasons: [],
-          pairAskSum: 0.98,
-          pairTakerCost: 1.0159856,
-          pairEdge: -0.0159856,
+          pairAskSum: 0.96,
+          pairTakerCost: 0.9959424,
+          pairEdge: 0.0040576,
         },
         {
           timestamp: 1713696015,
@@ -105,9 +105,9 @@ describe("live paper analytics", () => {
       completionOnlyCount: 1,
       hardCancelCount: 1,
       averageBuyShares: 20,
-      averageBuyNotional: 9.8,
+      averageBuyNotional: 9.6,
     });
-    expect(summary.bestPairEdge).toBeCloseTo(-0.0159856, 8);
+    expect(summary.bestPairEdge).toBeCloseTo(0.0040576, 8);
     expect(summary.worstPairEdge).toBeCloseTo(-0.036, 8);
   });
 });

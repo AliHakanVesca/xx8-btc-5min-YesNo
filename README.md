@@ -90,7 +90,7 @@ npm test
 
 `npm run capture -- --duration-sec 75` current+next BTC 5m marketleri icin capture-only oturum calistirir. Emir gondermez; raw market/user websocket payload'larini, token mapping'i ve ERC1155 balance snapshotlarini `data/capture/...` altina yazar ve validation raporu uretir.
 
-`npm run bot:live` stateful live session calistirir. Gercek orderbook, user websocket ve on-chain balance reconcile ile inventory state tasir; guvenlik icin `DRY_RUN=false` olmadan calismaz. Bu akış henuz continuous daemon/market rollover degildir; tek market-session odaklidir.
+`npm run bot:live` varsayilan olarak continuous rollover daemon calistirir. Her markette gercek orderbook, user websocket ve on-chain balance reconcile ile inventory state tasir; guvenlik icin `DRY_RUN=false` olmadan calismaz. `--max-markets 1` tek market canary/smoke icin kullanilir.
 
 `npm run analyze:xuan` once `data/xuanxuan008_data_20260415_145447.json` yolunu dener. Dosya yoksa bundled fixture ile devam eder ve bunu loglar.
 
@@ -133,7 +133,7 @@ Onerilen rollout:
 8. mumkunse authenticated/private Polygon RPC kullan; public RPC ilk testte calisabilir ama stale read / rate limit riski tasir
 9. ancak ondan sonra `DRY_RUN=false`
 10. once `npm run capture -- --duration-sec 75` ile raw ws/balance capture al
-11. sonra `npm run bot:live` ile kucuk canary calistir
+11. sonra `npm run bot:live -- --max-markets 1 --duration-sec 600` ile kucuk canary calistir
 12. ghost fill, stale book, merge fail ve stuck market oranlari log ile dogrulanmadan buyuk lot acma
 
 ## Guvenlik

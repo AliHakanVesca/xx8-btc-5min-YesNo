@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Behavioral-clone oriented Polymarket BTC 5m Up/Down maker/arbitrage bot skeleton.",
+  "description": "Behavioral-clone oriented Polymarket BTC 5m Up/Down taker pair accumulator bot skeleton.",
   "engines": {
     "node": ">=22.0.0"
   },

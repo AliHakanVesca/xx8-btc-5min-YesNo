@@ -29,7 +29,7 @@ describe("multi synthetic replay", () => {
       totalUnwindShares: 0,
       totalMergeShares: 500,
     });
-    expect(report.summary.totalEntryBuyNotional).toBeCloseTo(145.8, 8);
+    expect(report.summary.totalEntryBuyNotional).toBeCloseTo(144.2, 8);
 
     const firstSlug = report.scenarios[0]?.marketSlug ?? "";
     const windowStartTs = Number(firstSlug.split("-").at(-1));

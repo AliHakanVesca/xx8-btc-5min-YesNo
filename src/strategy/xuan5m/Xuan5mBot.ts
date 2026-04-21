@@ -11,6 +11,7 @@ import {
 import { chooseEntryBuys, type EntryBuyDecision } from "./entryLadderEngine.js";
 import type { XuanMarketState } from "./marketState.js";
 import { OrderBookState } from "./orderBookState.js";
+import { pairEntryCap } from "./modePolicy.js";
 import { pairCostWithBothTaker } from "./sumAvgEngine.js";
 
 export interface BotDecision {
@@ -43,6 +44,7 @@ export class Xuan5mBot {
       books.bestAsk("DOWN"),
       config.cryptoTakerFeeRate,
     );
+    const pairCap = pairEntryCap(config);
     const inventoryBalanced = Math.abs(state.upShares - state.downShares) <= state.market.minOrderSize;
 
     const lot = chooseLot(config, {
@@ -54,8 +56,8 @@ export class Xuan5mBot {
           books.depthAtOrBetter("UP", books.bestAsk("UP"), "ask"),
           books.depthAtOrBetter("DOWN", books.bestAsk("DOWN"), "ask"),
         ) >= config.defaultLot,
-      pairCostWithinCap: pairTakerCost <= config.entryTakerPairCap,
-      pairCostComfortable: pairTakerCost <= config.entryTakerPairCap - config.minEdgePerShare,
+      pairCostWithinCap: pairTakerCost <= pairCap,
+      pairCostComfortable: pairTakerCost <= pairCap - config.minEdgePerShare,
       inventoryBalanced,
       recentBothSidesFilled: state.fillHistory.some((fill) => fill.outcome === "UP") && state.fillHistory.some((fill) => fill.outcome === "DOWN"),
       marketVolumeHigh: true,

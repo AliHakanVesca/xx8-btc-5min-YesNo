@@ -23,7 +23,7 @@ import { TakerCompletionManager } from "./execution/takerCompletionManager.js";
 import { CtfClient } from "./infra/ctf/ctfClient.js";
 import { renderDashboard } from "./observability/dashboard.js";
 import { runLiveCheck } from "./live/liveCheck.js";
-import { runStatefulBotSession } from "./live/statefulBotSession.js";
+import { runContinuousBotDaemon } from "./live/continuousBotDaemon.js";
 import { runCaptureSession } from "./live/captureSession.js";
 
 async function fileExists(path: string): Promise<boolean> {
@@ -342,17 +342,21 @@ async function runBotLive(options: {
   tickMs: number;
   initialBookWaitMs: number;
   balanceSyncMs: number;
+  maxMarkets: number;
+  interSessionPauseMs: number;
 }): Promise<void> {
   const env = loadEnv();
   if (env.DRY_RUN) {
     throw new Error("bot:live icin once DRY_RUN=false yap.");
   }
 
-  const report = await runStatefulBotSession(env, {
+  const report = await runContinuousBotDaemon(env, {
     durationSec: options.durationSec,
     tickMs: options.tickMs,
     initialBookWaitMs: options.initialBookWaitMs,
     balanceSyncMs: options.balanceSyncMs,
+    maxMarkets: options.maxMarkets,
+    interSessionPauseMs: options.interSessionPauseMs,
   });
   console.log(JSON.stringify(report, null, 2));
 }
@@ -406,22 +410,28 @@ export async function runCli(argv = process.argv): Promise<void> {
   program.command("bot:dry").action(async () => runBotDry());
   program
     .command("bot:live")
-    .option("--duration-sec <n>", "Run the live market session for N seconds", "240")
+    .option("--duration-sec <n>", "Run each live market session for at most N seconds", "600")
     .option("--tick-ms <n>", "Decision loop interval in milliseconds", "1000")
     .option("--initial-book-wait-ms <n>", "How long to wait for initial orderbooks", "8000")
     .option("--balance-sync-ms <n>", "How often to reconcile ERC1155 balances", "5000")
+    .option("--max-markets <n>", "Stop after N markets; 0 keeps the daemon running", "0")
+    .option("--inter-session-pause-ms <n>", "Pause between finished markets before rollover", "1500")
     .action(
       async (options: {
         durationSec: string;
         tickMs: string;
         initialBookWaitMs: string;
         balanceSyncMs: string;
+        maxMarkets: string;
+        interSessionPauseMs: string;
       }) =>
         runBotLive({
           durationSec: Number(options.durationSec),
           tickMs: Number(options.tickMs),
           initialBookWaitMs: Number(options.initialBookWaitMs),
           balanceSyncMs: Number(options.balanceSyncMs),
+          maxMarkets: Number(options.maxMarkets),
+          interSessionPauseMs: Number(options.interSessionPauseMs),
         }),
     );
 

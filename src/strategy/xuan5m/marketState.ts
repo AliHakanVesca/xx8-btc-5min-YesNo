@@ -25,6 +25,7 @@ export interface XuanMarketState {
   fillHistory: FillRecord[];
   mergeHistory: MergeRecord[];
   cycleNo: number;
+  negativeEdgeConsumedUsdc: number;
   lastFilledSide?: OutcomeSide;
   stuckSide?: OutcomeSide;
   reentryDisabled: boolean;
@@ -41,6 +42,7 @@ export function createMarketState(market: MarketInfo): XuanMarketState {
     fillHistory: [],
     mergeHistory: [],
     cycleNo: 0,
+    negativeEdgeConsumedUsdc: 0,
     reentryDisabled: false,
   };
 }

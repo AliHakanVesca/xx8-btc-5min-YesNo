@@ -128,8 +128,8 @@ function recommendedCanaryEnv(): Record<string, string> {
   return {
     DRY_RUN: "false",
     CTF_MERGE_ENABLED: "true",
-    LIVE_SMALL_LOTS: "30",
-    DEFAULT_LOT: "30",
+    LIVE_SMALL_LOTS: "20",
+    DEFAULT_LOT: "20",
     MAX_MARKET_SHARES_PER_SIDE: "60",
     MAX_ONE_SIDED_EXPOSURE_SHARES: "30",
     MAX_CYCLES_PER_MARKET: "2",

@@ -35,11 +35,11 @@ describe("live paper analytics", () => {
     expect(sample.hasBooks).toBe(true);
     expect(sample.allowNewEntries).toBe(true);
     expect(sample.entryBuyCount).toBe(2);
-    expect(sample.makerOrderCount).toBe(0);
-    expect(sample.buyShares).toBe(60);
-    expect(sample.buyNotional).toBeCloseTo(29.4, 8);
-    expect(sample.quotedShares).toBe(0);
-    expect(sample.mergeShares).toBe(30);
+    expect(sample.balancedPairEntryCount).toBe(2);
+    expect(sample.laggingRebalanceCount).toBe(0);
+    expect(sample.buyShares).toBe(40);
+    expect(sample.buyNotional).toBeCloseTo(19.6, 8);
+    expect(sample.mergeShares).toBe(20);
     expect(sample.pairTakerCost).toBeGreaterThan(1);
   });
 
@@ -56,14 +56,13 @@ describe("live paper analytics", () => {
           secsToClose: 295,
           hasBooks: true,
           entryBuyCount: 2,
-          makerOrderCount: 0,
-          buyShares: 60,
-          buyNotional: 29.4,
-          quotedShares: 0,
-          quotedNotional: 0,
+          balancedPairEntryCount: 2,
+          laggingRebalanceCount: 0,
+          buyShares: 40,
+          buyNotional: 19.6,
           hasCompletion: false,
           hasUnwind: false,
-          mergeShares: 30,
+          mergeShares: 20,
           allowNewEntries: true,
           completionOnly: false,
           hardCancel: false,
@@ -78,11 +77,10 @@ describe("live paper analytics", () => {
           secsToClose: 8,
           hasBooks: true,
           entryBuyCount: 0,
-          makerOrderCount: 0,
+          balancedPairEntryCount: 0,
+          laggingRebalanceCount: 0,
           buyShares: 0,
           buyNotional: 0,
-          quotedShares: 0,
-          quotedNotional: 0,
           hasCompletion: false,
           hasUnwind: false,
           mergeShares: 0,
@@ -102,13 +100,12 @@ describe("live paper analytics", () => {
       sampleCount: 2,
       samplesWithBooks: 2,
       entryBuyReadyCount: 1,
-      makerReadyCount: 0,
+      balancedPairReadyCount: 1,
+      laggingRebalanceReadyCount: 0,
       completionOnlyCount: 1,
       hardCancelCount: 1,
-      averageBuyShares: 30,
-      averageBuyNotional: 14.7,
-      averageQuotedShares: 0,
-      averageQuotedNotional: 0,
+      averageBuyShares: 20,
+      averageBuyNotional: 9.8,
     });
     expect(summary.bestPairEdge).toBeCloseTo(-0.0159856, 8);
     expect(summary.worstPairEdge).toBeCloseTo(-0.036, 8);

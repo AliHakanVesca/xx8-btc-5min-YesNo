@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildOfflineMarket } from "../../src/infra/gamma/marketDiscovery.js";
-import { applyFill, imbalance, mergeableShares, pairVwapSum } from "../../src/strategy/xuan5m/inventoryState.js";
+import { applyFill, applyMerge, imbalance, mergeableShares, pairVwapSum } from "../../src/strategy/xuan5m/inventoryState.js";
 import { createMarketState } from "../../src/strategy/xuan5m/marketState.js";
 import { planMerge } from "../../src/strategy/xuan5m/mergeCoordinator.js";
 import { buildStrategyConfig } from "../../src/config/strategyPresets.js";
@@ -15,7 +15,7 @@ describe("inventory state", () => {
       price: 0.48,
       size: 60,
       timestamp: 1713696010,
-      makerTaker: "maker",
+      makerTaker: "taker",
     });
     state = applyFill(state, {
       outcome: "DOWN",
@@ -23,7 +23,7 @@ describe("inventory state", () => {
       price: 0.49,
       size: 60,
       timestamp: 1713696011,
-      makerTaker: "maker",
+      makerTaker: "taker",
     });
 
     expect(pairVwapSum(state)).toBeCloseTo(0.97, 8);
@@ -45,7 +45,7 @@ describe("inventory state", () => {
       price: 0.48,
       size: 30,
       timestamp: 1713696010,
-      makerTaker: "maker",
+      makerTaker: "taker",
     });
     state = applyFill(state, {
       outcome: "DOWN",
@@ -53,11 +53,65 @@ describe("inventory state", () => {
       price: 0.49,
       size: 30,
       timestamp: 1713696011,
-      makerTaker: "maker",
+      makerTaker: "taker",
     });
 
     const merge = planMerge(config, state);
     expect(merge.shouldMerge).toBe(true);
     expect(merge.mergeable).toBe(30);
+  });
+
+  it("reduces shares and keeps remaining average cost stable on sell fills", () => {
+    let state = createMarketState(buildOfflineMarket(1713696000));
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      price: 0.48,
+      size: 60,
+      timestamp: 1713696010,
+      makerTaker: "taker",
+    });
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "SELL",
+      price: 0.52,
+      size: 20,
+      timestamp: 1713696015,
+      makerTaker: "taker",
+    });
+
+    expect(state.upShares).toBe(40);
+    expect(state.upCost).toBeCloseTo(19.2, 8);
+  });
+
+  it("reduces both shares and costs on merge", () => {
+    let state = createMarketState(buildOfflineMarket(1713696000));
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      price: 0.48,
+      size: 40,
+      timestamp: 1713696010,
+      makerTaker: "taker",
+    });
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.47,
+      size: 40,
+      timestamp: 1713696011,
+      makerTaker: "taker",
+    });
+
+    state = applyMerge(state, {
+      amount: 20,
+      timestamp: 1713696020,
+      simulated: true,
+    });
+
+    expect(state.upShares).toBe(20);
+    expect(state.downShares).toBe(20);
+    expect(state.upCost).toBeCloseTo(9.6, 8);
+    expect(state.downCost).toBeCloseTo(9.4, 8);
   });
 });

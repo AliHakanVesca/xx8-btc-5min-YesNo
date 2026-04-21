@@ -1,8 +1,6 @@
 import type { XuanStrategyConfig } from "../../config/strategyPresets.js";
-import type { LimitOrderArgs } from "../../infra/clob/types.js";
 import { chooseLot } from "./lotLadder.js";
 import { planMerge } from "./mergeCoordinator.js";
-import { buildMakerPairQuote } from "./quoteEngine.js";
 import { evaluateRisk, type RiskContext, type RiskEvaluation } from "./riskEngine.js";
 import { getStrategyPhase } from "./scheduler.js";
 import {
@@ -13,12 +11,12 @@ import {
 import { chooseEntryBuys, type EntryBuyDecision } from "./entryLadderEngine.js";
 import type { XuanMarketState } from "./marketState.js";
 import { OrderBookState } from "./orderBookState.js";
+import { pairCostWithBothTaker } from "./sumAvgEngine.js";
 
 export interface BotDecision {
   phase: ReturnType<typeof getStrategyPhase>;
   risk: RiskEvaluation;
   entryBuys: EntryBuyDecision[];
-  makerOrders: LimitOrderArgs[];
   completion?: CompletionDecision | undefined;
   unwind?: UnwindDecision | undefined;
   mergeShares: number;
@@ -40,22 +38,31 @@ export class Xuan5mBot {
     const risk = evaluateRisk(config, state, riskContext);
     const secsFromOpen = nowTs - state.market.startTs;
     const secsToClose = state.market.endTs - nowTs;
+    const pairTakerCost = pairCostWithBothTaker(
+      books.bestAsk("UP"),
+      books.bestAsk("DOWN"),
+      config.cryptoTakerFeeRate,
+    );
+    const inventoryBalanced = Math.abs(state.upShares - state.downShares) <= state.market.minOrderSize;
 
     const lot = chooseLot(config, {
       dryRunOrSmallLive: input.dryRunOrSmallLive,
       secsFromOpen,
       imbalance: Math.abs(state.upShares - state.downShares) / Math.max(state.upShares + state.downShares, 1),
-      bookDepthGood: books.depthAtOrBetter("UP", books.bestBid("UP"), "bid") >= config.defaultLot,
-      edgeStrong: books.bestAsk("UP") + books.bestAsk("DOWN") <= config.combinedCapBase,
-      edgeVeryStrong: books.bestAsk("UP") + books.bestAsk("DOWN") <= config.combinedCapSafe,
+      bookDepthGood:
+        Math.min(
+          books.depthAtOrBetter("UP", books.bestAsk("UP"), "ask"),
+          books.depthAtOrBetter("DOWN", books.bestAsk("DOWN"), "ask"),
+        ) >= config.defaultLot,
+      pairCostWithinCap: pairTakerCost <= config.entryTakerPairCap,
+      pairCostComfortable: pairTakerCost <= config.entryTakerPairCap - config.minEdgePerShare,
+      inventoryBalanced,
       recentBothSidesFilled: state.fillHistory.some((fill) => fill.outcome === "UP") && state.fillHistory.some((fill) => fill.outcome === "DOWN"),
       marketVolumeHigh: true,
       pnlTodayPositive: riskContext.dailyLossUsdc <= 0,
     });
 
     const baseMergePlan = planMerge(config, state);
-    const mergeReadyWithoutDrift =
-      baseMergePlan.shouldMerge && Math.abs(state.upShares - state.downShares) <= state.market.minOrderSize;
 
     const entryBuys =
       risk.allowNewEntries
@@ -66,39 +73,6 @@ export class Xuan5mBot {
           })
         : [];
 
-    const makerOrders: LimitOrderArgs[] = [];
-    if (risk.allowNewEntries && config.makerQuotingEnabled && entryBuys.length === 0 && !mergeReadyWithoutDrift) {
-      const quote = buildMakerPairQuote(config, state, books, {
-        secsFromOpen,
-        secsToClose,
-        lot,
-      });
-      if (quote) {
-        if (quote.upSize > 0) {
-          makerOrders.push({
-            tokenId: state.market.tokens.UP.tokenId,
-            price: quote.upPrice,
-            size: quote.upSize,
-            side: "BUY",
-            orderType: "GTC",
-            postOnly: true,
-            expiration: Math.floor(Date.now() / 1000) + 60 + Math.max(30, secsToClose),
-          });
-        }
-        if (quote.downSize > 0) {
-          makerOrders.push({
-            tokenId: state.market.tokens.DOWN.tokenId,
-            price: quote.downPrice,
-            size: quote.downSize,
-            side: "BUY",
-            orderType: "GTC",
-            postOnly: true,
-            expiration: Math.floor(Date.now() / 1000) + 60 + Math.max(30, secsToClose),
-          });
-        }
-      }
-    }
-
     const inventoryAdjustment = risk.tradable && !risk.allowNewEntries
       ? chooseInventoryAdjustment(config, state, books, { secsToClose }) ?? undefined
       : undefined;
@@ -108,7 +82,6 @@ export class Xuan5mBot {
       phase,
       risk,
       entryBuys,
-      makerOrders,
       completion: inventoryAdjustment?.completion,
       unwind: inventoryAdjustment?.unwind,
       mergeShares: mergePlan.shouldMerge ? mergePlan.mergeable : 0,

@@ -9,23 +9,35 @@ export function applyFill(state: XuanMarketState, fill: FillRecord): XuanMarketS
     lastFilledSide: fill.outcome,
   };
 
-  if (fill.outcome === "UP") {
-    next.upShares += fill.size;
-    next.upCost += fill.size * fill.price;
-  } else {
-    next.downShares += fill.size;
-    next.downCost += fill.size * fill.price;
+  const sideKey = fill.outcome === "UP" ? "up" : "down";
+  const sharesKey = sideKey === "up" ? "upShares" : "downShares";
+  const costKey = sideKey === "up" ? "upCost" : "downCost";
+
+  if (fill.side === "BUY") {
+    next[sharesKey] += fill.size;
+    next[costKey] += fill.size * fill.price;
+    return next;
   }
+
+  const sharesBefore = next[sharesKey];
+  const matchedSize = Math.min(fill.size, sharesBefore);
+  const averageBefore = safeDivide(next[costKey], sharesBefore);
+  next[sharesKey] = Math.max(0, sharesBefore - matchedSize);
+  next[costKey] = Math.max(0, next[costKey] - averageBefore * matchedSize);
 
   return next;
 }
 
 export function applyMerge(state: XuanMarketState, merge: MergeRecord): XuanMarketState {
   const matched = Math.min(state.upShares, state.downShares, merge.amount);
+  const upAverage = averageCost(state, "UP");
+  const downAverage = averageCost(state, "DOWN");
   return {
     ...state,
     upShares: state.upShares - matched,
     downShares: state.downShares - matched,
+    upCost: Math.max(0, state.upCost - upAverage * matched),
+    downCost: Math.max(0, state.downCost - downAverage * matched),
     mergeHistory: [...state.mergeHistory, merge],
   };
 }

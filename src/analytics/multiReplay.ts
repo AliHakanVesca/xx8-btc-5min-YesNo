@@ -66,19 +66,19 @@ export interface MultiReplayScenarioResult {
   };
   orders: {
     entryBuyCount: number;
+    balancedPairEntryCount: number;
+    laggingRebalanceCount: number;
     totalEntryBuyShares: number;
     entryBuyNotional: number;
     entryBuys: Array<{
       side: OutcomeSide;
       size: number;
+      reason: string;
       expectedAveragePrice: number;
+      effectivePricePerShare: number;
       tokenId: string;
       price: number;
     }>;
-    makerOrderCount: number;
-    totalQuotedShares: number;
-    makerNotional: number;
-    makerQuotes: Array<{ tokenId: string; price: number; size: number }>;
     completion?: {
       sideToBuy: OutcomeSide;
       missingShares: number;
@@ -103,7 +103,8 @@ export interface MultiReplaySummary {
   totalScenarioCount: number;
   tradableScenarioCount: number;
   entryBuyScenarioCount: number;
-  makerScenarioCount: number;
+  balancedPairScenarioCount: number;
+  laggingRebalanceScenarioCount: number;
   completionScenarioCount: number;
   unwindScenarioCount: number;
   mergeScenarioCount: number;
@@ -111,9 +112,6 @@ export interface MultiReplaySummary {
   hardCancelScenarioCount: number;
   totalEntryBuyShares: number;
   totalEntryBuyNotional: number;
-  totalMakerOrders: number;
-  totalQuotedShares: number;
-  totalMakerNotional: number;
   totalCompletionShares: number;
   totalUnwindShares: number;
   totalMergeShares: number;
@@ -210,7 +208,7 @@ function seedFillHistory(inventory: ReplayInventory, timestamp: number): FillRec
       price: inventory.upAvg,
       size: inventory.upShares,
       timestamp: timestamp - 45,
-      makerTaker: "maker",
+      makerTaker: "taker",
     });
   }
 
@@ -221,7 +219,7 @@ function seedFillHistory(inventory: ReplayInventory, timestamp: number): FillRec
       price: inventory.downAvg,
       size: inventory.downShares,
       timestamp: timestamp - 30,
-      makerTaker: "maker",
+      makerTaker: "taker",
     });
   }
 
@@ -296,22 +294,19 @@ function runSingleScenario(
   const entryBuys = decision.entryBuys.map((entryBuy) => ({
     side: entryBuy.side,
     size: entryBuy.size,
+    reason: entryBuy.reason,
     expectedAveragePrice: entryBuy.expectedAveragePrice,
+    effectivePricePerShare: entryBuy.effectivePricePerShare,
     tokenId: entryBuy.order.tokenId,
     price: entryBuy.order.price ?? 0,
   }));
+  const balancedPairEntryCount = decision.entryBuys.filter((entryBuy) => entryBuy.reason !== "lagging_rebalance").length;
+  const laggingRebalanceCount = decision.entryBuys.filter((entryBuy) => entryBuy.reason === "lagging_rebalance").length;
   const totalEntryBuyShares = decision.entryBuys.reduce((acc, order) => acc + order.size, 0);
   const entryBuyNotional = decision.entryBuys.reduce(
     (acc, order) => acc + order.size * order.expectedAveragePrice,
     0,
   );
-  const makerQuotes = decision.makerOrders.map((order) => ({
-    tokenId: order.tokenId,
-    price: order.price,
-    size: order.size,
-  }));
-  const totalQuotedShares = decision.makerOrders.reduce((acc, order) => acc + order.size, 0);
-  const makerNotional = decision.makerOrders.reduce((acc, order) => acc + order.price * order.size, 0);
 
   return {
     marketSlug: market.slug,
@@ -346,13 +341,11 @@ function runSingleScenario(
     },
     orders: {
       entryBuyCount: decision.entryBuys.length,
+      balancedPairEntryCount,
+      laggingRebalanceCount,
       totalEntryBuyShares,
       entryBuyNotional,
       entryBuys,
-      makerOrderCount: decision.makerOrders.length,
-      totalQuotedShares,
-      makerNotional,
-      makerQuotes,
       ...(decision.completion
         ? {
             completion: {
@@ -390,7 +383,8 @@ function summarize(results: MultiReplayScenarioResult[], windowCount: number): M
     totalScenarioCount: results.length,
     tradableScenarioCount: results.filter((result) => result.risk.tradable).length,
     entryBuyScenarioCount: results.filter((result) => result.orders.entryBuyCount > 0).length,
-    makerScenarioCount: results.filter((result) => result.orders.makerOrderCount > 0).length,
+    balancedPairScenarioCount: results.filter((result) => result.orders.balancedPairEntryCount > 0).length,
+    laggingRebalanceScenarioCount: results.filter((result) => result.orders.laggingRebalanceCount > 0).length,
     completionScenarioCount: results.filter((result) => result.acceptance.hasCompletion).length,
     unwindScenarioCount: results.filter((result) => result.acceptance.hasUnwind).length,
     mergeScenarioCount: results.filter((result) => result.orders.mergeShares > 0).length,
@@ -398,9 +392,6 @@ function summarize(results: MultiReplayScenarioResult[], windowCount: number): M
     hardCancelScenarioCount: results.filter((result) => result.risk.hardCancel).length,
     totalEntryBuyShares: results.reduce((acc, result) => acc + result.orders.totalEntryBuyShares, 0),
     totalEntryBuyNotional: results.reduce((acc, result) => acc + result.orders.entryBuyNotional, 0),
-    totalMakerOrders: results.reduce((acc, result) => acc + result.orders.makerOrderCount, 0),
-    totalQuotedShares: results.reduce((acc, result) => acc + result.orders.totalQuotedShares, 0),
-    totalMakerNotional: results.reduce((acc, result) => acc + result.orders.makerNotional, 0),
     totalCompletionShares: results.reduce(
       (acc, result) => acc + (result.orders.completion?.missingShares ?? 0),
       0,

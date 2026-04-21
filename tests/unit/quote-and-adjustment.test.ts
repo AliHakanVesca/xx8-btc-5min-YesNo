@@ -3,8 +3,8 @@ import { parseEnv } from "../../src/config/env.js";
 import { buildStrategyConfig } from "../../src/config/strategyPresets.js";
 import { buildOfflineMarket } from "../../src/infra/gamma/marketDiscovery.js";
 import { createMarketState } from "../../src/strategy/xuan5m/marketState.js";
-import { buildMakerPairQuote } from "../../src/strategy/xuan5m/quoteEngine.js";
 import { chooseInventoryAdjustment } from "../../src/strategy/xuan5m/completionEngine.js";
+import { chooseEntryBuys } from "../../src/strategy/xuan5m/entryLadderEngine.js";
 import { OrderBookState } from "../../src/strategy/xuan5m/orderBookState.js";
 import { Xuan5mBot } from "../../src/strategy/xuan5m/Xuan5mBot.js";
 
@@ -26,36 +26,13 @@ function buildBook(
   };
 }
 
-describe("quote skew and inventory adjustment", () => {
+describe("entry and inventory adjustment", () => {
   const config = buildStrategyConfig(
     parseEnv({
       DRY_RUN: "true",
       POLY_STACK_MODE: "current-prod-v1",
     }),
   );
-
-  it("sizes only the lagging side when imbalance is severe", () => {
-    const market = buildOfflineMarket(1713696000);
-    const state = createMarketState(market);
-    state.upShares = 40;
-    state.downShares = 10;
-
-    const books = new OrderBookState(
-      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.48, size: 200 }], [{ price: 0.49, size: 200 }]),
-      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.48, size: 200 }], [{ price: 0.49, size: 200 }]),
-    );
-
-    const quote = buildMakerPairQuote(config, state, books, {
-      secsFromOpen: 90,
-      secsToClose: 210,
-      lot: 30,
-    });
-
-    expect(quote).not.toBeNull();
-    expect(quote?.skewedSide).toBe("DOWN");
-    expect(quote?.upSize).toBe(0);
-    expect(quote?.downSize).toBe(30);
-  });
 
   it("keeps buying only the lagging side during the entry window instead of taker completion", () => {
     const market = buildOfflineMarket(1713696000);
@@ -89,11 +66,45 @@ describe("quote skew and inventory adjustment", () => {
     expect(decision.risk.allowNewEntries).toBe(true);
     expect(decision.entryBuys).toHaveLength(1);
     expect(decision.entryBuys[0]?.side).toBe("DOWN");
+    expect(decision.entryBuys[0]?.reason).toBe("lagging_rebalance");
     expect(decision.entryBuys[0]?.order.side).toBe("BUY");
     expect(decision.entryBuys[0]?.order.tokenId).toBe(market.tokens.DOWN.tokenId);
     expect(decision.entryBuys[0]?.size).toBeGreaterThan(0);
-    expect(decision.makerOrders).toHaveLength(0);
     expect(decision.completion).toBeUndefined();
+  });
+
+  it("does not reopen both sides when only one side is carried into the entry window", () => {
+    const market = buildOfflineMarket(1713696000);
+    const state = createMarketState(market);
+    const bot = new Xuan5mBot();
+    state.upShares = 60;
+    state.upCost = 28.2;
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.48, size: 200 }], [{ price: 0.49, size: 200 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.48, size: 200 }], [{ price: 0.49, size: 200 }]),
+    );
+
+    const decision = bot.evaluateTick({
+      config,
+      state,
+      books,
+      nowTs: market.startTs + 90,
+      riskContext: {
+        secsToClose: 210,
+        staleBookMs: 200,
+        balanceStaleMs: 200,
+        bookIsCrossed: false,
+        dailyLossUsdc: 0,
+        marketLossUsdc: 0,
+        usdcBalance: 100,
+      },
+      dryRunOrSmallLive: true,
+    });
+
+    expect(decision.entryBuys).toHaveLength(1);
+    expect(decision.entryBuys[0]?.side).toBe("DOWN");
+    expect(decision.entryBuys[0]?.reason).toBe("lagging_rebalance");
   });
 
   it("opens with both-side taker buys by default when pair cost is within the entry cap", () => {
@@ -124,9 +135,58 @@ describe("quote skew and inventory adjustment", () => {
 
     expect(decision.entryBuys).toHaveLength(2);
     expect(decision.entryBuys.map((entry) => entry.side)).toEqual(["UP", "DOWN"]);
+    expect(decision.entryBuys.every((entry) => entry.reason === "balanced_pair_seed")).toBe(true);
     expect(decision.entryBuys.every((entry) => entry.order.orderType === "FAK")).toBe(true);
-    expect(decision.makerOrders).toHaveLength(0);
-    expect(decision.mergeShares).toBe(30);
+    expect(decision.mergeShares).toBe(20);
+  });
+
+  it("scans the configured ladder with real ask-side vwap and keeps the largest rung within cap", () => {
+    const market = buildOfflineMarket(1713696000);
+    const state = createMarketState(market);
+    const vwapConfig = buildStrategyConfig(
+      parseEnv({
+        DRY_RUN: "true",
+        POLY_STACK_MODE: "current-prod-v1",
+        LOT_LADDER: "20,40,60,80,100",
+        LIVE_SMALL_LOTS: "20,40",
+        DEFAULT_LOT: "40",
+        ENTRY_TAKER_PAIR_CAP: "1.01",
+      }),
+    );
+    const books = new OrderBookState(
+      buildBook(
+        market.tokens.UP.tokenId,
+        market.conditionId,
+        [{ price: 0.46, size: 200 }],
+        [
+          { price: 0.47, size: 20 },
+          { price: 0.5, size: 20 },
+          { price: 0.54, size: 60 },
+        ],
+      ),
+      buildBook(
+        market.tokens.DOWN.tokenId,
+        market.conditionId,
+        [{ price: 0.45, size: 200 }],
+        [
+          { price: 0.46, size: 20 },
+          { price: 0.49, size: 20 },
+          { price: 0.54, size: 60 },
+        ],
+      ),
+    );
+
+    const entryBuys = chooseEntryBuys(vwapConfig, state, books, {
+      secsFromOpen: 15,
+      secsToClose: 285,
+      lot: 100,
+    });
+
+    expect(entryBuys).toHaveLength(2);
+    expect(entryBuys.map((entry) => entry.size)).toEqual([40, 40]);
+    expect(entryBuys.every((entry) => entry.reason === "balanced_pair_seed")).toBe(true);
+    expect(entryBuys[0]?.pairCostWithFees).toBeLessThanOrEqual(1.01);
+    expect(entryBuys[0]?.pairCostWithFees).toBeGreaterThan(0.99);
   });
 
   it("falls back to partial completion when full completion is too expensive", () => {

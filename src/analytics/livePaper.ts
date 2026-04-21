@@ -23,11 +23,10 @@ export interface LivePaperSample {
   secsToClose: number;
   hasBooks: boolean;
   entryBuyCount: number;
-  makerOrderCount: number;
+  balancedPairEntryCount: number;
+  laggingRebalanceCount: number;
   buyShares: number;
   buyNotional: number;
-  quotedShares: number;
-  quotedNotional: number;
   hasCompletion: boolean;
   hasUnwind: boolean;
   mergeShares: number;
@@ -45,7 +44,8 @@ export interface LivePaperSummary {
   sampleCount: number;
   samplesWithBooks: number;
   entryBuyReadyCount: number;
-  makerReadyCount: number;
+  balancedPairReadyCount: number;
+  laggingRebalanceReadyCount: number;
   completionReadyCount: number;
   unwindReadyCount: number;
   mergeReadyCount: number;
@@ -54,8 +54,6 @@ export interface LivePaperSummary {
   hardCancelCount: number;
   averageBuyShares: number;
   averageBuyNotional: number;
-  averageQuotedShares: number;
-  averageQuotedNotional: number;
   averagePairAskSum?: number;
   averagePairTakerCost?: number;
   bestPairEdge?: number;
@@ -132,8 +130,8 @@ export function buildLivePaperSample(args: {
 
   const buyShares = decision.entryBuys.reduce((acc, order) => acc + order.size, 0);
   const buyNotional = decision.entryBuys.reduce((acc, order) => acc + order.size * order.expectedAveragePrice, 0);
-  const quotedShares = decision.makerOrders.reduce((acc, order) => acc + order.size, 0);
-  const quotedNotional = decision.makerOrders.reduce((acc, order) => acc + order.size * order.price, 0);
+  const balancedPairEntryCount = decision.entryBuys.filter((order) => order.reason !== "lagging_rebalance").length;
+  const laggingRebalanceCount = decision.entryBuys.filter((order) => order.reason === "lagging_rebalance").length;
   const hasBooks = Boolean(args.upBook && args.downBook);
   const pairAskSum = hasBooks ? books.bestAsk("UP") + books.bestAsk("DOWN") : undefined;
   const pairTakerCost = hasBooks
@@ -146,11 +144,10 @@ export function buildLivePaperSample(args: {
     secsToClose: args.market.endTs - args.nowTs,
     hasBooks,
     entryBuyCount: decision.entryBuys.length,
-    makerOrderCount: decision.makerOrders.length,
+    balancedPairEntryCount,
+    laggingRebalanceCount,
     buyShares,
     buyNotional,
-    quotedShares,
-    quotedNotional,
     hasCompletion: Boolean(decision.completion),
     hasUnwind: Boolean(decision.unwind),
     mergeShares: decision.mergeShares,
@@ -186,7 +183,8 @@ export function summarizeLivePaperSamples(args: {
     sampleCount: args.samples.length,
     samplesWithBooks: samplesWithBooks.length,
     entryBuyReadyCount: args.samples.filter((sample) => sample.entryBuyCount > 0).length,
-    makerReadyCount: args.samples.filter((sample) => sample.makerOrderCount > 0).length,
+    balancedPairReadyCount: args.samples.filter((sample) => sample.balancedPairEntryCount > 0).length,
+    laggingRebalanceReadyCount: args.samples.filter((sample) => sample.laggingRebalanceCount > 0).length,
     completionReadyCount: args.samples.filter((sample) => sample.hasCompletion).length,
     unwindReadyCount: args.samples.filter((sample) => sample.hasUnwind).length,
     mergeReadyCount: args.samples.filter((sample) => sample.mergeShares > 0).length,
@@ -197,10 +195,6 @@ export function summarizeLivePaperSamples(args: {
       args.samples.reduce((acc, sample) => acc + sample.buyShares, 0) / Math.max(args.samples.length, 1),
     averageBuyNotional:
       args.samples.reduce((acc, sample) => acc + sample.buyNotional, 0) / Math.max(args.samples.length, 1),
-    averageQuotedShares:
-      args.samples.reduce((acc, sample) => acc + sample.quotedShares, 0) / Math.max(args.samples.length, 1),
-    averageQuotedNotional:
-      args.samples.reduce((acc, sample) => acc + sample.quotedNotional, 0) / Math.max(args.samples.length, 1),
     ...(pairAskSums.length > 0
       ? { averagePairAskSum: pairAskSums.reduce((acc, value) => acc + value, 0) / pairAskSums.length }
       : {}),

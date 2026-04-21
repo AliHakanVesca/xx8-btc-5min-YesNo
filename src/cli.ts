@@ -19,11 +19,11 @@ import { buildSyntheticBook } from "./analytics/replaySimulator.js";
 import { OrderBookState } from "./strategy/xuan5m/orderBookState.js";
 import { Xuan5mBot } from "./strategy/xuan5m/Xuan5mBot.js";
 import { OrderManager } from "./execution/orderManager.js";
-import { PostOnlyManager } from "./execution/postOnlyManager.js";
 import { TakerCompletionManager } from "./execution/takerCompletionManager.js";
 import { CtfClient } from "./infra/ctf/ctfClient.js";
 import { renderDashboard } from "./observability/dashboard.js";
 import { runLiveCheck } from "./live/liveCheck.js";
+import { runStatefulBotSession } from "./live/statefulBotSession.js";
 
 async function fileExists(path: string): Promise<boolean> {
   try {
@@ -114,6 +114,7 @@ async function runPaperLive(options: {
 
 async function runConfigShow(): Promise<void> {
   const env = loadEnv();
+  const config = buildStrategyConfig(env);
   console.log(
     JSON.stringify(
       {
@@ -127,6 +128,36 @@ async function runConfigShow(): Promise<void> {
         activeCollateralToken: env.ACTIVE_COLLATERAL_TOKEN,
         activeCollateralSymbol: env.ACTIVE_COLLATERAL_SYMBOL,
         dryRun: env.DRY_RUN,
+        strategy: {
+          entryTakerBuyEnabled: config.entryTakerBuyEnabled,
+          entryTakerPairCap: config.entryTakerPairCap,
+          completionCap: config.completionCap,
+          minEdgePerShare: config.minEdgePerShare,
+          lotLadder: config.lotLadder,
+          liveSmallLots: config.liveSmallLots,
+          defaultLot: config.defaultLot,
+          mergeMinShares: config.mergeMinShares,
+          maxMarketSharesPerSide: config.maxMarketSharesPerSide,
+          maxOneSidedExposureShares: config.maxOneSidedExposureShares,
+          maxImbalanceFrac: config.maxImbalanceFrac,
+          forceRebalanceImbalanceFrac: config.forceRebalanceImbalanceFrac,
+          rebalanceLeadingFraction: config.rebalanceLeadingFraction,
+          rebalanceMaxLaggingMultiplier: config.rebalanceMaxLaggingMultiplier,
+          maxCyclesPerMarket: config.maxCyclesPerMarket,
+          maxBuysPerSide: config.maxBuysPerSide,
+          enterFromOpenSecMin: config.enterFromOpenSecMin,
+          enterFromOpenSecMax: config.enterFromOpenSecMax,
+          normalEntryCutoffSecToClose: config.normalEntryCutoffSecToClose,
+          completionOnlyCutoffSecToClose: config.completionOnlyCutoffSecToClose,
+          hardCancelSecToClose: config.hardCancelSecToClose,
+          partialCompletionFractions: config.partialCompletionFractions,
+          maxResidualHoldShares: config.maxResidualHoldShares,
+          residualUnwindSecToClose: config.residualUnwindSecToClose,
+          sellUnwindEnabled: config.sellUnwindEnabled,
+          dailyMaxLossUsdc: config.dailyMaxLossUsdc,
+          marketMaxLossUsdc: config.marketMaxLossUsdc,
+          minUsdcBalance: config.minUsdcBalance,
+        },
       },
       null,
       2,
@@ -223,14 +254,9 @@ async function runBotOnce(mode: "dry" | "live"): Promise<void> {
   });
 
   const orderManager = new OrderManager(clob);
-  const postOnly = new PostOnlyManager(orderManager);
   const completionManager = new TakerCompletionManager(orderManager);
   const ctf = new CtfClient(env);
 
-  const submitted =
-    decision.makerOrders.length > 0
-      ? await postOnly.placeQuotes(decision.makerOrders, market.tickSize)
-      : [];
   const entryBuys =
     decision.entryBuys.length > 0
       ? await Promise.all(decision.entryBuys.map((entryBuy) => completionManager.execute(entryBuy.order)))
@@ -271,7 +297,6 @@ async function runBotOnce(mode: "dry" | "live"): Promise<void> {
     market: market.slug,
     decision,
     entryBuys,
-    submitted,
     completion,
     unwind,
     merge,
@@ -287,8 +312,24 @@ async function runBotDry(): Promise<void> {
   await runBotOnce("dry");
 }
 
-async function runBotLive(): Promise<void> {
-  await runBotOnce("live");
+async function runBotLive(options: {
+  durationSec: number;
+  tickMs: number;
+  initialBookWaitMs: number;
+  balanceSyncMs: number;
+}): Promise<void> {
+  const env = loadEnv();
+  if (env.DRY_RUN) {
+    throw new Error("bot:live icin once DRY_RUN=false yap.");
+  }
+
+  const report = await runStatefulBotSession(env, {
+    durationSec: options.durationSec,
+    tickMs: options.tickMs,
+    initialBookWaitMs: options.initialBookWaitMs,
+    balanceSyncMs: options.balanceSyncMs,
+  });
+  console.log(JSON.stringify(report, null, 2));
 }
 
 async function runLiveCheckCommand(): Promise<void> {
@@ -328,7 +369,26 @@ export async function runCli(argv = process.argv): Promise<void> {
       }),
     );
   program.command("bot:dry").action(async () => runBotDry());
-  program.command("bot:live").action(async () => runBotLive());
+  program
+    .command("bot:live")
+    .option("--duration-sec <n>", "Run the live market session for N seconds", "240")
+    .option("--tick-ms <n>", "Decision loop interval in milliseconds", "1000")
+    .option("--initial-book-wait-ms <n>", "How long to wait for initial orderbooks", "8000")
+    .option("--balance-sync-ms <n>", "How often to reconcile ERC1155 balances", "5000")
+    .action(
+      async (options: {
+        durationSec: string;
+        tickMs: string;
+        initialBookWaitMs: string;
+        balanceSyncMs: string;
+      }) =>
+        runBotLive({
+          durationSec: Number(options.durationSec),
+          tickMs: Number(options.tickMs),
+          initialBookWaitMs: Number(options.initialBookWaitMs),
+          balanceSyncMs: Number(options.balanceSyncMs),
+        }),
+    );
 
   await program.parseAsync(argv);
 }

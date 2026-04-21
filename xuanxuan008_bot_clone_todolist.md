@@ -6,6 +6,8 @@
 **Referans veri:** `xuanxuan008_data_20260415_145447.json`
 
 > Önemli kabul: Başka bir kullanıcının open-order, cancel/replace, user WebSocket ve private execution akışı public değildir. Bu yüzden bu dokümanın hedefi “tam kaynak kod klonu” değil, public footprint ile uyumlu **behavioral clone / execution twin** üretmektir. Başarı ölçütü, kendi botumuzun trade dağılımı, fill zamanlaması, lot ladder’ı, Up/Down dengesi, pair-cost profili, merge davranışı ve risk kontrollerinin xuanxuan008 export’una yaklaşmasıdır.
+>
+> 2026-04-21 dogrulama notu: eski maker-heavy hipotezi artik birincil model degil. SQLite `trade_observations` ve raw archive capraz kontrolune gore `takerOnly=false` ile `takerOnly=true` farki sifir, `MAKER_REBATE=0`, ve public footprint taker-only / taker-dominant BUY + MERGE/REDEEM akisini gosteriyor. Bu dokumandaki maker-first, maker rebate veya post-only agirlikli kisimlar ancak archival not ya da secondary fallback olarak okunmali.
 
 ---
 
@@ -13,17 +15,17 @@
 
 Bu botun çekirdeği directional BTC tahmini değildir. Hedef strateji:
 
-**BTC 5m Up/Down marketlerinde YES/NO, yani Up/Down, çiftini düşük toplam maliyetle toplamak; mümkün olduğunca maker kalmak; tek bacak dolunca karşı bacağı kontrollü tamamlamak; eşleşen çiftleri CTF merge ile collateral’a çevirmek; kalan one-sided envanteri sıkı limitlerle yönetmek.**
+**BTC 5m Up/Down marketlerinde YES/NO, yani Up/Down, çiftini fee-sonrasi efektif maliyetle taker BUY olarak toplamak; denge bozulursa lagging tarafi tamamlamak; eşleşen çiftleri CTF merge ile collateral’a çevirmek; kalan one-sided envanteri merge/redeem odaklı sıkı limitlerle yönetmek.**
 
 Kısa etiket:
 
 ```text
-BTC 5m Hybrid Complete-Set Market Maker
-= maker-heavy YES/NO pair accumulation
+BTC 5m Taker Complete-Set Accumulator
+= fee-aware YES/NO pair accumulation
 + Gabagool-style sumAvg hedge guard
 + xuan-like lot ladder/timing
 + CTF merge/redeem worker
-+ maker rebate aware execution
++ ask-depth aware taker execution
 ```
 
 ---

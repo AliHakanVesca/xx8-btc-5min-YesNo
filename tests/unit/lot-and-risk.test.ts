@@ -21,13 +21,14 @@ describe("lot ladder and risk windows", () => {
         secsFromOpen: 10,
         imbalance: 0,
         bookDepthGood: true,
-        edgeStrong: true,
-        edgeVeryStrong: true,
+        pairCostWithinCap: true,
+        pairCostComfortable: true,
+        inventoryBalanced: true,
         recentBothSidesFilled: true,
         marketVolumeHigh: true,
         pnlTodayPositive: true,
       }),
-    ).toBe(30);
+    ).toBe(20);
   });
 
   it("moves to completion-only late in the window", () => {

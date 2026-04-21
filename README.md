@@ -1,6 +1,6 @@
 # xx8 BTC 5m Yes/No Bot
 
-Polymarket BTC 5m Up/Down marketlerinde inventory-manufacturing odakli complete-set accumulation, erken iki-bacak buy ladder, taker completion, merge/redeem ve xuan-like timing/risk davranisi icin TypeScript/Node.js bot iskeleti.
+Polymarket BTC 5m Up/Down marketlerinde fee-aware taker pair accumulation, lagging-side taker rebalance, merge/redeem recycle ve xuan-like timing/risk davranisi icin TypeScript/Node.js bot iskeleti.
 
 ## Hedef
 
@@ -9,9 +9,8 @@ Bu repo directional BTC tahmin botu degil. Ana hedef:
 - `btc-updown-5m-*` marketlerini kesintisiz kesfetmek
 - Up/Down taraflarini dengeli toplamak
 - varsayilan modda market acildiktan hemen sonra iki tarafi da buy ederek pair seed acmak
-- pair maliyeti uygunsa market icinde yeni rung'lar ekleyip matched inventory uretmek
+- fee-sonrasi pair maliyeti uygunsa market icinde yeni rung'lar ekleyip matched inventory uretmek
 - dengesizlikte entry penceresi boyunca sadece lagging tarafa buy-side scale yapmak
-- maker quoting'i ancak opsiyonel fallback mod olarak tutmak
 - entry cutoff sonrasi tek bacak doldugunda book-depth ve completion cap ile kismi / tam completion yapmak
 - varsayilan modda residual tek tarafi SELL etmek yerine merge/redeem agirlikli buy-only akisi korumak
 - eslesen ciftleri merge edip otomatik redeem ile collateral'a cevirmek
@@ -65,7 +64,6 @@ Varsayilanlar guvenlik odaklidir:
 - `CTF_MERGE_ENABLED=true`
 - `CTF_AUTO_REDEEM_ENABLED=true`
 - `ENTRY_TAKER_BUY_ENABLED=true`
-- `MAKER_QUOTING_ENABLED=false`
 - `ENTRY_TAKER_PAIR_CAP=1.02`
 - `SELL_UNWIND_ENABLED=false`
 - live rollout icin sadece izole cuzdan kullan
@@ -95,7 +93,7 @@ npm test
 
 `npm run paper:multi -- --windows 3` synthetic scenario matrix replay calistirir. Bu komut historical PnL backtest degil; temsilî 5m pencerelerde early pair-seed buy, lagging-side buy rebalance, streaming merge, completion ve hard-cancel davranisini toplu sayilarla gosterir.
 
-`npm run paper:live -- --duration-sec 20 --sample-ms 2000` gercek market orderbook'u ustunde canli paper decision loop calistirir. Emir gondermez; entry-buy hazirligi, completion-only / hard-cancel gecisleri, buy notional, merge readiness ve pair edge gibi karar metriklerini toplar. Current market gec pencereye girmisse otomatik olarak next 5m marketi secer.
+`npm run paper:live -- --duration-sec 20 --sample-ms 2000` gercek market orderbook'u ustunde canli paper decision loop calistirir. Emir gondermez; pair-entry readiness, lagging-side rebalance sinyali, completion-only / hard-cancel gecisleri, buy notional, merge readiness ve fee-sonrasi pair cost gibi karar metriklerini toplar. Current market gec pencereye girmisse otomatik olarak next 5m marketi secer.
 
 ## CLOB V2 Notu
 
@@ -113,7 +111,7 @@ Polymarket dokumanina gore CLOB V2 go-live tarihi 28 Nisan 2026. Bu repo iki ayr
 Paper mode:
 
 - market websocket ve market discovery calistirir
-- entry-buy/completion/merge kararlarini hesaplar
+- pair-entry/rebalance/completion/merge kararlarini hesaplar
 - gercek emir gondermez
 - orderbook/fill simülasyonlariyla acceptance metrikleri uretir
 
@@ -123,12 +121,12 @@ Onerilen rollout:
 
 1. `DRY_RUN=true` ile en az bir seans paper
 2. current production icin `POLY_STACK_MODE=current-prod-v1`
-3. ayrik cuzdan, dusuk bakiye, `LOT_LADDER=30,60`
+3. ayrik cuzdan, dusuk bakiye, `LOT_LADDER=20,40`
 4. live'a cikmadan once `POLY_USDC_TOKEN`, `CTF_CONTRACT_ADDRESS` ve API key setini doldur
    API key setini manuel aramak yerine `npm run clob:derive -- --write-env` ile turet
 5. `npm run live:check` ile preflight raporunu temizle
 6. safe/proxy kullaniyorsan `POLY_RELAYER_*` setini doldur ve `CTF_MERGE_ENABLED=true` ile `npm run live:check` raporunda `merge.ready=true` gor
-7. canary parametrelerini `LIVE_SMALL_LOTS=30`, `MAX_MARKET_SHARES_PER_SIDE=60`, `MAX_ONE_SIDED_EXPOSURE_SHARES=30`, `MAX_CYCLES_PER_MARKET=2`, `MAX_BUYS_PER_SIDE=2` olarak tut
+7. canary parametrelerini `LIVE_SMALL_LOTS=20`, `MAX_MARKET_SHARES_PER_SIDE=60`, `MAX_ONE_SIDED_EXPOSURE_SHARES=30`, `MAX_CYCLES_PER_MARKET=2`, `MAX_BUYS_PER_SIDE=2` olarak tut
 8. mumkunse authenticated/private Polygon RPC kullan; public RPC ilk testte calisabilir ama stale read / rate limit riski tasir
 9. ancak ondan sonra `DRY_RUN=false`
 10. `npm run bot:live` ile tek-seferlik canary calistir

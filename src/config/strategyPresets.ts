@@ -1,12 +1,23 @@
 import type { AppEnv } from "./schema.js";
 
 export interface XuanStrategyConfig {
+  botMode: "STRICT" | "XUAN";
+  enableMakerLayer: boolean;
   marketAsset: string;
   marketDurationSec: number;
   entryTakerBuyEnabled: boolean;
   entryTakerPairCap: number;
   completionCap: number;
   minEdgePerShare: number;
+  strictPairEffectiveCap: number;
+  normalPairEffectiveCap: number;
+  completionSoftCap: number;
+  completionHardCap: number;
+  emergencyCompletionMaxQty: number;
+  maxNegativeEdgePerMarketUsdc: number;
+  maxMarketExposureShares: number;
+  softImbalanceRatio: number;
+  hardImbalanceRatio: number;
   cryptoTakerFeeRate: number;
   enterFromOpenSecMin: number;
   enterFromOpenSecMax: number;
@@ -37,12 +48,23 @@ export interface XuanStrategyConfig {
 
 export function buildStrategyConfig(env: AppEnv): XuanStrategyConfig {
   return {
+    botMode: env.BOT_MODE,
+    enableMakerLayer: env.ENABLE_MAKER_LAYER,
     marketAsset: "btc",
     marketDurationSec: 300,
     entryTakerBuyEnabled: env.ENTRY_TAKER_BUY_ENABLED,
     entryTakerPairCap: env.ENTRY_TAKER_PAIR_CAP,
     completionCap: env.COMPLETION_CAP,
     minEdgePerShare: env.MIN_EDGE_PER_SHARE,
+    strictPairEffectiveCap: env.STRICT_PAIR_EFFECTIVE_CAP,
+    normalPairEffectiveCap: env.NORMAL_PAIR_EFFECTIVE_CAP,
+    completionSoftCap: env.COMPLETION_SOFT_CAP,
+    completionHardCap: env.COMPLETION_HARD_CAP,
+    emergencyCompletionMaxQty: env.EMERGENCY_COMPLETION_MAX_QTY,
+    maxNegativeEdgePerMarketUsdc: env.MAX_NEGATIVE_EDGE_PER_MARKET_USDC,
+    maxMarketExposureShares: env.MAX_MARKET_EXPOSURE_SHARES,
+    softImbalanceRatio: env.SOFT_IMBALANCE_RATIO,
+    hardImbalanceRatio: env.HARD_IMBALANCE_RATIO,
     cryptoTakerFeeRate: 0.072,
     enterFromOpenSecMin: env.ENTER_FROM_OPEN_SEC_MIN,
     enterFromOpenSecMax: env.ENTER_FROM_OPEN_SEC_MAX,

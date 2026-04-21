@@ -17,23 +17,34 @@ export class Erc1155BalanceReader {
     });
   }
 
-  async getBalance(tokenId: bigint | string): Promise<number> {
+  async getBalanceRaw(tokenId: bigint | string): Promise<bigint> {
     if (this.env.CTF_CONTRACT_ADDRESS === "0x0000000000000000000000000000000000000000") {
-      return 0;
+      return 0n;
     }
 
-    const balance = await this.client.readContract({
+    return this.client.readContract({
       address: this.env.CTF_CONTRACT_ADDRESS as `0x${string}`,
       abi: erc1155Abi,
       functionName: "balanceOf",
       args: [this.env.BOT_WALLET_ADDRESS as `0x${string}`, BigInt(tokenId)],
     });
-    return Number(balance);
+  }
+
+  async getBalance(tokenId: bigint | string): Promise<number> {
+    const raw = await this.getBalanceRaw(tokenId);
+    return Number(raw) / 1_000_000;
   }
 
   async getBalances(tokenIds: Array<bigint | string>): Promise<Map<string, number>> {
     const entries = await Promise.all(
       tokenIds.map(async (tokenId) => [String(tokenId), await this.getBalance(tokenId)] as const),
+    );
+    return new Map(entries);
+  }
+
+  async getBalancesRaw(tokenIds: Array<bigint | string>): Promise<Map<string, bigint>> {
+    const entries = await Promise.all(
+      tokenIds.map(async (tokenId) => [String(tokenId), await this.getBalanceRaw(tokenId)] as const),
     );
     return new Map(entries);
   }

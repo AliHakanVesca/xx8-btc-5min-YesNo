@@ -52,6 +52,7 @@ export class MarketWsClient extends EventEmitter {
       const payload = JSON.parse(buffer.toString()) as MarketEvent | MarketEvent[];
       const events = Array.isArray(payload) ? payload : [payload];
       for (const event of events) {
+        this.emit("raw", event);
         this.applyEvent(event);
       }
     });

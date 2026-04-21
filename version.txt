@@ -1,6 +1,16 @@
 
 ##############################################
 
+Version : V.0.0.5
+Date    : 22.04.2026
+Author  : Ali Hakan Çakır
+Changes : - Capture komutu ve capture session akisi eklendi.
+          - Raw websocket ve ERC1155 balance kayit altyapisi repoya dahil edildi.
+
+##############################################
+
+##############################################
+
 Version : V.0.0.4
 Date    : 22.04.2026
 Author  : Ali Hakan Çakır

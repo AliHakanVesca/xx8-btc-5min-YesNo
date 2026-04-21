@@ -75,6 +75,7 @@ npm run config:show
 npm run live:check
 npm run clob:derive -- --write-env
 npm run analyze:xuan
+npm run capture -- --duration-sec 75
 npm run paper
 npm run paper:multi -- --windows 3
 npm run paper:live -- --duration-sec 20 --sample-ms 2000
@@ -87,7 +88,9 @@ npm test
 
 `npm run live:check` canli preflight raporu uretir. RPC, Gamma discovery, CLOB auth, collateral balance/allowance, orderbook erisimi, market/user websocket, relayer auth, safe deployment ve merge readiness durumunu tek JSON cikti olarak verir.
 
-`npm run bot:live` tek seferlik live-small bot calistirir. Guvenlik icin `DRY_RUN=false` olmadan calismaz.
+`npm run capture -- --duration-sec 75` current+next BTC 5m marketleri icin capture-only oturum calistirir. Emir gondermez; raw market/user websocket payload'larini, token mapping'i ve ERC1155 balance snapshotlarini `data/capture/...` altina yazar ve validation raporu uretir.
+
+`npm run bot:live` stateful live session calistirir. Gercek orderbook, user websocket ve on-chain balance reconcile ile inventory state tasir; guvenlik icin `DRY_RUN=false` olmadan calismaz. Bu akış henuz continuous daemon/market rollover degildir; tek market-session odaklidir.
 
 `npm run analyze:xuan` once `data/xuanxuan008_data_20260415_145447.json` yolunu dener. Dosya yoksa bundled fixture ile devam eder ve bunu loglar.
 
@@ -129,8 +132,9 @@ Onerilen rollout:
 7. canary parametrelerini `LIVE_SMALL_LOTS=20`, `MAX_MARKET_SHARES_PER_SIDE=60`, `MAX_ONE_SIDED_EXPOSURE_SHARES=30`, `MAX_CYCLES_PER_MARKET=2`, `MAX_BUYS_PER_SIDE=2` olarak tut
 8. mumkunse authenticated/private Polygon RPC kullan; public RPC ilk testte calisabilir ama stale read / rate limit riski tasir
 9. ancak ondan sonra `DRY_RUN=false`
-10. `npm run bot:live` ile tek-seferlik canary calistir
-11. ghost fill, stale book, merge fail ve stuck market oranlari log ile dogrulanmadan buyuk lot acma
+10. once `npm run capture -- --duration-sec 75` ile raw ws/balance capture al
+11. sonra `npm run bot:live` ile kucuk canary calistir
+12. ghost fill, stale book, merge fail ve stuck market oranlari log ile dogrulanmadan buyuk lot acma
 
 ## Guvenlik
 

@@ -24,6 +24,7 @@ import { CtfClient } from "./infra/ctf/ctfClient.js";
 import { renderDashboard } from "./observability/dashboard.js";
 import { runLiveCheck } from "./live/liveCheck.js";
 import { runStatefulBotSession } from "./live/statefulBotSession.js";
+import { runCaptureSession } from "./live/captureSession.js";
 
 async function fileExists(path: string): Promise<boolean> {
   try {
@@ -118,6 +119,7 @@ async function runConfigShow(): Promise<void> {
   console.log(
     JSON.stringify(
       {
+        botMode: env.BOT_MODE,
         stackMode: env.POLY_STACK_MODE,
         useClobV2: env.USE_CLOB_V2,
         clobBaseUrl: env.POLY_CLOB_BASE_URL,
@@ -129,10 +131,20 @@ async function runConfigShow(): Promise<void> {
         activeCollateralSymbol: env.ACTIVE_COLLATERAL_SYMBOL,
         dryRun: env.DRY_RUN,
         strategy: {
+          enableMakerLayer: config.enableMakerLayer,
           entryTakerBuyEnabled: config.entryTakerBuyEnabled,
           entryTakerPairCap: config.entryTakerPairCap,
           completionCap: config.completionCap,
           minEdgePerShare: config.minEdgePerShare,
+          strictPairEffectiveCap: config.strictPairEffectiveCap,
+          normalPairEffectiveCap: config.normalPairEffectiveCap,
+          completionSoftCap: config.completionSoftCap,
+          completionHardCap: config.completionHardCap,
+          emergencyCompletionMaxQty: config.emergencyCompletionMaxQty,
+          maxNegativeEdgePerMarketUsdc: config.maxNegativeEdgePerMarketUsdc,
+          maxMarketExposureShares: config.maxMarketExposureShares,
+          softImbalanceRatio: config.softImbalanceRatio,
+          hardImbalanceRatio: config.hardImbalanceRatio,
           lotLadder: config.lotLadder,
           liveSmallLots: config.liveSmallLots,
           defaultLot: config.defaultLot,
@@ -163,6 +175,19 @@ async function runConfigShow(): Promise<void> {
       2,
     ),
   );
+}
+
+async function runCaptureCommand(options: {
+  durationSec: number;
+  initialBookWaitMs: number;
+}): Promise<void> {
+  const env = loadEnv({ enforceLiveRequirements: false });
+  const report = await runCaptureSession(env, {
+    durationSec: options.durationSec,
+    initialBookWaitMs: options.initialBookWaitMs,
+  });
+  await writeStructuredLog("system", { event: "capture_session", report });
+  console.log(JSON.stringify(report, null, 2));
 }
 
 function redactSecret(value: string): string {
@@ -345,6 +370,16 @@ export async function runCli(argv = process.argv): Promise<void> {
   program.name("xx8-btc-5min-yesno");
   program.command("config:show").action(async () => runConfigShow());
   program.command("live:check").action(async () => runLiveCheckCommand());
+  program
+    .command("capture")
+    .option("--duration-sec <n>", "Capture current+next market feeds for N seconds", "75")
+    .option("--initial-book-wait-ms <n>", "How long to wait for initial orderbooks", "8000")
+    .action(async (options: { durationSec: string; initialBookWaitMs: string }) =>
+      runCaptureCommand({
+        durationSec: Number(options.durationSec),
+        initialBookWaitMs: Number(options.initialBookWaitMs),
+      }),
+    );
   program
     .command("clob:derive")
     .option("--write-env", "Write derived POLY_API_* values into the env file")

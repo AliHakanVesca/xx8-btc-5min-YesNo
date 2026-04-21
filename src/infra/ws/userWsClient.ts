@@ -58,6 +58,7 @@ export class UserWsClient extends EventEmitter {
       const payload = JSON.parse(buffer.toString()) as UserTradeEvent | UserOrderEvent | Array<UserTradeEvent | UserOrderEvent>;
       const events = Array.isArray(payload) ? payload : [payload];
       for (const event of events) {
+        this.emit("raw", event);
         this.applyMessage(event);
       }
     });

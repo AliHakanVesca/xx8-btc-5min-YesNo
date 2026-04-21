@@ -15,6 +15,7 @@
     "live:check": "tsx src/cli.ts live:check",
     "clob:derive": "tsx src/cli.ts clob:derive",
     "analyze:xuan": "tsx src/cli.ts analyze:xuan",
+    "capture": "tsx src/cli.ts capture",
     "paper": "tsx src/cli.ts paper",
     "paper:multi": "tsx src/cli.ts paper:multi",
     "paper:live": "tsx src/cli.ts paper:live",

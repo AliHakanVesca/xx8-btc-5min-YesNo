@@ -1,0 +1,45 @@
+{
+  "name": "xx8-btc-5min-yesno",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Behavioral-clone oriented Polymarket BTC 5m Up/Down maker/arbitrage bot skeleton.",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "typecheck": "tsc --project tsconfig.json --noEmit",
+    "test": "vitest run",
+    "config:show": "tsx src/cli.ts config:show",
+    "live:check": "tsx src/cli.ts live:check",
+    "clob:derive": "tsx src/cli.ts clob:derive",
+    "analyze:xuan": "tsx src/cli.ts analyze:xuan",
+    "paper": "tsx src/cli.ts paper",
+    "paper:multi": "tsx src/cli.ts paper:multi",
+    "paper:live": "tsx src/cli.ts paper:live",
+    "bot:dry": "tsx src/cli.ts bot:dry",
+    "bot:live": "tsx src/cli.ts bot:live",
+    "audit:repo": "bash scripts/audit-third-party.sh .",
+    "audit:deps": "npm audit --omit=dev"
+  },
+  "dependencies": {
+    "@polymarket/builder-relayer-client": "^0.0.8",
+    "@polymarket/clob-client": "5.8.1",
+    "@polymarket/clob-client-v2": "1.0.0",
+    "commander": "14.0.3",
+    "decimal.js": "10.6.0",
+    "dotenv": "17.4.2",
+    "pino": "10.3.1",
+    "viem": "2.46.3",
+    "ws": "8.20.0",
+    "zod": "4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "25.6.0",
+    "@types/ws": "8.18.1",
+    "tsx": "4.21.0",
+    "typescript": "6.0.3",
+    "vitest": "4.1.5"
+  }
+}

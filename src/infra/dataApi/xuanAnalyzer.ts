@@ -10,6 +10,8 @@ export interface XuanTrade {
   price: number;
   size: number;
   timestamp: number;
+  transactionHash?: string | undefined;
+  wallet?: string | undefined;
 }
 
 export interface MarketTradeMetrics {
@@ -123,10 +125,29 @@ function parseTrade(raw: any): XuanTrade | undefined {
     price,
     size,
     timestamp,
+    transactionHash:
+      typeof raw?.transactionHash === "string"
+        ? raw.transactionHash
+        : typeof raw?.transaction_hash === "string"
+          ? raw.transaction_hash
+          : undefined,
+    wallet:
+      typeof raw?.proxyWallet === "string"
+        ? raw.proxyWallet
+        : typeof raw?.proxy_wallet === "string"
+          ? raw.proxy_wallet
+          : typeof raw?.wallet === "string"
+            ? raw.wallet
+            : undefined,
   };
 }
 
-function parseTrades(payload: unknown): XuanTrade[] {
+export function inferXuanWalletFromPayload(payload: unknown): string | undefined {
+  const first = extractXuanTradesFromPayload(payload).find((trade) => typeof trade.wallet === "string" && trade.wallet.length > 0);
+  return first?.wallet;
+}
+
+export function extractXuanTradesFromPayload(payload: unknown): XuanTrade[] {
   const rows = Array.isArray(payload)
     ? payload
     : Array.isArray((payload as any)?.trades)
@@ -183,7 +204,7 @@ export async function loadXuanDataset(filePath: string): Promise<unknown> {
 }
 
 export function analyzeXuanPayload(payload: unknown, sourceFile = "inline"): XuanMetricsReport {
-  const trades = parseTrades(payload).sort((a, b) => a.timestamp - b.timestamp);
+  const trades = extractXuanTradesFromPayload(payload).sort((a, b) => a.timestamp - b.timestamp);
   const marketMap = new Map<string, XuanTrade[]>();
 
   for (const trade of trades) {

@@ -14,6 +14,7 @@ import { createPublicClient, createWalletClient, erc20Abi, formatUnits, http, ty
 import { privateKeyToAccount } from "viem/accounts";
 import { polygon, polygonAmoy } from "viem/chains";
 import type { AppEnv } from "../config/schema.js";
+import { buildStrategyConfig } from "../config/strategyPresets.js";
 import { createClobAdapter } from "../infra/clob/index.js";
 import { GammaClient } from "../infra/gamma/gammaClient.js";
 import { discoverCurrentAndNextMarkets } from "../infra/gamma/marketDiscovery.js";
@@ -21,7 +22,10 @@ import { RelayerApiClient } from "../infra/relayer/relayerApiClient.js";
 import { SystemClock } from "../infra/time/clock.js";
 import { MarketWsClient } from "../infra/ws/marketWsClient.js";
 import { UserWsClient } from "../infra/ws/userWsClient.js";
-import { assessMergeExecutionReadiness, classifyWalletTopology } from "./topology.js";
+import { assessMergeExecutionReadiness, classifyWalletTopology, resolveConfiguredFunderAddress } from "./topology.js";
+import { buildInventoryActionPlan, fetchInventorySnapshot } from "./inventoryManager.js";
+import { resolveExchangeSpender } from "../infra/polygon/polymarketContracts.js";
+import { PersistentStateStore } from "./persistentStateStore.js";
 
 interface ProbeStatus {
   ok: boolean;
@@ -60,6 +64,8 @@ interface LiveCheckReport {
     openOrdersCount?: number;
     collateralBalance?: string;
     collateralAllowance?: string;
+    selectedExchangeSpender?: string;
+    selectedExchangeAllowance?: string;
   };
   market: {
     currentSlug?: string;
@@ -125,19 +131,27 @@ function hasApiCreds(env: AppEnv): boolean {
 }
 
 function recommendedCanaryEnv(): Record<string, string> {
-  return {
+  const report = {
     DRY_RUN: "false",
     CTF_MERGE_ENABLED: "true",
-    LIVE_SMALL_LOTS: "20",
-    DEFAULT_LOT: "20",
+    STATE_STORE: "SQLITE",
+    VALIDATION_SEQUENCE: "REPLAY_THEN_LIVE",
+    REPLAY_REQUIRED_BEFORE_LIVE: "true",
+    LIVE_SMALL_LOT_LADDER: "5,10,15",
+    DEFAULT_LOT: "5",
     MAX_MARKET_SHARES_PER_SIDE: "60",
     MAX_ONE_SIDED_EXPOSURE_SHARES: "30",
     MAX_CYCLES_PER_MARKET: "2",
     MAX_BUYS_PER_SIDE: "2",
+    ENABLE_XUAN_HARD_PAIR_SWEEP: "false",
+    ALLOW_SINGLE_LEG_SEED: "false",
+    ALLOW_CHEAP_UNDERDOG_SEED: "false",
     DAILY_MAX_LOSS_USDC: "10",
     MARKET_MAX_LOSS_USDC: "4",
-    MIN_USDC_BALANCE: "40",
+    MIN_USDC_BALANCE_FOR_NEW_ENTRY: "25",
+    MIN_USDC_BALANCE_FOR_COMPLETION: "5",
   };
+  return report;
 }
 
 function formatTokenAmount(raw: bigint, decimals: number): string {
@@ -161,6 +175,18 @@ function extractAllowanceRaw(balanceAllowance: unknown): string | undefined {
   }
 
   return values.reduce((max, current) => (BigInt(current) > BigInt(max) ? current : max));
+}
+
+function extractAllowanceMap(balanceAllowance: unknown): Record<string, string> {
+  const allowances = (balanceAllowance as { allowances?: Record<string, unknown> } | null)?.allowances;
+  if (!allowances || typeof allowances !== "object") {
+    const direct = (balanceAllowance as { allowance?: unknown } | null)?.allowance;
+    return typeof direct === "string" ? { direct } : {};
+  }
+
+  return Object.fromEntries(
+    Object.entries(allowances).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+  );
 }
 
 function isProbablyPublicRpc(url: string): boolean {
@@ -263,13 +289,15 @@ export async function runLiveCheck(env: AppEnv): Promise<LiveCheckReport> {
   const topology = classifyWalletTopology({
     configuredWalletAddress: env.BOT_WALLET_ADDRESS,
     signerAddress: signer.signerAddress,
-    funderAddress: env.POLY_FUNDER ?? env.BOT_WALLET_ADDRESS,
+    funderAddress: resolveConfiguredFunderAddress(env),
     signatureType: env.POLY_SIGNATURE_TYPE,
     chainId: env.POLY_CHAIN_ID,
   });
   const clob = createClobAdapter(env);
   const clock = new SystemClock();
   const gamma = new GammaClient(env);
+  const config = buildStrategyConfig(env);
+  const stateStore = new PersistentStateStore(config.stateStorePath);
   const publicClient = createPublicClient({
     chain: env.POLY_CHAIN_ID === 80002 ? polygonAmoy : polygon,
     transport: http(env.POLY_RPC_URL),
@@ -290,6 +318,7 @@ export async function runLiveCheck(env: AppEnv): Promise<LiveCheckReport> {
 
   const blockers: string[] = [];
   const warnings: string[] = [];
+  const latestReplayValidation = stateStore.latestValidationRun("replay");
 
   try {
     [
@@ -332,10 +361,21 @@ export async function runLiveCheck(env: AppEnv): Promise<LiveCheckReport> {
   if (env.DRY_RUN) {
     warnings.push("DRY_RUN=true. Bu iyi; canliya cikmadan once false yapilacak.");
   }
+  if (config.validationSequence === "REPLAY_THEN_LIVE" && config.replayRequiredBeforeLive) {
+    if (!latestReplayValidation) {
+      blockers.push("Replay validation kaydi bulunmadi. Live oncesi once npm run paper veya npm run paper:session calistir.");
+    } else if (latestReplayValidation.status === "fail") {
+      blockers.push("Replay validation FAIL durumda. Live oncesi comparator FAIL duzeltilmeli.");
+    } else if (latestReplayValidation.status === "warn") {
+      warnings.push("Replay validation WARN. Footprint similarity orta seviyede; live smoke oncesi sonucu dikkatle degerlendir.");
+    }
+  }
 
   const gammaStatus: ProbeStatus = { ok: false };
   const clobReadStatus: ProbeStatus = { ok: false };
   let marketInfo: LiveCheckReport["market"] = {};
+  let selectedExchangeSpender: string | undefined;
+  let selectedExchangeAllowanceRaw: string | undefined;
   let auth: LiveCheckReport["auth"] = {
     apiCredsPresent: hasApiCreds(env),
   };
@@ -406,6 +446,10 @@ export async function runLiveCheck(env: AppEnv): Promise<LiveCheckReport> {
       minOrderSize: current.minOrderSize,
       source: current.source,
     };
+    selectedExchangeSpender = resolveExchangeSpender({
+      useClobV2: env.USE_CLOB_V2,
+      negRisk: current.negRisk,
+    });
 
     try {
       await clob.getOrderBook(current.tokens.UP.tokenId);
@@ -456,6 +500,10 @@ export async function runLiveCheck(env: AppEnv): Promise<LiveCheckReport> {
           client.getBalanceAllowance({ asset_type: V2AssetType.COLLATERAL }),
         ]);
         const collateralAllowanceRaw = extractAllowanceRaw(balanceAllowance);
+        const allowanceMap = extractAllowanceMap(balanceAllowance);
+        selectedExchangeAllowanceRaw = selectedExchangeSpender
+          ? allowanceMap[selectedExchangeSpender] ?? balanceAllowance.allowance
+          : collateralAllowanceRaw;
         auth = {
           apiCredsPresent: true,
           apiKeysCount: apiKeys.apiKeys.length,
@@ -463,6 +511,10 @@ export async function runLiveCheck(env: AppEnv): Promise<LiveCheckReport> {
           collateralBalance: formatTokenAmount(BigInt(balanceAllowance.balance), Number(collateralDecimals)),
           ...(collateralAllowanceRaw
             ? { collateralAllowance: formatTokenAmount(BigInt(collateralAllowanceRaw), Number(collateralDecimals)) }
+            : {}),
+          ...(selectedExchangeSpender ? { selectedExchangeSpender } : {}),
+          ...(selectedExchangeAllowanceRaw
+            ? { selectedExchangeAllowance: formatTokenAmount(BigInt(selectedExchangeAllowanceRaw), Number(collateralDecimals)) }
             : {}),
         };
       } else {
@@ -492,6 +544,10 @@ export async function runLiveCheck(env: AppEnv): Promise<LiveCheckReport> {
           client.getBalanceAllowance({ asset_type: V1AssetType.COLLATERAL }),
         ]);
         const collateralAllowanceRaw = extractAllowanceRaw(balanceAllowance);
+        const allowanceMap = extractAllowanceMap(balanceAllowance);
+        selectedExchangeAllowanceRaw = selectedExchangeSpender
+          ? allowanceMap[selectedExchangeSpender] ?? balanceAllowance.allowance
+          : collateralAllowanceRaw;
         auth = {
           apiCredsPresent: true,
           apiKeysCount: apiKeys.apiKeys.length,
@@ -499,6 +555,10 @@ export async function runLiveCheck(env: AppEnv): Promise<LiveCheckReport> {
           collateralBalance: formatTokenAmount(BigInt(balanceAllowance.balance), Number(collateralDecimals)),
           ...(collateralAllowanceRaw
             ? { collateralAllowance: formatTokenAmount(BigInt(collateralAllowanceRaw), Number(collateralDecimals)) }
+            : {}),
+          ...(selectedExchangeSpender ? { selectedExchangeSpender } : {}),
+          ...(selectedExchangeAllowanceRaw
+            ? { selectedExchangeAllowance: formatTokenAmount(BigInt(selectedExchangeAllowanceRaw), Number(collateralDecimals)) }
             : {}),
         };
       }
@@ -510,11 +570,32 @@ export async function runLiveCheck(env: AppEnv): Promise<LiveCheckReport> {
   if (Number(auth.collateralAllowance ?? "0") <= 0) {
     blockers.push("Collateral allowance 0 veya okunamadi; buy emirleri fail eder.");
   }
-  if (Number(auth.collateralBalance ?? "0") < env.MIN_USDC_BALANCE) {
+  if (selectedExchangeSpender && Number(auth.selectedExchangeAllowance ?? "0") < env.MIN_USDC_BALANCE_FOR_NEW_ENTRY) {
+    blockers.push(
+      `Secili exchange spender allowance yetersiz (${selectedExchangeSpender} -> ${auth.selectedExchangeAllowance ?? "0"}). collateral:approve gerekli.`,
+    );
+  }
+  if (Number(auth.collateralBalance ?? "0") < env.MIN_USDC_BALANCE_FOR_NEW_ENTRY) {
     blockers.push("CLOB collateral balance min live esiginin altinda.");
   }
 
-  return {
+  try {
+    const inventorySnapshot = await fetchInventorySnapshot(env, config);
+    const inventoryPlan = buildInventoryActionPlan(inventorySnapshot, config);
+    const actionableMarkets = inventorySnapshot.markets.filter(
+      (market) => market.totalShares >= config.dustSharesThreshold,
+    ).length;
+    if (actionableMarkets > 0) {
+      warnings.push(`Funder uzerinde ${actionableMarkets} markette residual inventory bulundu.`);
+    }
+    if (inventoryPlan.blockNewEntries) {
+      blockers.push(`Startup inventory policy yeni entry'i bloklar: ${inventoryPlan.blockReasons.join(", ")}`);
+    }
+  } catch (error) {
+    warnings.push(`Inventory snapshot alinamadi: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  const report = {
     summary: {
       readyForLiveSmall: blockers.length === 0,
       blockers,
@@ -568,4 +649,6 @@ export async function runLiveCheck(env: AppEnv): Promise<LiveCheckReport> {
     },
     recommendedEnv: recommendedCanaryEnv(),
   };
+  stateStore.close();
+  return report;
 }

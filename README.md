@@ -78,6 +78,7 @@ npm run analyze:xuan
 npm run capture -- --duration-sec 75
 npm run paper
 npm run paper:multi -- --windows 3
+npm run paper:session -- --variant xuan-flow
 npm run paper:live -- --duration-sec 20 --sample-ms 2000
 npm run bot:dry
 npm run bot:live
@@ -95,6 +96,8 @@ npm test
 `npm run analyze:xuan` once `data/xuanxuan008_data_20260415_145447.json` yolunu dener. Dosya yoksa bundled fixture ile devam eder ve bunu loglar.
 
 `npm run paper:multi -- --windows 3` synthetic scenario matrix replay calistirir. Bu komut historical PnL backtest degil; temsilî 5m pencerelerde early pair-seed buy, lagging-side buy rebalance, streaming merge, completion ve hard-cancel davranisini toplu sayilarla gosterir.
+
+`npm run paper:session -- --variant xuan-flow` tek market icinde state tasiyan synthetic paper session calistirir. Bu akista bot fill, partial-leg, completion, merge ve session-level fee/PnL ozeti birlikte raporlanir. `blocked-completion` varyanti completion cap nedeniyle residual inventory'nin tutuldugu yolu gosterir.
 
 `npm run paper:live -- --duration-sec 20 --sample-ms 2000` gercek market orderbook'u ustunde canli paper decision loop calistirir. Emir gondermez; pair-entry readiness, lagging-side rebalance sinyali, completion-only / hard-cancel gecisleri, buy notional, merge readiness ve fee-sonrasi pair cost gibi karar metriklerini toplar. Current market gec pencereye girmisse otomatik olarak next 5m marketi secer.
 

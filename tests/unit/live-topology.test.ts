@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { assessMergeExecutionReadiness, classifyWalletTopology } from "../../src/live/topology.js";
+import { assessMergeExecutionReadiness, classifyWalletTopology, resolveConfiguredFunderAddress } from "../../src/live/topology.js";
 
 describe("live topology", () => {
   it("allows SAFE merge when derived funder, relayer owner, and deployment are all ready", () => {
@@ -86,5 +86,23 @@ describe("live topology", () => {
     expect(readiness.ready).toBe(false);
     expect(readiness.severity).toBe("warn");
     expect(readiness.reason).toContain("CTF_MERGE_ENABLED=false");
+  });
+
+  it("uses funder address as collateral owner when configured", () => {
+    expect(
+      resolveConfiguredFunderAddress({
+        BOT_WALLET_ADDRESS: "0x84CC411f0452791010E70E80FFF6255B1f757A29",
+        POLY_FUNDER: "0xeb724b33cb2d2f886989f035db9ab304a1d248ba",
+      }),
+    ).toBe("0xeb724b33cb2d2f886989f035db9ab304a1d248ba");
+  });
+
+  it("falls back to bot wallet when no funder is configured", () => {
+    expect(
+      resolveConfiguredFunderAddress({
+        BOT_WALLET_ADDRESS: "0x84CC411f0452791010E70E80FFF6255B1f757A29",
+        POLY_FUNDER: undefined,
+      }),
+    ).toBe("0x84CC411f0452791010E70E80FFF6255B1f757A29");
   });
 });

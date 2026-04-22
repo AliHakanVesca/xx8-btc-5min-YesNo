@@ -1,0 +1,177 @@
+{
+  "startedAt": 1776840762,
+  "endedAt": 1776840774,
+  "captureDir": "data/capture/2026-04-22T06-52-42-000Z",
+  "markets": {
+    "current": {
+      "slug": "btc-updown-5m-1776840600",
+      "conditionId": "0x526fc308e826807e23ce31cd07778a7b8717c7e706b35c9900dc48596499fa42",
+      "startTs": 1776840600,
+      "endTs": 1776840900,
+      "tickSize": 0.01,
+      "minOrderSize": 5,
+      "upTokenId": "37650664733244792966423739038379599087828227940236927725869921797940896732322",
+      "downTokenId": "69034667907688018551770175828664026680825091412205532445561625988371741639501"
+    },
+    "next": {
+      "slug": "btc-updown-5m-1776840900",
+      "conditionId": "0xc91d3eb94930a017911a96a4706c32aedccab7e761632ad47014bb894a4fd944",
+      "startTs": 1776840900,
+      "endTs": 1776841200,
+      "tickSize": 0.01,
+      "minOrderSize": 5,
+      "upTokenId": "76790476013463892033687406088162298173667916891477897284087861533006110730255",
+      "downTokenId": "43802758756037347435365431928559053616979470897209066760366393385821723236611"
+    }
+  },
+  "subscriptions": {
+    "marketAssetIds": [
+      "37650664733244792966423739038379599087828227940236927725869921797940896732322",
+      "69034667907688018551770175828664026680825091412205532445561625988371741639501",
+      "76790476013463892033687406088162298173667916891477897284087861533006110730255",
+      "43802758756037347435365431928559053616979470897209066760366393385821723236611"
+    ],
+    "userMarkets": [
+      "0x526fc308e826807e23ce31cd07778a7b8717c7e706b35c9900dc48596499fa42",
+      "0xc91d3eb94930a017911a96a4706c32aedccab7e761632ad47014bb894a4fd944"
+    ],
+    "userWsEnabled": true
+  },
+  "wsStatus": {
+    "marketWsOpened": true,
+    "userWsOpened": true,
+    "userWsWarnings": [],
+    "userWsErrors": []
+  },
+  "initialBalances": {
+    "current": {
+      "slug": "btc-updown-5m-1776840600",
+      "conditionId": "0x526fc308e826807e23ce31cd07778a7b8717c7e706b35c9900dc48596499fa42",
+      "up": {
+        "tokenId": "37650664733244792966423739038379599087828227940236927725869921797940896732322",
+        "rawBalance": "0",
+        "shares": 0
+      },
+      "down": {
+        "tokenId": "69034667907688018551770175828664026680825091412205532445561625988371741639501",
+        "rawBalance": "0",
+        "shares": 0
+      }
+    },
+    "next": {
+      "slug": "btc-updown-5m-1776840900",
+      "conditionId": "0xc91d3eb94930a017911a96a4706c32aedccab7e761632ad47014bb894a4fd944",
+      "up": {
+        "tokenId": "76790476013463892033687406088162298173667916891477897284087861533006110730255",
+        "rawBalance": "0",
+        "shares": 0
+      },
+      "down": {
+        "tokenId": "43802758756037347435365431928559053616979470897209066760366393385821723236611",
+        "rawBalance": "0",
+        "shares": 0
+      }
+    }
+  },
+  "finalBalances": {
+    "current": {
+      "slug": "btc-updown-5m-1776840600",
+      "conditionId": "0x526fc308e826807e23ce31cd07778a7b8717c7e706b35c9900dc48596499fa42",
+      "up": {
+        "tokenId": "37650664733244792966423739038379599087828227940236927725869921797940896732322",
+        "rawBalance": "0",
+        "shares": 0
+      },
+      "down": {
+        "tokenId": "69034667907688018551770175828664026680825091412205532445561625988371741639501",
+        "rawBalance": "0",
+        "shares": 0
+      }
+    },
+    "next": {
+      "slug": "btc-updown-5m-1776840900",
+      "conditionId": "0xc91d3eb94930a017911a96a4706c32aedccab7e761632ad47014bb894a4fd944",
+      "up": {
+        "tokenId": "76790476013463892033687406088162298173667916891477897284087861533006110730255",
+        "rawBalance": "0",
+        "shares": 0
+      },
+      "down": {
+        "tokenId": "43802758756037347435365431928559053616979470897209066760366393385821723236611",
+        "rawBalance": "0",
+        "shares": 0
+      }
+    }
+  },
+  "balanceDeltaShares": {
+    "current": {
+      "up": 0,
+      "down": 0
+    },
+    "next": {
+      "up": 0,
+      "down": 0
+    }
+  },
+  "normalization": {
+    "assumedScale": 1000000,
+    "rationale": "ERC1155 balance report includes raw on-chain amount and shares=raw/1e6 hypothesis; local CTF write path already uses 6-decimal base units.",
+    "confidence": "low"
+  },
+  "captureStats": {
+    "marketRawEventCount": 6559,
+    "userRawEventCount": 0,
+    "marketEventTypes": {
+      "book": 228,
+      "price_change": 5914,
+      "best_bid_ask": 310,
+      "last_trade_price": 107
+    },
+    "userEventTypes": {},
+    "booksSeenByAssetId": {
+      "37650664733244792966423739038379599087828227940236927725869921797940896732322": 321,
+      "69034667907688018551770175828664026680825091412205532445561625988371741639501": 317,
+      "76790476013463892033687406088162298173667916891477897284087861533006110730255": 4,
+      "43802758756037347435365431928559053616979470897209066760366393385821723236611": 3
+    }
+  },
+  "mappingValidation": {
+    "current": {
+      "upBookSeen": true,
+      "downBookSeen": true
+    },
+    "next": {
+      "upBookSeen": true,
+      "downBookSeen": true
+    }
+  },
+  "latestBooks": {
+    "37650664733244792966423739038379599087828227940236927725869921797940896732322": {
+      "bid": 0.56,
+      "ask": 0.58,
+      "timestamp": 1776840774
+    },
+    "69034667907688018551770175828664026680825091412205532445561625988371741639501": {
+      "bid": 0.42,
+      "ask": 0.44,
+      "timestamp": 1776840774
+    },
+    "76790476013463892033687406088162298173667916891477897284087861533006110730255": {
+      "bid": 0.01,
+      "ask": 0.99,
+      "timestamp": 1776840769
+    },
+    "43802758756037347435365431928559053616979470897209066760366393385821723236611": {
+      "bid": 0.01,
+      "ask": 0.99,
+      "timestamp": 1776840769
+    }
+  },
+  "files": {
+    "report": "data/capture/2026-04-22T06-52-42-000Z/report.json",
+    "markets": "data/capture/2026-04-22T06-52-42-000Z/markets.json",
+    "balances": "data/capture/2026-04-22T06-52-42-000Z/balances.json",
+    "marketWs": "data/capture/2026-04-22T06-52-42-000Z/market-ws.jsonl",
+    "userWs": "data/capture/2026-04-22T06-52-42-000Z/user-ws.jsonl"
+  }
+}

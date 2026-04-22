@@ -12,12 +12,12 @@ export class Erc20BalanceReader {
     });
   }
 
-  async getBalance(tokenAddress: string): Promise<number> {
+  async getBalance(tokenAddress: string, ownerAddress = this.env.BOT_WALLET_ADDRESS): Promise<number> {
     const balance = await this.client.readContract({
       address: tokenAddress as `0x${string}`,
       abi: erc20Abi,
       functionName: "balanceOf",
-      args: [this.env.BOT_WALLET_ADDRESS as `0x${string}`],
+      args: [ownerAddress as `0x${string}`],
     });
     return Number(balance);
   }

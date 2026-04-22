@@ -1,3 +1,4 @@
+import type { AppEnv } from "../config/schema.js";
 import { deriveExpectedFunderAddress, resolveRelayerExecutionMode, type RelayerExecutionMode } from "../infra/relayer/txType.js";
 
 export interface WalletTopology {
@@ -16,6 +17,12 @@ export interface MergeExecutionReadiness {
   ready: boolean;
   severity: "ok" | "warn" | "block";
   reason?: string;
+}
+
+export function resolveConfiguredFunderAddress(
+  env: Pick<AppEnv, "BOT_WALLET_ADDRESS" | "POLY_FUNDER">,
+): string {
+  return env.POLY_FUNDER ?? env.BOT_WALLET_ADDRESS;
 }
 
 export function classifyWalletTopology(args: {

@@ -8,11 +8,13 @@ import {
   type CompletionDecision,
   type UnwindDecision,
 } from "./completionEngine.js";
-import { chooseEntryBuys, type EntryBuyDecision } from "./entryLadderEngine.js";
+import { evaluateEntryBuys, type EntryBuyDecision, type EntryDecisionTrace } from "./entryLadderEngine.js";
 import type { XuanMarketState } from "./marketState.js";
 import { OrderBookState } from "./orderBookState.js";
 import { pairEntryCap } from "./modePolicy.js";
 import { pairCostWithBothTaker } from "./sumAvgEngine.js";
+import type { StrategyExecutionMode } from "./executionModes.js";
+import type { FairValueSnapshot } from "./fairValueEngine.js";
 
 export interface BotDecision {
   phase: ReturnType<typeof getStrategyPhase>;
@@ -21,6 +23,23 @@ export interface BotDecision {
   completion?: CompletionDecision | undefined;
   unwind?: UnwindDecision | undefined;
   mergeShares: number;
+  trace: BotDecisionTrace;
+}
+
+export interface BotDecisionTrace {
+  secsFromOpen: number;
+  secsToClose: number;
+  lot: number;
+  totalShares: number;
+  shareGap: number;
+  inventoryBalanced: boolean;
+  bestAskUp: number;
+  bestAskDown: number;
+  pairCap: number;
+  pairTakerCost: number;
+  selectedMode?: StrategyExecutionMode | undefined;
+  fairValue?: FairValueSnapshot | undefined;
+  entry: EntryDecisionTrace;
 }
 
 export interface TickInput {
@@ -30,31 +49,64 @@ export interface TickInput {
   nowTs: number;
   riskContext: RiskContext;
   dryRunOrSmallLive: boolean;
+  dailyNegativeEdgeSpentUsdc?: number;
+  fairValueSnapshot?: FairValueSnapshot | undefined;
+}
+
+function overrideRiskForPhase(
+  phase: ReturnType<typeof getStrategyPhase>,
+  risk: RiskEvaluation,
+): RiskEvaluation {
+  if (phase === "PREOPEN") {
+    return {
+      tradable: false,
+      allowNewEntries: false,
+      completionOnly: false,
+      hardCancel: true,
+      reasons: ["preopen"],
+    };
+  }
+
+  if (phase === "CLOSED") {
+    return {
+      tradable: false,
+      allowNewEntries: false,
+      completionOnly: false,
+      hardCancel: true,
+      reasons: ["closed"],
+    };
+  }
+
+  return risk;
 }
 
 export class Xuan5mBot {
   evaluateTick(input: TickInput): BotDecision {
     const { config, state, books, nowTs, riskContext } = input;
     const phase = getStrategyPhase(nowTs, state.market.startTs, state.market.endTs, config);
-    const risk = evaluateRisk(config, state, riskContext);
+    const risk = overrideRiskForPhase(phase, evaluateRisk(config, state, riskContext));
     const secsFromOpen = nowTs - state.market.startTs;
     const secsToClose = state.market.endTs - nowTs;
+    const totalShares = state.upShares + state.downShares;
+    const shareGap = Math.abs(state.upShares - state.downShares);
+    const bestAskUp = books.bestAsk("UP");
+    const bestAskDown = books.bestAsk("DOWN");
     const pairTakerCost = pairCostWithBothTaker(
-      books.bestAsk("UP"),
-      books.bestAsk("DOWN"),
+      bestAskUp,
+      bestAskDown,
       config.cryptoTakerFeeRate,
     );
     const pairCap = pairEntryCap(config);
-    const inventoryBalanced = Math.abs(state.upShares - state.downShares) <= state.market.minOrderSize;
+    const inventoryBalanced = shareGap <= config.completionMinQty;
 
     const lot = chooseLot(config, {
       dryRunOrSmallLive: input.dryRunOrSmallLive,
       secsFromOpen,
-      imbalance: Math.abs(state.upShares - state.downShares) / Math.max(state.upShares + state.downShares, 1),
+      imbalance: shareGap / Math.max(totalShares, 1),
       bookDepthGood:
         Math.min(
-          books.depthAtOrBetter("UP", books.bestAsk("UP"), "ask"),
-          books.depthAtOrBetter("DOWN", books.bestAsk("DOWN"), "ask"),
+          books.depthAtOrBetter("UP", bestAskUp, "ask"),
+          books.depthAtOrBetter("DOWN", bestAskDown, "ask"),
         ) >= config.defaultLot,
       pairCostWithinCap: pairTakerCost <= pairCap,
       pairCostComfortable: pairTakerCost <= pairCap - config.minEdgePerShare,
@@ -64,19 +116,26 @@ export class Xuan5mBot {
       pnlTodayPositive: riskContext.dailyLossUsdc <= 0,
     });
 
-    const baseMergePlan = planMerge(config, state);
+    const entryEvaluation = evaluateEntryBuys(config, state, books, {
+      secsFromOpen,
+      secsToClose,
+      lot,
+      dailyNegativeEdgeSpentUsdc: input.dailyNegativeEdgeSpentUsdc ?? state.negativeEdgeConsumedUsdc,
+      fairValueSnapshot: input.fairValueSnapshot,
+    });
 
     const entryBuys =
       risk.allowNewEntries
-        ? chooseEntryBuys(config, state, books, {
-            secsFromOpen,
-            secsToClose,
-            lot,
-          })
+        ? entryEvaluation.decisions
         : [];
 
     const inventoryAdjustment = risk.tradable && !risk.allowNewEntries
-      ? chooseInventoryAdjustment(config, state, books, { secsToClose }) ?? undefined
+        ? chooseInventoryAdjustment(config, state, books, {
+          secsToClose,
+          usdcBalance: riskContext.usdcBalance,
+          nowTs,
+          fairValueSnapshot: input.fairValueSnapshot,
+        }) ?? undefined
       : undefined;
     const mergePlan = planMerge(config, projectMergeState(state, entryBuys, inventoryAdjustment?.completion));
 
@@ -87,6 +146,31 @@ export class Xuan5mBot {
       completion: inventoryAdjustment?.completion,
       unwind: inventoryAdjustment?.unwind,
       mergeShares: mergePlan.shouldMerge ? mergePlan.mergeable : 0,
+      trace: {
+        secsFromOpen,
+        secsToClose,
+        lot,
+        totalShares,
+        shareGap,
+        inventoryBalanced,
+        bestAskUp,
+        bestAskDown,
+        pairCap,
+        pairTakerCost,
+        ...(input.fairValueSnapshot ? { fairValue: input.fairValueSnapshot } : {}),
+        selectedMode:
+          entryBuys[0]?.mode ??
+          inventoryAdjustment?.completion?.mode ??
+          inventoryAdjustment?.unwind?.mode ??
+          entryEvaluation.trace.selectedMode,
+        entry: risk.allowNewEntries
+          ? entryEvaluation.trace
+          : {
+              ...entryEvaluation.trace,
+              gatedByRisk: true,
+              skipReason: entryEvaluation.trace.skipReason ?? "risk_blocked",
+            },
+      },
     };
   }
 }

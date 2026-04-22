@@ -37,6 +37,26 @@ function extractMinOrderSize(raw: any): number | undefined {
   return value === undefined ? undefined : Number(value);
 }
 
+function extractExplicitPriceToBeat(raw: any): number | undefined {
+  const candidates = [
+    raw?.priceToBeat,
+    raw?.price_to_beat,
+    raw?.threshold,
+    raw?.thresholdPrice,
+    raw?.threshold_price,
+    raw?.strike,
+    raw?.strikePrice,
+    raw?.strike_price,
+  ];
+  for (const candidate of candidates) {
+    const numeric = Number(candidate);
+    if (Number.isFinite(numeric) && numeric > 0) {
+      return numeric;
+    }
+  }
+  return undefined;
+}
+
 function extractTokenMappings(raw: any): Array<{ tokenId: string; outcome: OutcomeSide }> {
   const entries: Array<{ tokenId: string; outcome: OutcomeSide }> = [];
 
@@ -91,6 +111,12 @@ function marketFromSources(
     feeRate: clobInfo?.feeRate ?? Number(gammaRaw?.fee_rate ?? 0.072),
     feesEnabled: Boolean(gammaRaw?.feesEnabled ?? gammaRaw?.fees_enabled ?? true),
     negRisk: clobInfo?.negRisk ?? Boolean(gammaRaw?.negRisk ?? false),
+    ...(extractExplicitPriceToBeat(gammaRaw) !== undefined
+      ? {
+          priceToBeat: extractExplicitPriceToBeat(gammaRaw),
+          priceToBeatSource: "metadata" as const,
+        }
+      : {}),
     tokens: {
       UP: {
         tokenId: upToken?.tokenId ?? zeroPadToken(slug, "UP"),

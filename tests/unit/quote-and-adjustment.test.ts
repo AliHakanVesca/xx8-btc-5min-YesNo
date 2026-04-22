@@ -137,7 +137,7 @@ describe("entry and inventory adjustment", () => {
     expect(decision.entryBuys.map((entry) => entry.side)).toEqual(["UP", "DOWN"]);
     expect(decision.entryBuys.every((entry) => entry.reason === "balanced_pair_seed")).toBe(true);
     expect(decision.entryBuys.every((entry) => entry.order.orderType === "FAK")).toBe(true);
-    expect(decision.mergeShares).toBe(20);
+    expect(decision.mergeShares).toBe(5);
   });
 
   it("scans the configured ladder with real ask-side vwap and keeps the largest rung within cap", () => {
@@ -147,8 +147,8 @@ describe("entry and inventory adjustment", () => {
       parseEnv({
         DRY_RUN: "true",
         POLY_STACK_MODE: "current-prod-v1",
-        LOT_LADDER: "20,40,60,80,100",
-        LIVE_SMALL_LOTS: "20,40",
+        XUAN_BASE_LOT_LADDER: "20,40,60,80,100",
+        LIVE_SMALL_LOT_LADDER: "20,40",
         DEFAULT_LOT: "40",
         NORMAL_PAIR_EFFECTIVE_CAP: "1.01",
       }),
@@ -203,7 +203,7 @@ describe("entry and inventory adjustment", () => {
         [{ price: 0.48, size: 200 }],
         [
           { price: 0.49, size: 30 },
-          { price: 0.64, size: 60 },
+          { price: 0.6, size: 60 },
         ],
       ),
     );
@@ -212,8 +212,9 @@ describe("entry and inventory adjustment", () => {
 
     expect(adjustment?.completion).toMatchObject({
       sideToBuy: "DOWN",
-      missingShares: 30,
-      residualAfter: 30,
+      missingShares: 10,
+      residualAfter: 50,
+      capMode: "strict",
     });
     expect(adjustment?.unwind).toBeUndefined();
   });
@@ -240,6 +241,7 @@ describe("entry and inventory adjustment", () => {
         DRY_RUN: "true",
         POLY_STACK_MODE: "current-prod-v1",
         SELL_UNWIND_ENABLED: "true",
+        ALLOW_UNRESOLVED_SELL: "true",
       }),
     );
     const market = buildOfflineMarket(1713696000);

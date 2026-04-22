@@ -28,7 +28,7 @@ describe("lot ladder and risk windows", () => {
         marketVolumeHigh: true,
         pnlTodayPositive: true,
       }),
-    ).toBe(20);
+    ).toBe(5);
   });
 
   it("moves to completion-only late in the window", () => {
@@ -45,5 +45,23 @@ describe("lot ladder and risk windows", () => {
 
     expect(risk.completionOnly).toBe(true);
     expect(risk.allowNewEntries).toBe(false);
+  });
+
+  it("switches to no-new-entry but keeps completion-only active under low collateral", () => {
+    const state = createMarketState(buildOfflineMarket(1713696000));
+    const risk = evaluateRisk(config, state, {
+      secsToClose: 120,
+      staleBookMs: 100,
+      balanceStaleMs: 100,
+      bookIsCrossed: false,
+      dailyLossUsdc: 0,
+      marketLossUsdc: 0,
+      usdcBalance: 12,
+    });
+
+    expect(risk.tradable).toBe(true);
+    expect(risk.allowNewEntries).toBe(false);
+    expect(risk.completionOnly).toBe(true);
+    expect(risk.reasons).toContain("low_usdc_no_new_entry");
   });
 });

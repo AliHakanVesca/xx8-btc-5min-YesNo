@@ -24,12 +24,12 @@ describe("multi synthetic replay", () => {
       mergeScenarioCount: 10,
       completionOnlyScenarioCount: 8,
       hardCancelScenarioCount: 2,
-      totalEntryBuyShares: 300,
-      totalCompletionShares: 120,
+      totalEntryBuyShares: 80,
+      totalCompletionShares: 20,
       totalUnwindShares: 0,
-      totalMergeShares: 500,
+      totalMergeShares: 270,
     });
-    expect(report.summary.totalEntryBuyNotional).toBeCloseTo(144.2, 8);
+    expect(report.summary.totalEntryBuyNotional).toBeCloseTo(38.5, 8);
 
     const firstSlug = report.scenarios[0]?.marketSlug ?? "";
     const windowStartTs = Number(firstSlug.split("-").at(-1));
@@ -37,15 +37,15 @@ describe("multi synthetic replay", () => {
     expect(windowStartTs % 300).toBe(0);
 
     const profitableCompletion = report.scenarios.find((scenario) => scenario.scenarioName === "profitable-completion");
-    expect(profitableCompletion?.orders.completion?.missingShares).toBe(60);
+    expect(profitableCompletion?.orders.completion?.missingShares).toBe(10);
     expect(profitableCompletion?.economics.completionWithinCap).toBe(true);
-    expect(profitableCompletion?.orders.mergeShares).toBe(60);
+    expect(profitableCompletion?.orders.mergeShares).toBe(10);
 
     const openingPairSeed = report.scenarios.find((scenario) => scenario.scenarioName === "open-balanced-entry");
     expect(openingPairSeed?.orders.entryBuyCount).toBe(2);
     expect(openingPairSeed?.orders.entryBuys.map((entry) => entry.side)).toEqual(["UP", "DOWN"]);
-    expect(openingPairSeed?.orders.totalEntryBuyShares).toBe(40);
-    expect(openingPairSeed?.orders.mergeShares).toBe(20);
+    expect(openingPairSeed?.orders.totalEntryBuyShares).toBe(10);
+    expect(openingPairSeed?.orders.mergeShares).toBe(5);
 
     const rebalanceScenario = report.scenarios.find((scenario) => scenario.scenarioName === "mid-rebalance-buy-only");
     expect(rebalanceScenario?.orders.entryBuyCount).toBe(1);
@@ -54,15 +54,15 @@ describe("multi synthetic replay", () => {
     expect(rebalanceScenario?.orders.entryBuys).toHaveLength(1);
     expect(rebalanceScenario?.orders.entryBuys[0]?.side).toBe("DOWN");
     expect(rebalanceScenario?.orders.entryBuys[0]?.reason).toBe("lagging_rebalance");
-    expect(rebalanceScenario?.orders.entryBuys[0]?.size).toBe(30);
+    expect(rebalanceScenario?.orders.entryBuys[0]?.size).toBe(10);
     expect(rebalanceScenario?.orders.completion).toBeUndefined();
-    expect(rebalanceScenario?.orders.mergeShares).toBe(40);
+    expect(rebalanceScenario?.orders.mergeShares).toBe(20);
 
     const mergeQueue = report.scenarios.find((scenario) => scenario.scenarioName === "merge-queue");
     expect(mergeQueue?.orders.entryBuyCount).toBe(2);
     expect(mergeQueue?.orders.balancedPairEntryCount).toBe(2);
-    expect(mergeQueue?.orders.totalEntryBuyShares).toBe(40);
-    expect(mergeQueue?.orders.mergeShares).toBe(110);
+    expect(mergeQueue?.orders.totalEntryBuyShares).toBe(10);
+    expect(mergeQueue?.orders.mergeShares).toBe(95);
 
     const blockedCompletion = report.scenarios.find(
       (scenario) => scenario.scenarioName === "expensive-completion-blocked",

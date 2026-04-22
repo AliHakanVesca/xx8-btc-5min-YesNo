@@ -20,6 +20,7 @@ import type {
   OrderBook,
   OrderResult,
 } from "./types.js";
+import { deriveOrderResultSuccess } from "./orderResult.js";
 
 function toV1Chain(chainId: number): V1Chain {
   return chainId === 80002 ? V1Chain.AMOY : V1Chain.POLYGON;
@@ -234,7 +235,7 @@ export class V1Adapter implements ClobAdapter {
 
   private mapOrderResult(raw: any, fallbackStatus: string): OrderResult {
     return {
-      success: raw?.success ?? true,
+      success: deriveOrderResultSuccess(raw, raw?.status ?? fallbackStatus),
       simulated: false,
       orderId: raw?.orderID ?? raw?.orderId ?? "unknown-order-id",
       status: raw?.status ?? fallbackStatus,

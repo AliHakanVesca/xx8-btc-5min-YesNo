@@ -1,16 +1,19 @@
 import type { AppEnv } from "../config/schema.js";
-import { buildStrategyConfig } from "../config/strategyPresets.js";
+import { buildStrategyConfig, type XuanStrategyConfig } from "../config/strategyPresets.js";
 import { createClobAdapter } from "../infra/clob/index.js";
 import type { MarketInfo, OrderBook, OutcomeSide, TradeSide } from "../infra/clob/types.js";
+import type { MarketOrderArgs, OrderResult } from "../infra/clob/types.js";
 import { GammaClient } from "../infra/gamma/gammaClient.js";
 import { Erc1155BalanceReader } from "../infra/polygon/erc1155Balances.js";
 import { Erc20BalanceReader } from "../infra/polygon/erc20Balances.js";
 import { discoverCurrentAndNextMarkets } from "../infra/gamma/marketDiscovery.js";
 import { UserWsClient, type UserOrderEvent, type UserTradeEvent } from "../infra/ws/userWsClient.js";
 import { MarketWsClient } from "../infra/ws/marketWsClient.js";
+import { BtcPriceFeed } from "../infra/ws/btcPriceFeed.js";
 import { SystemClock } from "../infra/time/clock.js";
 import { CtfClient } from "../infra/ctf/ctfClient.js";
 import { createLogger, writeStructuredLog } from "../observability/logger.js";
+import { JsonlTraceLogger } from "../observability/jsonlTrace.js";
 import { renderDashboard } from "../observability/dashboard.js";
 import { OrderManager } from "../execution/orderManager.js";
 import {
@@ -26,9 +29,23 @@ import { TakerCompletionManager } from "../execution/takerCompletionManager.js";
 import { Xuan5mBot } from "../strategy/xuan5m/Xuan5mBot.js";
 import { OrderBookState } from "../strategy/xuan5m/orderBookState.js";
 import { createMarketState, type FillRecord, type XuanMarketState } from "../strategy/xuan5m/marketState.js";
-import { applyFill, applyMerge, averageCost } from "../strategy/xuan5m/inventoryState.js";
+import { applyFill, applyMerge, averageCost, shrinkOutcomeToObservedShares } from "../strategy/xuan5m/inventoryState.js";
+import { chooseInventoryAdjustment } from "../strategy/xuan5m/completionEngine.js";
 import { planMerge } from "../strategy/xuan5m/mergeCoordinator.js";
 import { estimateNegativeEdgeUsdc } from "../strategy/xuan5m/modePolicy.js";
+import { resolveConfiguredFunderAddress } from "./topology.js";
+import { isClassifiedBuyMode, type StrategyExecutionMode } from "../strategy/xuan5m/executionModes.js";
+import type { EntryBuyDecision } from "../strategy/xuan5m/entryLadderEngine.js";
+import {
+  buildInventoryActionPlan,
+  executeInventoryActionPlan,
+  fetchInventorySnapshot,
+  type InventoryMarketView,
+} from "./inventoryManager.js";
+import { isOrderResultAccepted, summarizeOrderResult } from "../infra/clob/orderResult.js";
+import { PersistentStateStore } from "./persistentStateStore.js";
+import { MarketFairValueRuntime } from "./fairValueRuntime.js";
+import type { FairValueSnapshot } from "../strategy/xuan5m/fairValueEngine.js";
 
 export interface BotSessionOptions {
   durationSec?: number;
@@ -36,6 +53,8 @@ export interface BotSessionOptions {
   initialBookWaitMs?: number;
   balanceSyncMs?: number;
   marketSelection?: "auto" | "current" | "next";
+  initialDailyNegativeEdgeSpentUsdc?: number;
+  dailyBudgetStorePath?: string;
 }
 
 export interface ObservedTokenBalances {
@@ -56,9 +75,18 @@ export interface StateReconcileResult {
 }
 
 export interface SubmittedIntent {
+  side: TradeSide;
   price?: number | undefined;
   submittedAt: number;
+  mode?: StrategyExecutionMode | undefined;
+  groupId?: string | undefined;
+  orderId?: string | undefined;
+  expectedShares?: number | undefined;
+  attributedShares: number;
+  active: boolean;
 }
+
+type SubmittedIntentBook = Partial<Record<OutcomeSide, SubmittedIntent[]>>;
 
 export interface BotSessionReport {
   runtime: {
@@ -105,6 +133,10 @@ export interface BotSessionReport {
     fillCount: number;
     mergeCount: number;
     negativeEdgeConsumedUsdc: number;
+    negativePairEdgeConsumedUsdc: number;
+    negativeCompletionEdgeConsumedUsdc: number;
+    initialDailyNegativeEdgeSpentUsdc: number;
+    finalDailyNegativeEdgeSpentUsdc: number;
   };
   finalDecision: ReturnType<Xuan5mBot["evaluateTick"]>;
   dashboard: string;
@@ -118,6 +150,101 @@ interface PendingPairExecution {
   negativeEdgeUsdc: number;
   deadlineAt: number;
   status: PairOrderGroupStatus;
+  submittedAt: number;
+  reconciledAfterSubmit: boolean;
+}
+
+interface PartialOpenGroupLock {
+  groupId: string;
+  status: Extract<PairOrderGroupStatus, "UP_ONLY" | "DOWN_ONLY">;
+  openedAt: number;
+}
+
+const DECISION_TRACE_INTERVAL_SEC = 20;
+
+interface DecisionTraceContext {
+  eventSeq: number;
+  decisionLatencyMs: number;
+  bookAgeMsUp: number;
+  bookAgeMsDown: number;
+}
+
+function normalizeMergeAmount(mergeable: number, dustLeaveShares: number): number {
+  return Number(Math.max(0, mergeable - Math.max(0, dustLeaveShares)).toFixed(6));
+}
+
+function computePendingLockedShares(
+  pending: PendingPairExecution | undefined,
+  fillSnapshot: { upBoughtQty: number; downBoughtQty: number } | undefined,
+  config: Pick<XuanStrategyConfig, "lockReservedQtyForPendingOrders">,
+): { up: number; down: number } {
+  if (!pending || !config.lockReservedQtyForPendingOrders) {
+    return { up: 0, down: 0 };
+  }
+  return {
+    up: Number((fillSnapshot?.upBoughtQty ?? 0).toFixed(6)),
+    down: Number((fillSnapshot?.downBoughtQty ?? 0).toFixed(6)),
+  };
+}
+
+function unlockedMergeableShares(
+  state: XuanMarketState,
+  locked: { up: number; down: number },
+): number {
+  return Number(
+    Math.min(
+      Math.max(0, state.upShares - locked.up),
+      Math.max(0, state.downShares - locked.down),
+    ).toFixed(6),
+  );
+}
+
+function shouldAllowControlledOverlap(args: {
+  config: Pick<
+    XuanStrategyConfig,
+    | "allowControlledOverlap"
+    | "allowOverlapOnlyAfterPartialClassified"
+    | "allowOverlapOnlyWhenCompletionEngineActive"
+    | "allowOverlapInLast30S"
+    | "finalWindowCompletionOnlySec"
+    | "partialFastWindowSec"
+    | "partialPatientWindowSec"
+    | "maxOpenGroupsPerMarket"
+    | "maxOpenPartialGroups"
+  >;
+  nowTs: number;
+  secsToClose: number;
+  partialOpenGroupLock: PartialOpenGroupLock | undefined;
+  completionActive: boolean;
+  linkageHealthy: boolean;
+  entryBuys: EntryBuyDecision[];
+}): boolean {
+  if (!args.config.allowControlledOverlap) {
+    return false;
+  }
+  if (!args.partialOpenGroupLock || args.entryBuys.length !== 2) {
+    return false;
+  }
+  if (args.config.maxOpenGroupsPerMarket < 2 || args.config.maxOpenPartialGroups < 1) {
+    return false;
+  }
+  if (!args.config.allowOverlapInLast30S && args.secsToClose <= args.config.finalWindowCompletionOnlySec) {
+    return false;
+  }
+  const partialAgeSec = Math.max(0, args.nowTs - args.partialOpenGroupLock.openedAt);
+  if (partialAgeSec < args.config.partialFastWindowSec) {
+    return false;
+  }
+  if (partialAgeSec >= args.config.partialPatientWindowSec) {
+    return false;
+  }
+  if (args.config.allowOverlapOnlyAfterPartialClassified && !args.linkageHealthy) {
+    return false;
+  }
+  if (args.config.allowOverlapOnlyWhenCompletionEngineActive && !args.completionActive) {
+    return false;
+  }
+  return true;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -174,11 +301,114 @@ function clampFallbackPrice(price: number | undefined): number {
   return 0.5;
 }
 
+function normalizeShares(value: number): number {
+  return Number(value.toFixed(6));
+}
+
 function pushEvent(events: Array<Record<string, unknown>>, event: Record<string, unknown>, limit = 200): void {
   events.push(event);
   if (events.length > limit) {
     events.shift();
   }
+}
+
+function buildDecisionTraceEvent(
+  decision: ReturnType<Xuan5mBot["evaluateTick"]>,
+  context: DecisionTraceContext,
+): Record<string, unknown> {
+  const candidateCaps = decision.trace.entry.candidates.map((candidate) => ({
+    qty: candidate.requestedSize,
+    rawPair: candidate.rawPairCost,
+    effectivePair: candidate.pairCost,
+    negativeEdgeUsdc: candidate.negativeEdgeUsdc,
+    selectedMode: candidate.selectedMode ?? null,
+    gateReason: candidate.gateReason ?? null,
+  }));
+  const bestEffectivePair =
+    decision.trace.entry.candidates.length > 0
+      ? Math.min(...decision.trace.entry.candidates.map((candidate) => candidate.pairCost))
+      : null;
+  const bestRawPair =
+    decision.trace.entry.candidates.length > 0
+      ? Math.min(...decision.trace.entry.candidates.map((candidate) => candidate.rawPairCost))
+      : null;
+  return {
+    eventSeq: context.eventSeq,
+    decisionLatencyMs: context.decisionLatencyMs,
+    bookAgeMsUp: context.bookAgeMsUp,
+    bookAgeMsDown: context.bookAgeMsDown,
+    phase: decision.phase,
+    allowNewEntries: decision.risk.allowNewEntries,
+    completionOnly: decision.risk.completionOnly,
+    hardCancel: decision.risk.hardCancel,
+    riskReasons: decision.risk.reasons,
+    secsFromOpen: decision.trace.secsFromOpen,
+    secsToClose: decision.trace.secsToClose,
+    lot: decision.trace.lot,
+    totalShares: decision.trace.totalShares,
+    shareGap: decision.trace.shareGap,
+    inventoryBalanced: decision.trace.inventoryBalanced,
+    bestAskUp: decision.trace.bestAskUp,
+    bestAskDown: decision.trace.bestAskDown,
+    pairCap: decision.trace.pairCap,
+    pairTakerCost: decision.trace.pairTakerCost,
+    selectedMode: decision.trace.selectedMode ?? null,
+    fairValueStatus: decision.trace.fairValue?.status ?? null,
+    fairValuePriceToBeat: decision.trace.fairValue?.priceToBeat ?? null,
+    fairValueLivePrice: decision.trace.fairValue?.livePrice ?? null,
+    fairValueUp: decision.trace.fairValue?.fairUp ?? null,
+    fairValueDown: decision.trace.fairValue?.fairDown ?? null,
+    fairValueEstimatedThreshold: decision.trace.fairValue?.estimatedThreshold ?? null,
+    bestEffectivePair,
+    bestRawPair,
+    wouldTradeAtCap_1_005: Boolean(bestEffectivePair !== null && bestEffectivePair <= 1.005),
+    wouldTradeAtCap_1_025: Boolean(bestEffectivePair !== null && bestEffectivePair <= 1.025),
+    wouldTradeAtCap_1_035: Boolean(bestEffectivePair !== null && bestEffectivePair <= 1.035),
+    wouldTradeAtCap_1_055: Boolean(bestEffectivePair !== null && bestEffectivePair <= 1.055),
+    qtyCaps: candidateCaps,
+    entryMode: decision.trace.entry.mode,
+    entrySkipReason: decision.trace.entry.skipReason ?? null,
+    gatedByRisk: decision.trace.entry.gatedByRisk ?? false,
+    laggingSide: decision.trace.entry.laggingSide ?? null,
+    repairSize: decision.trace.entry.repairSize ?? null,
+    repairFilledSize: decision.trace.entry.repairFilledSize ?? null,
+    repairCost: decision.trace.entry.repairCost ?? null,
+    repairAllowed: decision.trace.entry.repairAllowed ?? null,
+    repairCapMode: decision.trace.entry.repairCapMode ?? null,
+    candidates: decision.trace.entry.candidates,
+    seedCandidates: decision.trace.entry.seedCandidates ?? [],
+  };
+}
+
+function decisionTraceSignature(decision: ReturnType<Xuan5mBot["evaluateTick"]>): string {
+  const entry = decision.trace.entry;
+  const candidateSignature = entry.candidates
+    .map((candidate) => `${candidate.requestedSize}:${candidate.verdict}:${candidate.pairCost.toFixed(6)}`)
+    .join("|");
+  const seedSignature = (entry.seedCandidates ?? [])
+    .map(
+      (candidate) =>
+        `${candidate.side}:${candidate.allowed ? "ok" : candidate.skipReason ?? "skip"}:${candidate.referencePairCost.toFixed(6)}`,
+    )
+    .join("|");
+
+  return [
+    decision.phase,
+    decision.risk.allowNewEntries ? "entry_on" : "entry_off",
+    decision.risk.completionOnly ? "completion_only" : "normal",
+    decision.risk.hardCancel ? "hard_cancel" : "soft",
+    decision.risk.reasons.join(","),
+    decision.trace.fairValue?.status ?? "",
+    decision.trace.fairValue?.fairUp?.toFixed(4) ?? "",
+    decision.trace.fairValue?.fairDown?.toFixed(4) ?? "",
+    entry.mode,
+    entry.skipReason ?? "",
+    entry.gatedByRisk ? "gated" : "open",
+    candidateSignature,
+    seedSignature,
+    entry.repairAllowed === undefined ? "" : entry.repairAllowed ? "repair_ok" : "repair_blocked",
+    entry.repairCost?.toFixed(6) ?? "",
+  ].join("::");
 }
 
 function pickSessionMarket(
@@ -215,8 +445,9 @@ async function waitForInitialBooks(
 async function readObservedBalances(
   reader: Erc1155BalanceReader,
   market: MarketInfo,
+  ownerAddress: string,
 ): Promise<ObservedTokenBalances> {
-  const balances = await reader.getBalances([market.tokens.UP.tokenId, market.tokens.DOWN.tokenId]);
+  const balances = await reader.getBalances([market.tokens.UP.tokenId, market.tokens.DOWN.tokenId], ownerAddress);
   return {
     up: balances.get(String(market.tokens.UP.tokenId)) ?? 0,
     down: balances.get(String(market.tokens.DOWN.tokenId)) ?? 0,
@@ -228,7 +459,7 @@ async function readCollateralBalanceUsdc(env: AppEnv): Promise<number | undefine
     return undefined;
   }
   const reader = new Erc20BalanceReader(env);
-  const raw = await reader.getBalance(env.ACTIVE_COLLATERAL_TOKEN);
+  const raw = await reader.getBalance(env.ACTIVE_COLLATERAL_TOKEN, resolveConfiguredFunderAddress(env));
   return raw / 1_000_000;
 }
 
@@ -236,7 +467,7 @@ export function inferUserTradeFill(args: {
   event: UserTradeEvent;
   market: MarketInfo;
   nowTs: number;
-  submittedPrices: Partial<Record<OutcomeSide, SubmittedIntent>>;
+  submittedPrices: SubmittedIntentBook;
 }): FillRecord | undefined {
   const outcome = normalizeOutcome(args.event.outcome) ?? outcomeForAssetId(args.market, args.event.asset_id);
   if (!outcome) {
@@ -254,10 +485,12 @@ export function inferUserTradeFill(args: {
     0,
   );
   const weightedPrice = matchedSize > 0 ? weightedNotional / matchedSize : undefined;
-  const fallbackIntent = args.submittedPrices[outcome];
+  const fallbackIntent = latestSubmittedIntent(args.submittedPrices, outcome);
   const price = parseNumeric(args.event.price) ?? weightedPrice ?? fallbackIntent?.price;
   const makerSide = makerOrders[0]?.side?.toUpperCase();
-  const side: TradeSide = makerSide === "BUY" ? "SELL" : "BUY";
+  const side: TradeSide =
+    fallbackIntent?.side ??
+    (makerSide === "BUY" ? "SELL" : "BUY");
 
   return {
     outcome,
@@ -266,6 +499,7 @@ export function inferUserTradeFill(args: {
     size: Number(matchedSize.toFixed(6)),
     timestamp: args.nowTs,
     makerTaker: "taker",
+    executionMode: fallbackIntent?.mode,
   };
 }
 
@@ -281,7 +515,6 @@ export function reconcileStateWithBalances(args: {
 
   const reconcileOutcome = (outcome: OutcomeSide, observedShares: number): void => {
     const sharesKey = outcome === "UP" ? "upShares" : "downShares";
-    const costKey = outcome === "UP" ? "upCost" : "downCost";
     const currentShares = state[sharesKey];
     const normalizedObserved = Number(observedShares.toFixed(6));
 
@@ -300,12 +533,7 @@ export function reconcileStateWithBalances(args: {
     }
 
     if (normalizedObserved < currentShares - 1e-6) {
-      const averageBefore = averageCost(state, outcome);
-      state = {
-        ...state,
-        [sharesKey]: normalizedObserved,
-        [costKey]: Number((normalizedObserved * averageBefore).toFixed(6)),
-      };
+      state = shrinkOutcomeToObservedShares(state, outcome, normalizedObserved);
       corrections.push({
         outcome,
         fromShares: currentShares,
@@ -322,18 +550,139 @@ export function reconcileStateWithBalances(args: {
 
 function buildFallbackPrices(
   books: OrderBookState,
-  submittedPrices: Partial<Record<OutcomeSide, SubmittedIntent>>,
+  submittedPrices: SubmittedIntentBook,
 ): Record<OutcomeSide, number | undefined> {
   return {
-    UP: submittedPrices.UP?.price ?? books.bestAsk("UP"),
-    DOWN: submittedPrices.DOWN?.price ?? books.bestAsk("DOWN"),
+    UP: latestSubmittedIntent(submittedPrices, "UP")?.price ?? books.bestAsk("UP"),
+    DOWN: latestSubmittedIntent(submittedPrices, "DOWN")?.price ?? books.bestAsk("DOWN"),
   };
 }
 
+function latestSubmittedIntent(
+  submittedPrices: SubmittedIntentBook,
+  outcome: OutcomeSide,
+): SubmittedIntent | undefined {
+  const intents = submittedPrices[outcome] ?? [];
+  return [...intents].reverse().find((intent) => intent.active) ?? intents.at(-1);
+}
+
+function recentSubmittedIntent(
+  submittedPrices: SubmittedIntentBook,
+  outcome: OutcomeSide,
+  nowTs: number,
+  maxAgeSec: number,
+): SubmittedIntent | undefined {
+  const intents = submittedPrices[outcome] ?? [];
+  return [...intents]
+    .reverse()
+    .find((intent) => nowTs - intent.submittedAt <= maxAgeSec);
+}
+
+function findActiveSubmittedIntent(
+  submittedPrices: SubmittedIntentBook,
+  outcome: OutcomeSide,
+): SubmittedIntent | undefined {
+  const intents = submittedPrices[outcome] ?? [];
+  return intents.find((intent) => intent.active);
+}
+
+function consumeSubmittedIntent(
+  submittedPrices: SubmittedIntentBook,
+  outcome: OutcomeSide,
+  filledShares: number,
+): SubmittedIntent | undefined {
+  const intent = findActiveSubmittedIntent(submittedPrices, outcome);
+  if (!intent) {
+    return undefined;
+  }
+  intent.attributedShares = normalizeShares(intent.attributedShares + filledShares);
+  if (
+    intent.expectedShares === undefined ||
+    intent.attributedShares >= normalizeShares(Math.max(0, intent.expectedShares - 1e-6))
+  ) {
+    intent.active = false;
+  }
+  return intent;
+}
+
+function resolveFillIntent(
+  submittedPrices: SubmittedIntentBook,
+  outcome: OutcomeSide,
+  filledShares: number,
+  nowTs: number,
+  maxAgeSec: number,
+): SubmittedIntent | undefined {
+  return (
+    consumeSubmittedIntent(submittedPrices, outcome, filledShares) ??
+    recentSubmittedIntent(submittedPrices, outcome, nowTs, maxAgeSec)
+  );
+}
+
+function inferPendingPairExecutionIntent(args: {
+  pending: PendingPairExecution | undefined;
+  outcome: OutcomeSide;
+  filledShares: number;
+  fillSnapshot?: { upBoughtQty: number; downBoughtQty: number } | undefined;
+}): SubmittedIntent | undefined {
+  if (!args.pending) {
+    return undefined;
+  }
+
+  const alreadyAttributed =
+    args.outcome === "UP" ? args.fillSnapshot?.upBoughtQty ?? 0 : args.fillSnapshot?.downBoughtQty ?? 0;
+  const remainingQty = normalizeShares(Math.max(0, args.pending.group.intendedQty - alreadyAttributed));
+  if (remainingQty <= 1e-6) {
+    return undefined;
+  }
+
+  const toleranceShares = 0.5;
+  if (args.filledShares > remainingQty + toleranceShares) {
+    return undefined;
+  }
+
+  return {
+    side: "BUY",
+    price: args.outcome === "UP" ? args.pending.group.maxUpPrice : args.pending.group.maxDownPrice,
+    submittedAt: args.pending.submittedAt,
+    mode: args.pending.group.selectedMode,
+    groupId: args.pending.group.groupId,
+    expectedShares: remainingQty,
+    attributedShares: normalizeShares(args.filledShares),
+    active: false,
+  };
+}
+
+function extractExpectedSharesFromOrderResult(result: OrderResult | undefined): number | undefined {
+  const raw = result?.raw;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return undefined;
+  }
+  const value = Number((raw as { takingAmount?: unknown }).takingAmount);
+  if (!Number.isFinite(value) || value <= 0) {
+    return undefined;
+  }
+  return normalizeShares(value);
+}
+
+function expectedSharesForSubmission(
+  shareTarget: number | undefined,
+  result: OrderResult | undefined,
+): number | undefined {
+  return extractExpectedSharesFromOrderResult(result) ?? (shareTarget !== undefined ? normalizeShares(shareTarget) : undefined);
+}
+
 function rememberSubmittedPrices(
-  submittedPrices: Partial<Record<OutcomeSide, SubmittedIntent>>,
+  submittedPrices: SubmittedIntentBook,
   market: MarketInfo,
-  orders: Array<{ tokenId: string; price?: number | undefined }>,
+  orders: Array<{
+    tokenId: string;
+    side: TradeSide;
+    price?: number | undefined;
+    mode?: StrategyExecutionMode | undefined;
+    groupId?: string | undefined;
+    orderId?: string | undefined;
+    expectedShares?: number | undefined;
+  }>,
   submittedAt: number,
 ): void {
   for (const order of orders) {
@@ -341,10 +690,20 @@ function rememberSubmittedPrices(
     if (!outcome) {
       continue;
     }
-    submittedPrices[outcome] = {
+    const nextIntent: SubmittedIntent = {
+      side: order.side,
       price: order.price,
       submittedAt,
+      mode: order.mode,
+      groupId: order.groupId,
+      orderId: order.orderId,
+      expectedShares: order.expectedShares,
+      attributedShares: 0,
+      active: true,
     };
+    const bucket = submittedPrices[outcome] ?? [];
+    bucket.push(nextIntent);
+    submittedPrices[outcome] = bucket;
   }
 }
 
@@ -352,24 +711,121 @@ function buildBooks(client: MarketWsClient, market: MarketInfo): OrderBookState 
   return new OrderBookState(client.getBook(market.tokens.UP.tokenId), client.getBook(market.tokens.DOWN.tokenId));
 }
 
-function reserveNegativeEdgeBudget(state: XuanMarketState, negativeEdgeUsdc: number): XuanMarketState {
+function reserveNegativeEdgeBudget(
+  state: XuanMarketState,
+  negativeEdgeUsdc: number,
+  bucket: "pair" | "completion",
+): XuanMarketState {
   if (negativeEdgeUsdc <= 0) {
     return state;
   }
   return {
     ...state,
     negativeEdgeConsumedUsdc: Number((state.negativeEdgeConsumedUsdc + negativeEdgeUsdc).toFixed(6)),
+    negativePairEdgeConsumedUsdc:
+      bucket === "pair"
+        ? Number((state.negativePairEdgeConsumedUsdc + negativeEdgeUsdc).toFixed(6))
+        : state.negativePairEdgeConsumedUsdc,
+    negativeCompletionEdgeConsumedUsdc:
+      bucket === "completion"
+        ? Number((state.negativeCompletionEdgeConsumedUsdc + negativeEdgeUsdc).toFixed(6))
+        : state.negativeCompletionEdgeConsumedUsdc,
   };
+}
+
+function consumedPairNegativeEdgeUsdc(args: {
+  estimatedNegativeEdgeUsdc: number;
+  intendedQty: number;
+  filledUpQty: number;
+  filledDownQty: number;
+}): number {
+  if (args.estimatedNegativeEdgeUsdc <= 0 || args.intendedQty <= 0) {
+    return 0;
+  }
+  const fillRatio = Math.min(
+    1,
+    (Math.max(0, args.filledUpQty) + Math.max(0, args.filledDownQty)) / (args.intendedQty * 2),
+  );
+  return normalizeShares(args.estimatedNegativeEdgeUsdc * fillRatio);
+}
+
+function withAvailableUsdcBalance(order: MarketOrderArgs, usdcBalance: number | undefined): MarketOrderArgs {
+  if (order.side !== "BUY" || usdcBalance === undefined || !Number.isFinite(usdcBalance) || usdcBalance <= 0) {
+    return order;
+  }
+
+  return {
+    ...order,
+    userUsdcBalance: Number(usdcBalance.toFixed(6)),
+  };
+}
+
+async function logRejectedOrder(args: {
+  traceLogger: JsonlTraceLogger;
+  phase: "entry" | "completion" | "unwind";
+  mode: string;
+  side?: OutcomeSide | undefined;
+  size: number;
+  result: OrderResult;
+  order: MarketOrderArgs;
+  negativeEdgeUsdc?: number | undefined;
+}): Promise<void> {
+  await args.traceLogger.write("errors", {
+    channel: "order_submit",
+    severity: "warn",
+    phase: args.phase,
+    mode: args.mode,
+    outcome: args.side ?? null,
+    size: args.size,
+    price: args.order.price ?? null,
+    shareTarget: args.order.shareTarget ?? null,
+    spendAmount: args.order.amount,
+    negativeEdgeUsdc: args.negativeEdgeUsdc ?? 0,
+    ...summarizeOrderResult(args.result),
+  });
+}
+
+function updateSeedSubmissionState(
+  state: XuanMarketState,
+  mode: StrategyExecutionMode,
+  side: OutcomeSide,
+): XuanMarketState {
+  if (mode === "PAIRGROUP_COVERED_SEED") {
+    const nextCount = state.consecutiveSeedSide === side ? state.consecutiveSeedCount + 1 : 1;
+    return {
+      ...state,
+      consecutiveSeedSide: side,
+      consecutiveSeedCount: nextCount,
+      lastExecutionMode: mode,
+    };
+  }
+
+  return {
+    ...state,
+    consecutiveSeedSide: undefined,
+    consecutiveSeedCount: 0,
+    lastExecutionMode: mode,
+  };
+}
+
+function assertClassifiedBuyMode(mode: StrategyExecutionMode, config: Pick<XuanStrategyConfig, "rejectUnclassifiedBuy">): void {
+  if (!config.rejectUnclassifiedBuy) {
+    return;
+  }
+  if (!isClassifiedBuyMode(mode)) {
+    throw new Error(`Unclassified BUY mode rejected: ${mode}`);
+  }
 }
 
 function resolveActivePairExecution(
   pending: PendingPairExecution | undefined,
   state: XuanMarketState,
+  fillSnapshot?: { upBoughtQty: number; downBoughtQty: number },
 ): PendingPairExecution | undefined {
   if (!pending) {
     return undefined;
   }
-  const status = resolvePairOrderGroupStatus(pending.group, state);
+  const status = resolvePairOrderGroupStatus(pending.group, state, fillSnapshot);
   return {
     ...pending,
     status,
@@ -390,10 +846,20 @@ export async function runStatefulBotSession(
     initialBookWaitMs: Math.max(1000, Math.floor(options.initialBookWaitMs ?? 8000)),
     balanceSyncMs: Math.max(1000, Math.floor(options.balanceSyncMs ?? 5000)),
     marketSelection: options.marketSelection ?? "auto",
+    initialDailyNegativeEdgeSpentUsdc: Math.max(0, Number(options.initialDailyNegativeEdgeSpentUsdc ?? 0)),
+    dailyBudgetStorePath: options.dailyBudgetStorePath ?? "",
   };
 
   const logger = createLogger(env);
   const config = buildStrategyConfig(env);
+  const stateStore = new PersistentStateStore(config.stateStorePath);
+  if (!env.DRY_RUN && config.validationSequence === "REPLAY_THEN_LIVE" && config.replayRequiredBeforeLive) {
+    const latestReplayValidation = stateStore.latestValidationRun("replay");
+    if (!latestReplayValidation || latestReplayValidation.status === "fail") {
+      stateStore.close();
+      throw new Error("Live once girmeden once replay validation gerekli. Once npm run paper veya npm run paper:session calistir.");
+    }
+  }
   const clob = createClobAdapter(env);
   const gamma = new GammaClient(env);
   const clock = new SystemClock();
@@ -407,17 +873,63 @@ export async function runStatefulBotSession(
   const startedAt = clock.now();
 
   const discovery = await discoverCurrentAndNextMarkets({ env, gammaClient: gamma, clob, clock });
-  const selected =
+  let selected =
     resolvedOptions.marketSelection === "current"
       ? { selection: "current" as const, market: discovery.current }
       : resolvedOptions.marketSelection === "next"
         ? { selection: "next" as const, market: discovery.next }
         : pickSessionMarket(discovery, startedAt, config.normalEntryCutoffSecToClose);
+  let startupInventorySnapshot =
+    config.startupInventoryPolicy === "ADOPT_AND_RECONCILE"
+      ? await fetchInventorySnapshot(env, config)
+      : undefined;
+  if (
+    resolvedOptions.marketSelection === "auto" &&
+    startupInventorySnapshot?.currentMarket &&
+    startupInventorySnapshot.currentMarket.totalShares >= config.dustSharesThreshold
+  ) {
+    selected = {
+      selection: "current",
+      market: discovery.current,
+    };
+  }
   const market = selected.market;
+  const balanceOwnerAddress = resolveConfiguredFunderAddress(env);
+  const persistedBudget = stateStore.loadRiskBudget({
+    wallet: balanceOwnerAddress,
+    now: new Date(startedAt * 1000),
+  });
+  const initialDailyNegativeEdgeSpentUsdc = Math.max(
+    0,
+    Number(
+      options.initialDailyNegativeEdgeSpentUsdc ?? persistedBudget.dailyNegativeSpentUsdc,
+    ),
+  );
+  resolvedOptions.initialDailyNegativeEdgeSpentUsdc = initialDailyNegativeEdgeSpentUsdc;
+  const runId = `live-${market.slug}-${startedAt}`;
+  const traceLogger = new JsonlTraceLogger(env, {
+    runId,
+    source: "stateful_session",
+    botMode: config.botMode,
+    dryRun: env.DRY_RUN,
+    marketSlug: market.slug,
+    conditionId: market.conditionId,
+    upTokenId: market.tokens.UP.tokenId,
+    downTokenId: market.tokens.DOWN.tokenId,
+  });
   let state = createMarketState(market);
   let cachedUsdcBalance = (await readCollateralBalanceUsdc(env)) ?? Math.max(config.minUsdcBalance, 100);
+  let startupBlockNewEntries = false;
+  let startupCompletionOnly = false;
+  let startupSafeHalt = false;
+  let startupExternalReasons: string[] = [];
+  let externalActivityDetected = false;
+  let pairgroupLinkageHealthy = true;
+  let grouplessFillEvents = 0;
   let lastBalanceSyncAt = 0;
   let actionCooldownUntil = 0;
+  let lastMergeAtMs = 0;
+  let mergeTxCount = 0;
   let adoptedInventory = false;
   let userTradeCount = 0;
   let balanceSyncCount = 0;
@@ -429,27 +941,339 @@ export async function runStatefulBotSession(
   let unwindSubmitCount = 0;
   let mergeCount = 0;
   let ticks = 0;
-  const submittedPrices: Partial<Record<OutcomeSide, SubmittedIntent>> = {};
+  const submittedPrices: SubmittedIntentBook = {};
   const seenTradeIds = new Set<string>();
   const events: Array<Record<string, unknown>> = [];
   let pendingPairExecution: PendingPairExecution | undefined;
+  let partialOpenGroupLock: PartialOpenGroupLock | undefined;
+  let lastDecisionTraceAt = 0;
+  let lastDecisionTraceSignature = "";
+  let marketEventSeq = 0;
+  let latestBookEventAtMs = Date.now();
+  let lastBookEventAtMs: Record<OutcomeSide, number> = {
+    UP: Date.now(),
+    DOWN: Date.now(),
+  };
+  let pendingDecisionPulseResolve: (() => void) | undefined;
+  let latestFairValueSnapshot: FairValueSnapshot | undefined;
+  const btcPriceFeed = new BtcPriceFeed();
+  const fairValueRuntime = new MarketFairValueRuntime(config, market, stateStore, btcPriceFeed);
+  const persistedSafeHalt = stateStore.loadSafeHalt();
+  if (persistedSafeHalt.active && config.requireManualResumeConfirm) {
+    stateStore.close();
+    throw new Error(
+      `SAFE_HALT aktif (${persistedSafeHalt.reason ?? "external_activity"}). Once npm run inventory:reconcile, sonra npm run inventory:report, en son npm run bot:resume --confirm calistir.`,
+    );
+  }
 
+  const persistDailyBudget = (nextState: XuanMarketState): void => {
+    stateStore.upsertRiskBudget({
+      wallet: balanceOwnerAddress,
+      dailyNegativeSpentUsdc: initialDailyNegativeEdgeSpentUsdc + nextState.negativeEdgeConsumedUsdc,
+      marketSlug: market.slug,
+      marketNegativeSpentUsdc: nextState.negativePairEdgeConsumedUsdc,
+      now: new Date(clock.now() * 1000),
+    });
+  };
+  const submittedIntentMaxAgeSec = Math.max(15, Math.ceil(config.pairgroupFinalizeTimeoutMs / 1000) + 2);
+
+  const signalDecisionPulse = (): void => {
+    const resolve = pendingDecisionPulseResolve;
+    pendingDecisionPulseResolve = undefined;
+    resolve?.();
+  };
+
+  const waitForDecisionPulse = async (): Promise<void> =>
+    new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        if (pendingDecisionPulseResolve === onPulse) {
+          pendingDecisionPulseResolve = undefined;
+        }
+        resolve();
+      }, resolvedOptions.tickMs);
+
+      const onPulse = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+
+      pendingDecisionPulseResolve = onPulse;
+    });
+
+  const writeRiskEvent = async (reason: string, extra: Record<string, unknown> = {}): Promise<void> => {
+    await traceLogger.write("risk_events", {
+      reason,
+      ...extra,
+    });
+  };
+
+  const markExternalActivity = async (
+    reason: string,
+    extra: Record<string, unknown> = {},
+  ): Promise<void> => {
+    if (externalActivityDetected) {
+      return;
+    }
+    externalActivityDetected = true;
+    startupBlockNewEntries = config.blockNewEntryOnExternalActivity;
+    startupCompletionOnly =
+      config.externalActivityMode === "SAFE_HALT" ? false : config.requireReconcileAfterManualTrade;
+    startupSafeHalt = config.externalActivityMode === "SAFE_HALT";
+    if (startupSafeHalt) {
+      stateStore.setSafeHalt({
+        active: true,
+        reason,
+        timestamp: clock.now(),
+      });
+      try {
+        await clob.cancelAll();
+      } catch (error) {
+        logger.warn({ error }, "SAFE_HALT cancelAll failed.");
+      }
+    }
+    startupExternalReasons = [...new Set([...startupExternalReasons, reason])];
+    stateStore.recordExternalActivity({
+      marketSlug: market.slug,
+      conditionId: market.conditionId,
+      timestamp: clock.now(),
+      type: "runtime",
+      action: reason,
+      reason,
+      botRecognized: false,
+      responseMode: config.externalActivityMode,
+    });
+    await writeRiskEvent(reason, {
+      stage: "runtime",
+      blockNewEntries: startupBlockNewEntries,
+      completionOnly: startupCompletionOnly,
+      safeHalt: startupSafeHalt,
+      ...extra,
+    });
+  };
+
+  const markPairgroupRepairRequired = async (
+    reason: string,
+    extra: Record<string, unknown> = {},
+  ): Promise<void> => {
+    pairgroupLinkageHealthy = false;
+    grouplessFillEvents += 1;
+    const escalateToGlobalSafeHalt =
+      config.pairgroupRepairRequiredScope === "GLOBAL" ||
+      config.pairgroupRepairRepeatEscalation === "GLOBAL_SAFE_HALT" &&
+      grouplessFillEvents >= config.maxGrouplessFillEventsBeforeGlobalHalt;
+
+    startupCompletionOnly = true;
+    startupBlockNewEntries = true;
+    startupExternalReasons = [...new Set([...startupExternalReasons, reason])];
+    if (escalateToGlobalSafeHalt) {
+      startupCompletionOnly = false;
+      startupSafeHalt = true;
+      stateStore.setSafeHalt({
+        active: true,
+        reason,
+        timestamp: clock.now(),
+      });
+      try {
+        await clob.cancelAll();
+      } catch (error) {
+        logger.warn({ error }, "pairgroup repair escalation cancelAll failed.");
+      }
+    }
+    stateStore.upsertMarketState(state, reason);
+    stateStore.recordReconcileRun({
+      scope: "pairgroup_repair_required",
+      marketSlug: market.slug,
+      conditionId: market.conditionId,
+      timestamp: clock.now(),
+      status: escalateToGlobalSafeHalt ? "safe_halt" : "repair_required",
+      requiresManualResume: true,
+      payload: {
+        scope: config.pairgroupRepairRequiredScope,
+        grouplessFillEvents,
+        escalated: escalateToGlobalSafeHalt,
+        ...extra,
+      },
+    });
+    await writeRiskEvent(reason, {
+      stage: "pairgroup_repair",
+      scope: config.pairgroupRepairRequiredScope,
+      grouplessFillEvents,
+      escalated: escalateToGlobalSafeHalt,
+      ...extra,
+    });
+  };
+
+  const writeInventorySnapshotTrace = async (
+    label: string,
+    snapshot: Awaited<ReturnType<typeof fetchInventorySnapshot>>,
+  ): Promise<void> => {
+    await traceLogger.write("inventory_snapshots", {
+      label,
+      walletAddress: snapshot.walletAddress,
+      currentSlug: snapshot.currentSlug,
+      previousSlug: snapshot.previousSlug,
+      nextSlug: snapshot.nextSlug,
+      markets: snapshot.markets.map((inventoryMarket) => ({
+        slug: inventoryMarket.slug,
+        relation: inventoryMarket.relation,
+        knownBtc5m: inventoryMarket.knownBtc5m,
+        resolved: inventoryMarket.resolved,
+        redeemable: inventoryMarket.redeemable,
+        upShares: inventoryMarket.upShares,
+        downShares: inventoryMarket.downShares,
+        mergeable: inventoryMarket.mergeable,
+        residualUp: inventoryMarket.residualUp,
+        residualDown: inventoryMarket.residualDown,
+        imbalanceRatio: inventoryMarket.imbalanceRatio,
+      })),
+    });
+  };
+
+  await traceLogger.write("market_rollover", {
+    status: "session_start",
+    selection: selected.selection,
+    startedAt,
+  });
+  stateStore.recordMarketRollover({
+    status: "session_start",
+    timestamp: startedAt,
+    marketSlug: market.slug,
+    conditionId: market.conditionId,
+    payload: {
+      selection: selected.selection,
+      initialDailyNegativeEdgeSpentUsdc,
+    },
+  });
+  state = stateStore.loadMarketState(state);
+  stateStore.upsertMarketState(state);
+  if (config.restartRestorePartialAsCompletionOnly) {
+    const restoredPartialGroup = stateStore.loadLatestOpenPartialPairGroup(market.slug);
+    const restoredGap = Math.abs(state.upShares - state.downShares);
+    if (
+      restoredPartialGroup &&
+      restoredGap > Math.max(config.repairMinQty, config.completionMinQty)
+    ) {
+      partialOpenGroupLock = {
+        groupId: restoredPartialGroup.groupId,
+        status: restoredPartialGroup.status,
+        openedAt: restoredPartialGroup.createdAt,
+      };
+      startupCompletionOnly = true;
+      if (config.blockNewPairWhenRestoredPartialExists) {
+        startupBlockNewEntries = true;
+      }
+      state = {
+        ...state,
+        reentryDisabled: true,
+      };
+      stateStore.upsertMarketState(state, "restored_partial_group_open");
+      await writeRiskEvent("restored_partial_group_open", {
+        groupId: restoredPartialGroup.groupId,
+        status: restoredPartialGroup.status,
+        restoredGap,
+      });
+    }
+  }
+
+  if (startupInventorySnapshot) {
+    await writeInventorySnapshotTrace("startup_before_manage", startupInventorySnapshot);
+    const startupPlan = buildInventoryActionPlan(startupInventorySnapshot, config);
+    startupBlockNewEntries = startupPlan.blockNewEntries;
+    startupExternalReasons = [...startupPlan.blockReasons];
+
+    if (startupPlan.redeem.length > 0 || startupPlan.merge.length > 0) {
+      const startupActions = await executeInventoryActionPlan(env, startupPlan, config);
+      for (const action of startupActions) {
+        await traceLogger.write("merge_redeem", {
+          action: action.type,
+          slug: action.slug,
+          relation: action.relation,
+          amount: action.amount ?? null,
+          reason: action.reason,
+          txHash: action.result.txHash ?? null,
+          simulated: action.result.simulated,
+          skipped: action.result.skipped ?? false,
+        });
+      }
+      startupInventorySnapshot = await fetchInventorySnapshot(env, config);
+      await writeInventorySnapshotTrace("startup_after_manage", startupInventorySnapshot);
+    }
+
+    const startupGuardPlan = buildInventoryActionPlan(startupInventorySnapshot, config);
+    startupBlockNewEntries = startupGuardPlan.blockNewEntries;
+    startupExternalReasons = [...startupGuardPlan.blockReasons];
+    const startupCurrentInventory =
+      startupInventorySnapshot.markets.find(
+        (inventoryMarket) => inventoryMarket.conditionId === market.conditionId || inventoryMarket.slug === market.slug,
+      ) ?? startupInventorySnapshot.currentMarket;
+    if (startupCurrentInventory && startupCurrentInventory.imbalanceRatio >= config.hardImbalanceRatio) {
+      startupBlockNewEntries = true;
+      startupCompletionOnly = true;
+      startupExternalReasons.push("startup_current_inventory_hard_imbalance");
+    }
+    for (const reason of startupExternalReasons) {
+      await writeRiskEvent(reason, {
+        stage: "startup",
+      });
+    }
+  }
+
+  btcPriceFeed.connect();
   marketWs.connect([market.tokens.UP.tokenId, market.tokens.DOWN.tokenId]);
   userWs.connect([market.conditionId]);
+
+  marketWs.on("book", (book: OrderBook) => {
+    marketEventSeq += 1;
+    latestBookEventAtMs = Date.now();
+    const outcome = outcomeForAssetId(market, book.assetId);
+    if (outcome) {
+      lastBookEventAtMs[outcome] = latestBookEventAtMs;
+    }
+    signalDecisionPulse();
+  });
+  btcPriceFeed.on("price", () => {
+    signalDecisionPulse();
+  });
+  btcPriceFeed.on("warn", (error: Error) => {
+    logger.warn({ error }, "BTC price feed warning.");
+    pushEvent(events, { timestamp: clock.now(), type: "btc_price_warn", message: error.message });
+    void traceLogger.write("errors", {
+      channel: "btc_price_feed",
+      severity: "warn",
+      message: error.message,
+    });
+  });
 
   userWs.on("warn", (error: Error) => {
     logger.warn({ error }, "User websocket warning.");
     pushEvent(events, { timestamp: clock.now(), type: "user_ws_warn", message: error.message });
+    void traceLogger.write("errors", {
+      channel: "user_ws",
+      severity: "warn",
+      message: error.message,
+    });
   });
   userWs.on("error", (error: Error) => {
     logger.error({ error }, "User websocket error.");
     pushEvent(events, { timestamp: clock.now(), type: "user_ws_error", message: error.message });
+    void traceLogger.write("errors", {
+      channel: "user_ws",
+      severity: "error",
+      message: error.message,
+    });
   });
   userWs.on("order", (event: UserOrderEvent) => {
     pushEvent(events, {
       timestamp: clock.now(),
       type: "user_order",
       eventType: event.type,
+      orderId: event.id,
+      assetId: event.asset_id,
+      price: event.price,
+      matchedSize: event.size_matched,
+    });
+    void traceLogger.write("orders", {
+      eventType: "user_order",
       orderId: event.id,
       assetId: event.asset_id,
       price: event.price,
@@ -474,26 +1298,83 @@ export async function runStatefulBotSession(
         eventId: event.id,
         assetId: event.asset_id,
       });
+      void traceLogger.write("errors", {
+        channel: "user_trade",
+        severity: "warn",
+        message: "user_trade_unparsed",
+        eventId: event.id,
+        assetId: event.asset_id,
+      });
       return;
     }
 
-    state = applyFill(state, fill);
+    const pendingFillSnapshot = pendingPairExecution
+      ? stateStore.loadPairGroupFillSnapshot(pendingPairExecution.group.groupId)
+      : undefined;
+    const submittedIntent =
+      resolveFillIntent(
+        submittedPrices,
+        fill.outcome,
+        fill.size,
+        fill.timestamp,
+        submittedIntentMaxAgeSec,
+      ) ??
+      inferPendingPairExecutionIntent({
+        pending: pendingPairExecution,
+        outcome: fill.outcome,
+        filledShares: fill.size,
+        fillSnapshot: pendingFillSnapshot,
+      });
+    const normalizedFill: FillRecord = {
+      ...fill,
+      executionMode: fill.executionMode ?? submittedIntent?.mode,
+    };
+    if (pendingPairExecution && !submittedIntent?.groupId) {
+      void markPairgroupRepairRequired("pairgroup_repair_required", {
+        source: "user_ws",
+        eventId: event.id,
+        outcome: normalizedFill.outcome,
+        size: normalizedFill.size,
+        pendingPairGroupId: pendingPairExecution.group.groupId,
+      });
+    }
+    state = applyFill(state, normalizedFill);
+    stateStore.recordFill(state, normalizedFill, {
+      orderId: submittedIntent?.orderId,
+      groupId: submittedIntent?.groupId,
+      executionMode: submittedIntent?.mode,
+      source: "USER_WS",
+    });
+    stateStore.upsertMarketState(state);
     userTradeCount += 1;
     pushEvent(events, {
-      timestamp: fill.timestamp,
+      timestamp: normalizedFill.timestamp,
       type: "user_fill",
       eventId: event.id,
-      outcome: fill.outcome,
-      side: fill.side,
-      size: fill.size,
-      price: fill.price,
+      outcome: normalizedFill.outcome,
+      side: normalizedFill.side,
+      size: normalizedFill.size,
+      price: normalizedFill.price,
+      groupId: submittedIntent?.groupId ?? null,
+      orderId: submittedIntent?.orderId ?? null,
+    });
+    void traceLogger.write("user_fills", {
+      eventId: event.id,
+      outcome: normalizedFill.outcome,
+      side: normalizedFill.side,
+      size: normalizedFill.size,
+      price: normalizedFill.price,
+      groupId: submittedIntent?.groupId ?? null,
+      orderId: submittedIntent?.orderId ?? null,
+      correlationId: submittedIntent?.groupId ?? event.id,
     });
   });
 
   try {
     const initial = await waitForInitialBooks(marketWs, market, resolvedOptions.initialBookWaitMs);
     const initialBooks = new OrderBookState(initial.upBook, initial.downBook);
-    const initialBalances = await readObservedBalances(balanceReader, market);
+    const initialBalances = await readObservedBalances(balanceReader, market, balanceOwnerAddress);
+    latestFairValueSnapshot = fairValueRuntime.evaluate(startedAt);
     if (initialBalances.up > 0 || initialBalances.down > 0) {
       const adopted = reconcileStateWithBalances({
         state,
@@ -505,6 +1386,12 @@ export async function runStatefulBotSession(
         },
       });
       state = adopted.state;
+      for (const fill of adopted.inferredFills) {
+        stateStore.recordFill(state, fill, {
+          source: "BALANCE_RECONCILE",
+        });
+      }
+      stateStore.upsertMarketState(state);
       adoptedInventory = adopted.inferredFills.length > 0 || adopted.corrections.length > 0;
       if (adoptedInventory) {
         pushEvent(events, {
@@ -513,6 +1400,24 @@ export async function runStatefulBotSession(
           upShares: state.upShares,
           downShares: state.downShares,
         });
+        await traceLogger.write("inventory_snapshots", {
+          label: "startup_adopted_market_state",
+          upShares: state.upShares,
+          downShares: state.downShares,
+          fillCount: state.fillHistory.length,
+          startupBlockNewEntries,
+          startupCompletionOnly,
+        });
+      }
+      const startupCorrectionMagnitude = adopted.corrections.reduce(
+        (acc, correction) => acc + Math.abs(correction.fromShares - correction.toShares),
+        0,
+      );
+      if (startupCorrectionMagnitude > config.stateReconcileToleranceShares) {
+        startupSafeHalt = true;
+        startupBlockNewEntries = true;
+        startupCompletionOnly = false;
+        startupExternalReasons.push("startup_reconcile_mismatch");
       }
     }
 
@@ -525,9 +1430,11 @@ export async function runStatefulBotSession(
       const downBook = marketWs.getBook(market.tokens.DOWN.tokenId);
 
       if (!upBook || !downBook) {
-        await sleep(resolvedOptions.tickMs);
+        await waitForDecisionPulse();
         continue;
       }
+
+      latestFairValueSnapshot = fairValueRuntime.evaluate(nowTs);
 
       if (nowTs - lastBalanceSyncAt >= Math.floor(resolvedOptions.balanceSyncMs / 1000)) {
         lastBalanceSyncAt = nowTs;
@@ -536,7 +1443,7 @@ export async function runStatefulBotSession(
 
         const reconciled = reconcileStateWithBalances({
           state,
-          observed: await readObservedBalances(balanceReader, market),
+          observed: await readObservedBalances(balanceReader, market, balanceOwnerAddress),
           nowTs,
           fallbackPrices: buildFallbackPrices(books, submittedPrices),
         });
@@ -544,12 +1451,57 @@ export async function runStatefulBotSession(
         balanceCorrectionCount += reconciled.corrections.length;
 
         for (const fill of reconciled.inferredFills) {
+          const pendingFillSnapshot = pendingPairExecution
+            ? stateStore.loadPairGroupFillSnapshot(pendingPairExecution.group.groupId)
+            : undefined;
+          const submittedIntent =
+            resolveFillIntent(
+              submittedPrices,
+              fill.outcome,
+              fill.size,
+              fill.timestamp,
+              submittedIntentMaxAgeSec,
+            ) ??
+            inferPendingPairExecutionIntent({
+              pending: pendingPairExecution,
+              outcome: fill.outcome,
+              filledShares: fill.size,
+              fillSnapshot: pendingFillSnapshot,
+            });
+          const normalizedFill: FillRecord = {
+            ...fill,
+            executionMode: fill.executionMode ?? submittedIntent?.mode,
+          };
+          if (pendingPairExecution && !submittedIntent?.groupId) {
+            await markPairgroupRepairRequired("pairgroup_repair_required", {
+              source: "balance_reconcile",
+              outcome: normalizedFill.outcome,
+              size: normalizedFill.size,
+              pendingPairGroupId: pendingPairExecution.group.groupId,
+            });
+          }
+          stateStore.recordFill(state, normalizedFill, {
+            orderId: submittedIntent?.orderId,
+            groupId: submittedIntent?.groupId,
+            executionMode: submittedIntent?.mode,
+            source: "BALANCE_RECONCILE",
+          });
           pushEvent(events, {
             timestamp: nowTs,
             type: "balance_sync_fill",
-            outcome: fill.outcome,
-            size: fill.size,
-            price: fill.price,
+            outcome: normalizedFill.outcome,
+            size: normalizedFill.size,
+            price: normalizedFill.price,
+            groupId: submittedIntent?.groupId ?? null,
+            orderId: submittedIntent?.orderId ?? null,
+          });
+          await traceLogger.write("balance_sync", {
+            balanceEvent: "fill",
+            outcome: normalizedFill.outcome,
+            size: normalizedFill.size,
+            price: normalizedFill.price,
+            groupId: submittedIntent?.groupId ?? null,
+            orderId: submittedIntent?.orderId ?? null,
           });
         }
         for (const correction of reconciled.corrections) {
@@ -560,28 +1512,108 @@ export async function runStatefulBotSession(
             fromShares: correction.fromShares,
             toShares: correction.toShares,
           });
+          await traceLogger.write("balance_sync", {
+            balanceEvent: "correction",
+            outcome: correction.outcome,
+            fromShares: correction.fromShares,
+            toShares: correction.toShares,
+          });
+          if (
+            config.blockNewEntryOnExternalActivity &&
+            correction.toShares + 1e-6 < correction.fromShares
+          ) {
+            await markExternalActivity("external_inventory_delta", {
+              outcome: correction.outcome,
+              fromShares: correction.fromShares,
+              toShares: correction.toShares,
+            });
+          }
+        }
+        stateStore.upsertMarketState(state);
+        stateStore.recordReconcileRun({
+          scope: "session_balance_sync",
+          marketSlug: market.slug,
+          conditionId: market.conditionId,
+          timestamp: nowTs,
+          status: reconciled.corrections.length > 0 ? "corrected" : "ok",
+          requiresManualResume: externalActivityDetected,
+          mismatchShares: reconciled.corrections.reduce(
+            (sum, correction) => sum + Math.abs(correction.fromShares - correction.toShares),
+            0,
+          ),
+          payload: {
+            inferredFills: reconciled.inferredFills.length,
+            corrections: reconciled.corrections.length,
+          },
+        });
+
+        if (config.mergeOnEachReconcile) {
+          await traceLogger.write("inventory_snapshots", {
+            label: "reconcile_state",
+            upShares: state.upShares,
+            downShares: state.downShares,
+            mergeable: Math.min(state.upShares, state.downShares),
+            negativeEdgeConsumedUsdc: state.negativeEdgeConsumedUsdc,
+          });
+        }
+
+        if (pendingPairExecution && nowTs >= pendingPairExecution.submittedAt) {
+          pendingPairExecution = {
+            ...pendingPairExecution,
+            reconciledAfterSubmit: true,
+          };
         }
       }
 
-      pendingPairExecution = resolveActivePairExecution(pendingPairExecution, state);
+      const pendingFillSnapshot = pendingPairExecution
+        ? stateStore.loadPairGroupFillSnapshot(pendingPairExecution.group.groupId)
+        : undefined;
+      pendingPairExecution = resolveActivePairExecution(pendingPairExecution, state, pendingFillSnapshot);
       if (pendingPairExecution) {
         const deadlinePassed = Date.now() >= pendingPairExecution.deadlineAt;
         const finalized =
-          pendingPairExecution.status !== "PENDING" || deadlinePassed
+          pendingPairExecution.status !== "PENDING" ||
+          (deadlinePassed &&
+            (!config.pairgroupFinalizeAfterBalanceSync || pendingPairExecution.reconciledAfterSubmit))
             ? finalizePairExecutionResult({
                 group: pendingPairExecution.group,
                 upResult: pendingPairExecution.upResult,
                 downResult: pendingPairExecution.downResult,
                 state,
+                fillSnapshot: stateStore.loadPairGroupFillSnapshot(pendingPairExecution.group.groupId),
+                reconcileObservedAfterSubmit: pendingPairExecution.reconciledAfterSubmit,
+                requireReconcileBeforeNoneFilled: config.pairgroupRequireReconcileBeforeNoneFilled,
               })
             : undefined;
 
         if (finalized) {
-          if (finalized.status === "BOTH_FILLED") {
-            state = reserveNegativeEdgeBudget(state, pendingPairExecution.negativeEdgeUsdc);
+          const actualNegativeEdgeUsdc = consumedPairNegativeEdgeUsdc({
+            estimatedNegativeEdgeUsdc: pendingPairExecution.negativeEdgeUsdc,
+            intendedQty: finalized.group.intendedQty,
+            filledUpQty: finalized.filledUpQty,
+            filledDownQty: finalized.filledDownQty,
+          });
+          const finalizedGroup = {
+            ...finalized.group,
+            negativeEdgeUsdc: actualNegativeEdgeUsdc,
+            marketNegativeSpentAfter: normalizeShares(
+              finalized.group.marketNegativeSpentBefore + actualNegativeEdgeUsdc,
+            ),
+          };
+
+          if (actualNegativeEdgeUsdc > 0) {
+            state = reserveNegativeEdgeBudget(state, actualNegativeEdgeUsdc, "pair");
+            persistDailyBudget(state);
           }
           if (finalized.status === "UP_ONLY" || finalized.status === "DOWN_ONLY") {
             partialLegCount += 1;
+            partialOpenGroupLock = {
+              groupId: finalized.group.groupId,
+              status: finalized.status,
+              openedAt: nowTs,
+            };
+          } else if (partialOpenGroupLock?.groupId === finalized.group.groupId) {
+            partialOpenGroupLock = undefined;
           }
           pushEvent(events, {
             timestamp: nowTs,
@@ -589,48 +1621,193 @@ export async function runStatefulBotSession(
             groupId: finalized.group.groupId,
             status: finalized.status,
             intendedQty: finalized.group.intendedQty,
-            negativeEdgeUsdc:
-              finalized.status === "BOTH_FILLED" ? pendingPairExecution.negativeEdgeUsdc : 0,
+            negativeEdgeUsdc: actualNegativeEdgeUsdc,
+            filledUpQty: finalized.filledUpQty,
+            filledDownQty: finalized.filledDownQty,
             upResult: pendingPairExecution.upResult,
             downResult: pendingPairExecution.downResult,
           });
+          await traceLogger.write("pair_groups", {
+            eventType: "pair_group_finalized",
+            pairGroupId: finalized.group.groupId,
+            status: finalized.status,
+            normalizedStatus:
+              finalized.status === "UP_ONLY" || finalized.status === "DOWN_ONLY"
+                ? "PARTIAL"
+                : finalized.status,
+            selectedMode: finalizedGroup.selectedMode,
+            intendedQty: finalizedGroup.intendedQty,
+            rawPair: finalizedGroup.rawPair,
+            effectivePair: finalizedGroup.effectivePair,
+            negativeEdgeUsdc: actualNegativeEdgeUsdc,
+            marketNegativeSpentBefore: finalizedGroup.marketNegativeSpentBefore,
+            marketNegativeSpentAfter: finalizedGroup.marketNegativeSpentAfter,
+            filledUpQty: finalized.filledUpQty,
+            filledDownQty: finalized.filledDownQty,
+          });
+          stateStore.upsertPairGroup(finalizedGroup);
+          stateStore.upsertMarketState(
+            state,
+            partialOpenGroupLock?.groupId ? "partial_group_open" : undefined,
+          );
           pendingPairExecution = undefined;
         }
       }
 
-      if (!pendingPairExecution && Date.now() >= actionCooldownUntil) {
+      if (Date.now() >= actionCooldownUntil) {
         const mergePlan = planMerge(config, state);
-        if (mergePlan.shouldMerge && mergePlan.mergeable > 0) {
+        const pendingMergeFillSnapshot = pendingPairExecution
+          ? stateStore.loadPairGroupFillSnapshot(pendingPairExecution.group.groupId)
+          : undefined;
+        const lockedPendingShares = computePendingLockedShares(
+          pendingPairExecution,
+          pendingMergeFillSnapshot,
+          config,
+        );
+        const mergeableUnlocked = config.mergeOnlyConfirmedMatchedUnlockedLots
+          ? unlockedMergeableShares(state, lockedPendingShares)
+          : mergePlan.mergeable;
+        const mergeAmount = normalizeMergeAmount(mergeableUnlocked, config.mergeDustLeaveShares);
+        const mergeAllowed =
+          config.mergeMode === "AUTO" &&
+          mergePlan.shouldMerge &&
+          mergeAmount >= config.mergeMinShares &&
+          Date.now() - lastMergeAtMs >= config.mergeDebounceMs &&
+          (!pendingPairExecution || config.allowMergeWithPendingGroups) &&
+          mergeTxCount < config.mergeMaxTxPerMarket;
+        if (mergeAllowed) {
           const mergeResult = env.CTF_MERGE_ENABLED
-            ? await ctf.mergePositions(market.conditionId, mergePlan.mergeable)
+            ? await ctf.mergePositions(market.conditionId, mergeAmount)
             : {
                 simulated: true,
                 skipped: true,
                 action: "merge" as const,
-                amount: mergePlan.mergeable,
+                amount: mergeAmount,
                 conditionId: market.conditionId,
                 reason: "CTF_MERGE_ENABLED=false",
               };
           if (mergeResult.simulated || !mergeResult.skipped) {
+            const preMergeState = state;
             state = applyMerge(state, {
-              amount: mergePlan.mergeable,
+              amount: mergeAmount,
               timestamp: nowTs,
               simulated: mergeResult.simulated,
             });
+            stateStore.recordMerge(preMergeState, state.mergeHistory.at(-1) ?? {
+              amount: mergeAmount,
+              timestamp: nowTs,
+              simulated: mergeResult.simulated,
+            });
+            const residualAfterMerge = Math.abs(state.upShares - state.downShares);
+            if (config.postMergeOnlyCompletion) {
+              if (config.postMergeOnlyCompletionWhileResidual && residualAfterMerge > config.postMergeFlatDustShares) {
+                state = {
+                  ...state,
+                  reentryDisabled: true,
+                  postMergeCompletionOnlyUntil: undefined,
+                };
+              } else if (config.postMergeAllowNewPairIfFlat) {
+                state = {
+                  ...state,
+                  reentryDisabled: false,
+                  postMergeCompletionOnlyUntil:
+                    nowTs + Math.ceil(config.postMergePairReopenCooldownMs / 1000),
+                };
+              } else {
+                state = {
+                  ...state,
+                  reentryDisabled: true,
+                  postMergeCompletionOnlyUntil:
+                    nowTs + Math.ceil(config.postMergeNewSeedCooldownMs / 1000),
+                };
+              }
+            }
             mergeCount += 1;
+            mergeTxCount += 1;
+            lastMergeAtMs = Date.now();
+            stateStore.upsertMarketState(state, state.reentryDisabled ? "post_merge_completion_only" : undefined);
           }
           actionCooldownUntil = Date.now() + config.reentryDelayMs;
           pushEvent(events, {
             timestamp: nowTs,
             type: "merge",
-            amount: mergePlan.mergeable,
+            amount: mergeAmount,
             result: mergeResult,
           });
-          await sleep(resolvedOptions.tickMs);
+          await traceLogger.write("merge_redeem", {
+            action: "merge",
+            amount: mergeAmount,
+            txHash: mergeResult.txHash ?? null,
+            simulated: mergeResult.simulated,
+            skipped: mergeResult.skipped ?? false,
+            lockedPendingUpShares: lockedPendingShares.up,
+            lockedPendingDownShares: lockedPendingShares.down,
+            matchedUpCost: state.mergeHistory.at(-1)?.matchedUpCost ?? null,
+            matchedDownCost: state.mergeHistory.at(-1)?.matchedDownCost ?? null,
+            mergeReturn: state.mergeHistory.at(-1)?.mergeReturn ?? null,
+            realizedPnl: state.mergeHistory.at(-1)?.realizedPnl ?? null,
+            remainingUpShares: state.mergeHistory.at(-1)?.remainingUpShares ?? null,
+            remainingDownShares: state.mergeHistory.at(-1)?.remainingDownShares ?? null,
+            postMergeCompletionOnlyUntil: state.postMergeCompletionOnlyUntil ?? null,
+          });
+          await waitForDecisionPulse();
           continue;
         }
       }
 
+      const decisionEvalStartedAtMs = Date.now();
+      if (
+        partialOpenGroupLock &&
+        Math.abs(state.upShares - state.downShares) <= Math.max(config.repairMinQty, config.completionMinQty)
+      ) {
+        partialOpenGroupLock = undefined;
+        stateStore.upsertMarketState(state);
+      }
+      if (
+        state.reentryDisabled &&
+        Math.abs(state.upShares - state.downShares) <= config.postMergeFlatDustShares &&
+        config.postMergeAllowNewPairIfFlat
+      ) {
+        state = {
+          ...state,
+          reentryDisabled: false,
+          postMergeCompletionOnlyUntil:
+            nowTs + Math.ceil(config.postMergePairReopenCooldownMs / 1000),
+        };
+        stateStore.upsertMarketState(state);
+      }
+      const overlapCompletionProbe =
+        partialOpenGroupLock !== undefined
+          ? chooseInventoryAdjustment(config, state, books, {
+              secsToClose: market.endTs - nowTs,
+              usdcBalance: cachedUsdcBalance,
+              nowTs,
+              fairValueSnapshot: latestFairValueSnapshot,
+            })
+          : undefined;
+      const overlapCompletionActive = Boolean(overlapCompletionProbe?.completion);
+      const partialAgeSec =
+        partialOpenGroupLock !== undefined ? Math.max(0, nowTs - partialOpenGroupLock.openedAt) : undefined;
+      const previewControlledOverlapAllowed =
+        partialOpenGroupLock !== undefined &&
+        config.allowControlledOverlap &&
+        config.maxOpenGroupsPerMarket >= 2 &&
+        config.maxOpenPartialGroups >= 1 &&
+        (!config.allowOverlapOnlyAfterPartialClassified || pairgroupLinkageHealthy) &&
+        (!config.allowOverlapOnlyWhenCompletionEngineActive || overlapCompletionActive) &&
+        partialAgeSec !== undefined &&
+        partialAgeSec >= config.partialFastWindowSec &&
+        partialAgeSec < config.partialPatientWindowSec &&
+        (config.allowOverlapInLast30S || nowTs < market.endTs - config.finalWindowCompletionOnlySec);
+      const postMergeCompletionOnlyActive =
+        config.postMergeOnlyCompletion &&
+        (state.reentryDisabled ||
+          (state.postMergeCompletionOnlyUntil !== undefined && nowTs < state.postMergeCompletionOnlyUntil));
+      const partialOpenCompletionOnlyActive =
+        config.blockNewPairWhilePartialOpen &&
+        partialOpenGroupLock !== undefined &&
+        config.maxOpenPartialGroups <= 1 &&
+        !previewControlledOverlapAllowed;
       const decision = bot.evaluateTick({
         config,
         state,
@@ -644,22 +1821,97 @@ export async function runStatefulBotSession(
           dailyLossUsdc: 0,
           marketLossUsdc: 0,
           usdcBalance: cachedUsdcBalance,
+          forceNoNewEntries:
+            startupBlockNewEntries || postMergeCompletionOnlyActive || partialOpenCompletionOnlyActive,
+          forceCompletionOnly:
+            startupCompletionOnly || postMergeCompletionOnlyActive || partialOpenCompletionOnlyActive,
+          forceSafeHalt: startupSafeHalt,
+          externalReasons: [
+            ...startupExternalReasons,
+            ...(postMergeCompletionOnlyActive ? ["post_merge_completion_only"] : []),
+            ...(partialOpenCompletionOnlyActive ? ["partial_group_open"] : []),
+          ],
         },
         dryRunOrSmallLive: false,
+        dailyNegativeEdgeSpentUsdc:
+          resolvedOptions.initialDailyNegativeEdgeSpentUsdc + state.negativeEdgeConsumedUsdc,
+        fairValueSnapshot: latestFairValueSnapshot,
       });
+      const decisionTraceContext: DecisionTraceContext = {
+        eventSeq: marketEventSeq,
+        decisionLatencyMs: Math.max(0, Date.now() - Math.max(latestBookEventAtMs, decisionEvalStartedAtMs)),
+        bookAgeMsUp: Math.max(0, Date.now() - lastBookEventAtMs.UP),
+        bookAgeMsDown: Math.max(0, Date.now() - lastBookEventAtMs.DOWN),
+      };
+
+      if (decision.entryBuys.length === 0 && !decision.completion && !decision.unwind) {
+        const traceSignature = decisionTraceSignature(decision);
+        if (
+          traceSignature !== lastDecisionTraceSignature ||
+          nowTs - lastDecisionTraceAt >= DECISION_TRACE_INTERVAL_SEC
+        ) {
+          pushEvent(events, {
+            timestamp: nowTs,
+            type: "decision_trace",
+            ...buildDecisionTraceEvent(decision, decisionTraceContext),
+          });
+          await traceLogger.write("decision_trace", {
+            ...buildDecisionTraceEvent(decision, decisionTraceContext),
+          });
+          if (decision.risk.reasons.length > 0 || decision.trace.entry.gatedByRisk) {
+            await traceLogger.write("risk_events", {
+              reason: decision.trace.entry.skipReason ?? "risk_gate",
+              riskReasons: decision.risk.reasons,
+              phase: decision.phase,
+              allowNewEntries: decision.risk.allowNewEntries,
+              completionOnly: decision.risk.completionOnly,
+              hardCancel: decision.risk.hardCancel,
+            });
+          }
+          lastDecisionTraceSignature = traceSignature;
+          lastDecisionTraceAt = nowTs;
+        }
+      }
 
       if (Date.now() < actionCooldownUntil) {
-        await sleep(resolvedOptions.tickMs);
+        await waitForDecisionPulse();
         continue;
       }
 
       if (pendingPairExecution && decision.entryBuys.length > 1) {
-        await sleep(resolvedOptions.tickMs);
+        await waitForDecisionPulse();
+        continue;
+      }
+
+      const controlledOverlapActive = shouldAllowControlledOverlap({
+        config,
+        nowTs,
+        secsToClose: market.endTs - nowTs,
+        partialOpenGroupLock,
+        completionActive: overlapCompletionActive,
+        linkageHealthy: pairgroupLinkageHealthy,
+        entryBuys: decision.entryBuys,
+      });
+
+      if (partialOpenGroupLock && decision.entryBuys.length > 1 && !controlledOverlapActive) {
+        await traceLogger.write("risk_events", {
+          reason: "controlled_overlap_blocked",
+          partialGroupId: partialOpenGroupLock.groupId,
+          partialStatus: partialOpenGroupLock.status,
+          partialAgeSec,
+          completionActive: overlapCompletionActive,
+          linkageHealthy: pairgroupLinkageHealthy,
+          secsToClose: market.endTs - nowTs,
+        });
+        await waitForDecisionPulse();
         continue;
       }
 
       if (decision.entryBuys.length > 0) {
         const submittedAt = Date.now();
+        for (const entryBuy of decision.entryBuys) {
+          assertClassifiedBuyMode(entryBuy.mode, config);
+        }
         if (decision.entryBuys.length === 2) {
           const upEntry = decision.entryBuys.find((entryBuy) => entryBuy.side === "UP");
           const downEntry = decision.entryBuys.find((entryBuy) => entryBuy.side === "DOWN");
@@ -676,53 +1928,179 @@ export async function runStatefulBotSession(
             maxUpPrice: upEntry.order.price,
             maxDownPrice: downEntry.order.price,
             mode: config.botMode,
+            selectedMode: upEntry.mode as "STRICT_PAIR_SWEEP" | "XUAN_SOFT_PAIR_SWEEP" | "XUAN_HARD_PAIR_SWEEP",
             createdAt: submittedAt,
             state,
+            rawPair: upEntry.rawPairCost ?? 0,
+            effectivePair: upEntry.pairCostWithFees ?? 0,
+            negativeEdgeUsdc: upEntry.negativeEdgeUsdc ?? 0,
           });
           const groupedEntries = applyPairOrderType(decision.entryBuys, group);
-          const [upResult, downResult] = await Promise.all(
-            groupedEntries.map((entryBuy) => completionManager.execute(entryBuy.order)),
-          );
+          const missingSide: OutcomeSide = state.upShares > state.downShares ? "DOWN" : "UP";
+          const orderedEntries = controlledOverlapActive
+            ? [...groupedEntries].sort((left, right) => {
+                if (left.side === right.side) return 0;
+                return left.side === missingSide ? -1 : 1;
+              })
+            : groupedEntries;
+          let upResult: OrderResult | undefined;
+          let downResult: OrderResult | undefined;
+          const executedEntries: EntryBuyDecision[] = [];
+
+          if (controlledOverlapActive) {
+            for (let index = 0; index < orderedEntries.length; index += 1) {
+              const entryBuy = orderedEntries[index]!;
+              const result = await completionManager.execute(
+                withAvailableUsdcBalance(entryBuy.order, cachedUsdcBalance),
+              );
+              executedEntries.push(entryBuy);
+              if (entryBuy.side === "UP") {
+                upResult = result;
+              } else {
+                downResult = result;
+              }
+              if (index === 0 && !isOrderResultAccepted(result)) {
+                break;
+              }
+            }
+          } else {
+            const [parallelUpResult, parallelDownResult] = await Promise.all(
+              groupedEntries.map((entryBuy) =>
+                completionManager.execute(withAvailableUsdcBalance(entryBuy.order, cachedUsdcBalance)),
+              ),
+            );
+            upResult = parallelUpResult;
+            downResult = parallelDownResult;
+            executedEntries.push(...groupedEntries);
+          }
 
           rememberSubmittedPrices(
             submittedPrices,
             market,
-            groupedEntries.map((entryBuy) => entryBuy.order),
+            executedEntries.map((entryBuy) => ({
+              ...entryBuy.order,
+              side: entryBuy.order.side,
+              mode: entryBuy.mode,
+              groupId: group.groupId,
+              orderId: entryBuy.side === "UP" ? upResult?.orderId : downResult?.orderId,
+              expectedShares: expectedSharesForSubmission(
+                entryBuy.order.shareTarget,
+                entryBuy.side === "UP" ? upResult : downResult,
+              ),
+            })),
             submittedAt,
           );
           const negativeEdgeUsdc = estimateNegativeEdgeUsdc(upEntry.pairCostWithFees ?? 1, group.intendedQty);
           pairGroupCount += 1;
-          entrySubmitCount += groupedEntries.length;
+          entrySubmitCount += executedEntries.length;
           actionCooldownUntil = Date.now() + config.reentryDelayMs;
+          const anyAccepted = Boolean(
+            (upResult && isOrderResultAccepted(upResult)) ||
+              (downResult && isOrderResultAccepted(downResult)),
+          );
+          const pairFinalizeTimeoutMs = anyAccepted
+            ? Math.max(config.pairgroupFinalizeTimeoutMs, submittedIntentMaxAgeSec * 1000)
+            : config.pairgroupFinalizeTimeoutMs;
           pendingPairExecution = {
             group,
             upResult,
             downResult,
             negativeEdgeUsdc,
-            deadlineAt: Date.now() + Math.max(config.reentryDelayMs * 3, 3000),
+            deadlineAt: Date.now() + Math.max(config.reentryDelayMs * 3, pairFinalizeTimeoutMs),
             status: "PENDING",
+            submittedAt,
+            reconciledAfterSubmit: false,
           };
           pushEvent(events, {
             timestamp: nowTs,
             type: "pair_group_submit",
             groupId: group.groupId,
+            selectedMode: group.selectedMode,
             orderType: group.orderType,
             intendedQty: group.intendedQty,
             maxUpPrice: group.maxUpPrice,
             maxDownPrice: group.maxDownPrice,
+            rawPair: group.rawPair,
             pairCostWithFees: upEntry.pairCostWithFees,
             negativeEdgeUsdc,
+            marketNegativeSpentBefore: group.marketNegativeSpentBefore,
+            marketNegativeSpentAfter: group.marketNegativeSpentAfter,
+            controlledOverlap: controlledOverlapActive,
             upResult,
             downResult,
           });
+          await traceLogger.write("pair_groups", {
+            eventType: "pair_group_submit",
+            pairGroupId: group.groupId,
+            status: "SUBMITTED",
+            selectedMode: group.selectedMode,
+            intendedQty: group.intendedQty,
+            rawPair: group.rawPair,
+            effectivePair: group.effectivePair,
+            negativeEdgeUsdc,
+            maxUpPrice: group.maxUpPrice ?? null,
+            maxDownPrice: group.maxDownPrice ?? null,
+            orderType: group.orderType,
+            marketNegativeSpentBefore: group.marketNegativeSpentBefore,
+            marketNegativeSpentAfter: group.marketNegativeSpentAfter,
+            filledUpQty: null,
+            filledDownQty: null,
+            correlationId: group.groupId,
+          });
+          await traceLogger.write("orders", {
+            eventType: "pair_orders_submit",
+            pairGroupId: group.groupId,
+            orderType: group.orderType,
+            controlledOverlap: controlledOverlapActive,
+            upOrderId: upResult?.orderId ?? null,
+            downOrderId: downResult?.orderId ?? null,
+            upStatus: upResult?.status ?? null,
+            downStatus: downResult?.status ?? null,
+            upAccepted: upResult ? isOrderResultAccepted(upResult) : false,
+            downAccepted: downResult ? isOrderResultAccepted(downResult) : false,
+            upResult: upResult ? summarizeOrderResult(upResult) : null,
+            downResult: downResult ? summarizeOrderResult(downResult) : null,
+          });
+          stateStore.upsertPairGroup(group);
         } else {
           const entryBuy = decision.entryBuys[0];
           if (!entryBuy) {
             throw new Error("Expected a single entry buy decision.");
           }
-          const result = await completionManager.execute(entryBuy.order);
-          rememberSubmittedPrices(submittedPrices, market, [entryBuy.order], submittedAt);
-          state = reserveNegativeEdgeBudget(state, entryBuy.negativeEdgeUsdc ?? 0);
+          const liveOrder = withAvailableUsdcBalance(entryBuy.order, cachedUsdcBalance);
+          const result = await completionManager.execute(liveOrder);
+          rememberSubmittedPrices(
+            submittedPrices,
+            market,
+            [
+              {
+                ...entryBuy.order,
+                side: entryBuy.order.side,
+                mode: entryBuy.mode,
+                orderId: result.orderId,
+                expectedShares: expectedSharesForSubmission(liveOrder.shareTarget, result),
+              },
+            ],
+            submittedAt,
+          );
+          const accepted = isOrderResultAccepted(result);
+          if (accepted) {
+            state = reserveNegativeEdgeBudget(state, entryBuy.negativeEdgeUsdc ?? 0, "pair");
+            persistDailyBudget(state);
+            state = updateSeedSubmissionState(state, entryBuy.mode, entryBuy.side);
+            stateStore.upsertMarketState(state);
+          } else {
+            await logRejectedOrder({
+              traceLogger,
+              phase: "entry",
+              mode: entryBuy.mode,
+              side: entryBuy.side,
+              size: entryBuy.size,
+              result,
+              order: liveOrder,
+              negativeEdgeUsdc: entryBuy.negativeEdgeUsdc,
+            });
+          }
           entrySubmitCount += 1;
           actionCooldownUntil = Date.now() + config.reentryDelayMs;
           pushEvent(events, {
@@ -734,60 +2112,291 @@ export async function runStatefulBotSession(
                 size: entryBuy.size,
                 price: entryBuy.order.price,
                 reason: entryBuy.reason,
-                result,
+                mode: entryBuy.mode,
+                rawPair: entryBuy.rawPairCost ?? null,
+                effectivePair: entryBuy.pairCostWithFees ?? null,
+                negativeEdgeUsdc: entryBuy.negativeEdgeUsdc ?? 0,
+                shareTarget: liveOrder.shareTarget ?? null,
+                spendAmount: liveOrder.amount,
+                result: summarizeOrderResult(result),
               },
             ],
           });
+          await traceLogger.write("orders", {
+            eventType: "entry_submit",
+            selectedMode: entryBuy.mode,
+            side: entryBuy.side,
+            size: entryBuy.size,
+            price: liveOrder.price ?? null,
+            shareTarget: liveOrder.shareTarget ?? null,
+            spendAmount: liveOrder.amount,
+            negativeEdgeUsdc: entryBuy.negativeEdgeUsdc ?? 0,
+            orderId: result.orderId,
+            orderStatus: result.status,
+            orderAccepted: accepted,
+            orderResult: summarizeOrderResult(result),
+            oldGap: decision.trace.entry.repairOldGap ?? decision.trace.shareGap,
+            newGapEstimate: decision.trace.entry.repairNewGap ?? null,
+            wouldIncreaseImbalance: decision.trace.entry.repairWouldIncreaseImbalance ?? null,
+            requestedQty: decision.trace.entry.repairRequestedQty ?? entryBuy.size,
+            finalQty: decision.trace.entry.repairFinalQty ?? entryBuy.size,
+            missingQty: decision.trace.entry.repairMissingQty ?? null,
+            residualOppositeAveragePrice: decision.trace.entry.repairOppositeAveragePrice ?? null,
+            effectiveCompletionCost: decision.trace.entry.repairCost ?? entryBuy.pairCostWithFees ?? null,
+            capUsed: decision.trace.entry.repairCapMode ?? null,
+            rejectReason: accepted ? null : decision.trace.entry.skipReason ?? null,
+            correlationId: result.orderId,
+          });
         }
-        await sleep(resolvedOptions.tickMs);
+        await waitForDecisionPulse();
         continue;
       }
 
       if (decision.completion) {
-        const result = await completionManager.complete(decision.completion.order);
-        rememberSubmittedPrices(submittedPrices, market, [decision.completion.order], Date.now());
-        state = reserveNegativeEdgeBudget(state, decision.completion.negativeEdgeUsdc);
+        assertClassifiedBuyMode(decision.completion.mode, config);
+        const liveOrder = withAvailableUsdcBalance(decision.completion.order, cachedUsdcBalance);
+        const result = await completionManager.complete(liveOrder);
+        rememberSubmittedPrices(
+          submittedPrices,
+          market,
+          [
+            {
+              ...decision.completion.order,
+              side: decision.completion.order.side,
+              mode: decision.completion.mode,
+              orderId: result.orderId,
+              expectedShares: expectedSharesForSubmission(liveOrder.shareTarget, result),
+            },
+          ],
+          Date.now(),
+        );
+        const accepted = isOrderResultAccepted(result);
+        if (accepted) {
+          state = reserveNegativeEdgeBudget(state, decision.completion.negativeEdgeUsdc, "completion");
+          persistDailyBudget(state);
+          state = updateSeedSubmissionState(state, decision.completion.mode, decision.completion.sideToBuy);
+          stateStore.upsertMarketState(state);
+        } else {
+          await logRejectedOrder({
+            traceLogger,
+            phase: "completion",
+            mode: decision.completion.mode,
+            side: decision.completion.sideToBuy,
+            size: decision.completion.missingShares,
+            result,
+            order: liveOrder,
+            negativeEdgeUsdc: decision.completion.negativeEdgeUsdc,
+          });
+        }
         completionSubmitCount += 1;
         actionCooldownUntil = Date.now() + config.reentryDelayMs;
         pushEvent(events, {
           timestamp: nowTs,
           type: "completion_submit",
           outcome: decision.completion.sideToBuy,
+          mode: decision.completion.mode,
           size: decision.completion.missingShares,
-          price: decision.completion.order.price,
+          price: liveOrder.price,
+          shareTarget: liveOrder.shareTarget ?? null,
+          spendAmount: liveOrder.amount,
           costWithFees: decision.completion.costWithFees,
           capMode: decision.completion.capMode,
           negativeEdgeUsdc: decision.completion.negativeEdgeUsdc,
-          result,
+          result: summarizeOrderResult(result),
         });
-        await sleep(resolvedOptions.tickMs);
+        await traceLogger.write("orders", {
+          eventType: "completion_submit",
+          normalizedMode: `COMPLETION_${decision.completion.sideToBuy}`,
+          outcome: decision.completion.sideToBuy,
+          size: decision.completion.missingShares,
+          price: liveOrder.price ?? null,
+          shareTarget: liveOrder.shareTarget ?? null,
+          spendAmount: liveOrder.amount,
+          capMode: decision.completion.capMode,
+          negativeEdgeUsdc: decision.completion.negativeEdgeUsdc,
+          orderId: result.orderId,
+          orderStatus: result.status,
+          orderAccepted: accepted,
+          orderResult: summarizeOrderResult(result),
+          oldGap: decision.completion.oldGap,
+          newGapEstimate: decision.completion.newGap,
+          wouldIncreaseImbalance:
+            decision.completion.newGap > decision.completion.oldGap + config.maxCompletionOvershootShares,
+          requestedQty: decision.completion.missingShares,
+          finalQty: decision.completion.missingShares,
+          missingQty: Math.abs(state.upShares - state.downShares),
+          residualOppositeAveragePrice: decision.completion.oppositeAveragePrice,
+          missingSideAveragePrice: decision.completion.missingSideAveragePrice,
+          effectiveCompletionCost: decision.completion.costWithFees,
+          highLowMismatch: decision.completion.highLowMismatch,
+          capUsed: decision.completion.capMode,
+          rejectReason: accepted ? null : "completion_rejected",
+          correlationId: result.orderId,
+        });
+        await waitForDecisionPulse();
         continue;
       }
 
       if (decision.unwind) {
-        const result = await completionManager.complete(decision.unwind.order);
-        rememberSubmittedPrices(submittedPrices, market, [decision.unwind.order], Date.now());
+        const liveOrder = withAvailableUsdcBalance(decision.unwind.order, cachedUsdcBalance);
+        const result = await completionManager.complete(liveOrder);
+        rememberSubmittedPrices(
+          submittedPrices,
+          market,
+          [
+            {
+              ...decision.unwind.order,
+              side: decision.unwind.order.side,
+              mode: decision.unwind.mode,
+              orderId: result.orderId,
+              expectedShares: expectedSharesForSubmission(liveOrder.shareTarget, result),
+            },
+          ],
+          Date.now(),
+        );
+        const accepted = isOrderResultAccepted(result);
+        if (accepted) {
+          state = updateSeedSubmissionState(state, decision.unwind.mode, decision.unwind.sideToSell);
+          stateStore.upsertMarketState(state);
+        } else {
+          await logRejectedOrder({
+            traceLogger,
+            phase: "unwind",
+            mode: decision.unwind.mode,
+            side: decision.unwind.sideToSell,
+            size: decision.unwind.unwindShares,
+            result,
+            order: liveOrder,
+          });
+        }
         unwindSubmitCount += 1;
         actionCooldownUntil = Date.now() + config.reentryDelayMs;
         pushEvent(events, {
           timestamp: nowTs,
           type: "unwind_submit",
           outcome: decision.unwind.sideToSell,
+          mode: decision.unwind.mode,
           size: decision.unwind.unwindShares,
-          price: decision.unwind.order.price,
-          result,
+          price: liveOrder.price,
+          shareTarget: liveOrder.shareTarget ?? null,
+          amount: liveOrder.amount,
+          result: summarizeOrderResult(result),
+        });
+        await traceLogger.write("orders", {
+          eventType: "unwind_submit",
+          outcome: decision.unwind.sideToSell,
+          size: decision.unwind.unwindShares,
+          price: liveOrder.price ?? null,
+          shareTarget: liveOrder.shareTarget ?? null,
+          amount: liveOrder.amount,
+          orderId: result.orderId,
+          orderStatus: result.status,
+          orderAccepted: accepted,
+          orderResult: summarizeOrderResult(result),
+          correlationId: result.orderId,
         });
       }
 
-      await sleep(resolvedOptions.tickMs);
+      await waitForDecisionPulse();
     }
   } finally {
+    btcPriceFeed.disconnect();
     marketWs.disconnect();
     userWs.disconnect();
   }
 
   const endedAt = clock.now();
+  const closingMergePlan = planMerge(config, state);
+  const closingPendingFillSnapshot = pendingPairExecution
+    ? stateStore.loadPairGroupFillSnapshot(pendingPairExecution.group.groupId)
+    : undefined;
+  const closingLockedPendingShares = computePendingLockedShares(
+    pendingPairExecution,
+    closingPendingFillSnapshot,
+    config,
+  );
+  const closingMergeableUnlocked = config.mergeOnlyConfirmedMatchedUnlockedLots
+    ? unlockedMergeableShares(state, closingLockedPendingShares)
+    : closingMergePlan.mergeable;
+  const closingMergeAmount = normalizeMergeAmount(closingMergeableUnlocked, config.mergeDustLeaveShares);
+  if (
+    config.mergeMode === "AUTO" &&
+    config.mergeOnMarketClose &&
+    endedAt >= market.endTs &&
+    closingMergeAmount >= config.mergeMinShares &&
+    (!pendingPairExecution || config.allowMergeWithPendingGroups) &&
+    mergeTxCount < config.mergeMaxTxPerMarket
+  ) {
+    const closingMergeResult = env.CTF_MERGE_ENABLED
+      ? await ctf.mergePositions(market.conditionId, closingMergeAmount)
+      : {
+          simulated: true,
+          skipped: true,
+          action: "merge" as const,
+          amount: closingMergeAmount,
+          conditionId: market.conditionId,
+          reason: "CTF_MERGE_ENABLED=false",
+        };
+    if (closingMergeResult.simulated || !closingMergeResult.skipped) {
+      const preMergeState = state;
+      state = applyMerge(state, {
+        amount: closingMergeAmount,
+        timestamp: endedAt,
+        simulated: closingMergeResult.simulated,
+      });
+      stateStore.recordMerge(preMergeState, state.mergeHistory.at(-1) ?? {
+        amount: closingMergeAmount,
+        timestamp: endedAt,
+        simulated: closingMergeResult.simulated,
+      });
+      if (config.postMergeOnlyCompletion) {
+        const residualAfterMerge = Math.abs(state.upShares - state.downShares);
+        if (config.postMergeOnlyCompletionWhileResidual && residualAfterMerge > config.postMergeFlatDustShares) {
+          state = {
+            ...state,
+            reentryDisabled: true,
+            postMergeCompletionOnlyUntil: undefined,
+          };
+        } else if (config.postMergeAllowNewPairIfFlat) {
+          state = {
+            ...state,
+            reentryDisabled: false,
+            postMergeCompletionOnlyUntil:
+              endedAt + Math.ceil(config.postMergePairReopenCooldownMs / 1000),
+          };
+        } else {
+          state = {
+            ...state,
+            reentryDisabled: true,
+            postMergeCompletionOnlyUntil:
+              endedAt + Math.ceil(config.postMergeNewSeedCooldownMs / 1000),
+          };
+        }
+      }
+      mergeCount += 1;
+      stateStore.upsertMarketState(state, state.reentryDisabled ? "post_merge_completion_only" : undefined);
+    }
+    await traceLogger.write("merge_redeem", {
+      action: "merge",
+      amount: closingMergeAmount,
+      trigger: "market_close",
+      txHash: closingMergeResult.txHash ?? null,
+      simulated: closingMergeResult.simulated,
+      skipped: closingMergeResult.skipped ?? false,
+      matchedUpCost: state.mergeHistory.at(-1)?.matchedUpCost ?? null,
+      matchedDownCost: state.mergeHistory.at(-1)?.matchedDownCost ?? null,
+      mergeReturn: state.mergeHistory.at(-1)?.mergeReturn ?? null,
+      realizedPnl: state.mergeHistory.at(-1)?.realizedPnl ?? null,
+      remainingUpShares: state.mergeHistory.at(-1)?.remainingUpShares ?? null,
+      remainingDownShares: state.mergeHistory.at(-1)?.remainingDownShares ?? null,
+      postMergeCompletionOnlyUntil: state.postMergeCompletionOnlyUntil ?? null,
+    });
+  }
   const finalBooks = buildBooks(marketWs, market);
+  const finalPostMergeCompletionOnlyActive =
+    config.postMergeOnlyCompletion &&
+    (state.reentryDisabled ||
+      (state.postMergeCompletionOnlyUntil !== undefined && endedAt < state.postMergeCompletionOnlyUntil));
   const finalDecision = bot.evaluateTick({
     config,
     state,
@@ -801,8 +2410,18 @@ export async function runStatefulBotSession(
       dailyLossUsdc: 0,
       marketLossUsdc: 0,
       usdcBalance: cachedUsdcBalance,
+      forceNoNewEntries: startupBlockNewEntries || finalPostMergeCompletionOnlyActive,
+      forceCompletionOnly: startupCompletionOnly || finalPostMergeCompletionOnlyActive,
+      forceSafeHalt: startupSafeHalt,
+      externalReasons: [
+        ...startupExternalReasons,
+        ...(finalPostMergeCompletionOnlyActive ? ["post_merge_completion_only"] : []),
+      ],
     },
     dryRunOrSmallLive: false,
+    dailyNegativeEdgeSpentUsdc:
+      resolvedOptions.initialDailyNegativeEdgeSpentUsdc + state.negativeEdgeConsumedUsdc,
+    fairValueSnapshot: latestFairValueSnapshot,
   });
 
   const payload: BotSessionReport = {
@@ -850,11 +2469,47 @@ export async function runStatefulBotSession(
       fillCount: state.fillHistory.length,
       mergeCount: state.mergeHistory.length,
       negativeEdgeConsumedUsdc: state.negativeEdgeConsumedUsdc,
+      negativePairEdgeConsumedUsdc: state.negativePairEdgeConsumedUsdc,
+      negativeCompletionEdgeConsumedUsdc: state.negativeCompletionEdgeConsumedUsdc,
+      initialDailyNegativeEdgeSpentUsdc: resolvedOptions.initialDailyNegativeEdgeSpentUsdc,
+      finalDailyNegativeEdgeSpentUsdc: Number(
+        (resolvedOptions.initialDailyNegativeEdgeSpentUsdc + state.negativeEdgeConsumedUsdc).toFixed(6),
+      ),
     },
     finalDecision,
     dashboard: renderDashboard(state, finalDecision, endedAt),
     events,
   };
+
+  persistDailyBudget(state);
+  await traceLogger.write("market_rollover", {
+    status: "session_end",
+    endedAt,
+    upShares: state.upShares,
+    downShares: state.downShares,
+    mergeCount,
+    fillCount: state.fillHistory.length,
+    finalDailyNegativeEdgeSpentUsdc: Number(
+      (resolvedOptions.initialDailyNegativeEdgeSpentUsdc + state.negativeEdgeConsumedUsdc).toFixed(6),
+    ),
+  });
+  stateStore.recordMarketRollover({
+    status: "session_end",
+    timestamp: endedAt,
+    marketSlug: market.slug,
+    conditionId: market.conditionId,
+    payload: {
+      upShares: state.upShares,
+      downShares: state.downShares,
+      mergeCount,
+      fillCount: state.fillHistory.length,
+      finalDailyNegativeEdgeSpentUsdc: Number(
+        (resolvedOptions.initialDailyNegativeEdgeSpentUsdc + state.negativeEdgeConsumedUsdc).toFixed(6),
+      ),
+    },
+  });
+  await traceLogger.flush();
+  stateStore.close();
 
   await writeStructuredLog("orders", { event: "bot_live_stateful", ...payload });
   return payload;

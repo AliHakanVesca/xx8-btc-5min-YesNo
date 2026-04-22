@@ -19,6 +19,8 @@ export interface MarketInfo {
   feeRate: number;
   feesEnabled: boolean;
   negRisk: boolean;
+  priceToBeat?: number | undefined;
+  priceToBeatSource?: "metadata" | "estimated" | undefined;
   tokens: Record<OutcomeSide, MarketToken>;
   source: "gamma" | "clob" | "fallback";
 }
@@ -56,6 +58,7 @@ export interface MarketOrderArgs {
   tokenId: string;
   price?: number | undefined;
   amount: number;
+  shareTarget?: number | undefined;
   side: TradeSide;
   orderType: TakerOrderType;
   userUsdcBalance?: number | undefined;

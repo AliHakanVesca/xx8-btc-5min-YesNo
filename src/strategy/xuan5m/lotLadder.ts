@@ -14,17 +14,19 @@ export interface LotContext {
 }
 
 export function chooseLot(config: XuanStrategyConfig, ctx: LotContext): number {
+  const smallLots = config.liveSmallLotLadder.length > 0 ? config.liveSmallLotLadder : config.liveSmallLots;
+  const baseLots = config.xuanBaseLotLadder.length > 0 ? config.xuanBaseLotLadder : config.lotLadder;
   if (ctx.dryRunOrSmallLive) {
-    return config.liveSmallLots[0] ?? config.defaultLot;
+    return smallLots[0] ?? config.defaultLot;
   }
   if (ctx.imbalance >= config.forceRebalanceImbalanceFrac) {
-    return config.liveSmallLots[0] ?? config.defaultLot;
+    return smallLots[0] ?? config.defaultLot;
   }
   if (ctx.secsFromOpen < 45 && ctx.bookDepthGood && ctx.pairCostWithinCap) {
-    return config.lotLadder[1] ?? config.defaultLot;
+    return baseLots[1] ?? config.defaultLot;
   }
   if (ctx.secsFromOpen < 120 && ctx.pairCostWithinCap && ctx.recentBothSidesFilled) {
-    return config.lotLadder[2] ?? config.defaultLot;
+    return baseLots[2] ?? config.defaultLot;
   }
   if (
     ctx.inventoryBalanced &&
@@ -33,10 +35,10 @@ export function chooseLot(config: XuanStrategyConfig, ctx: LotContext): number {
     ctx.pnlTodayPositive &&
     ctx.bookDepthGood
   ) {
-    return config.lotLadder[4] ?? config.defaultLot;
+    return baseLots[3] ?? config.defaultLot;
   }
   if (ctx.inventoryBalanced && ctx.pairCostWithinCap) {
-    return config.lotLadder[3] ?? config.defaultLot;
+    return baseLots[2] ?? config.defaultLot;
   }
   return config.defaultLot;
 }

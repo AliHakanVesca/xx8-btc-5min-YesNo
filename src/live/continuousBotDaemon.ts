@@ -1,6 +1,10 @@
 import type { AppEnv } from "../config/schema.js";
+import { buildStrategyConfig } from "../config/strategyPresets.js";
 import { writeStructuredLog } from "../observability/logger.js";
+import { JsonlTraceLogger } from "../observability/jsonlTrace.js";
 import { runStatefulBotSession, type BotSessionOptions, type BotSessionReport } from "./statefulBotSession.js";
+import { PersistentStateStore } from "./persistentStateStore.js";
+import { resolveConfiguredFunderAddress } from "./topology.js";
 
 export interface ContinuousBotDaemonOptions extends BotSessionOptions {
   maxMarkets?: number;
@@ -16,11 +20,14 @@ export interface ContinuousBotDaemonReport {
     initialBookWaitMs: number;
     balanceSyncMs: number;
     interSessionPauseMs: number;
+    stateDbPath: string;
   };
   summary: {
     startedAt: number;
     endedAt: number;
     marketsCompleted: number;
+    initialDailyNegativeEdgeSpentUsdc: number;
+    finalDailyNegativeEdgeSpentUsdc: number;
   };
   sessions: Array<{
     market: BotSessionReport["market"];
@@ -44,10 +51,47 @@ export async function runContinuousBotDaemon(
     balanceSyncMs: Math.max(1000, Math.floor(options.balanceSyncMs ?? 5000)),
     interSessionPauseMs: Math.max(250, Math.floor(options.interSessionPauseMs ?? 1500)),
     maxMarkets: Math.max(0, Math.floor(options.maxMarkets ?? 0)),
+    dailyBudgetStorePath: options.dailyBudgetStorePath ?? "",
   };
 
   const startedAt = Math.floor(Date.now() / 1000);
   const sessions: ContinuousBotDaemonReport["sessions"] = [];
+  const config = buildStrategyConfig(env);
+  const stateStore = new PersistentStateStore(config.stateStorePath);
+  const wallet = resolveConfiguredFunderAddress(env);
+  const traceLogger = new JsonlTraceLogger(env, {
+    runId: `daemon-${startedAt}`,
+    source: "continuous_daemon",
+    botMode: env.BOT_MODE,
+    dryRun: env.DRY_RUN,
+  });
+  const persistedBudget = stateStore.loadRiskBudget({
+    wallet,
+    now: new Date(startedAt * 1000),
+  });
+  let dailyNegativeEdgeSpentUsdc = Math.max(
+    0,
+    Number(options.initialDailyNegativeEdgeSpentUsdc ?? persistedBudget.dailyNegativeSpentUsdc),
+  );
+  const initialDailyNegativeEdgeSpentUsdc = dailyNegativeEdgeSpentUsdc;
+  stateStore.upsertRiskBudget({
+    wallet,
+    dailyNegativeSpentUsdc: dailyNegativeEdgeSpentUsdc,
+    now: new Date(startedAt * 1000),
+  });
+  stateStore.recordMarketRollover({
+    status: "daemon_start",
+    timestamp: startedAt,
+    payload: {
+      initialDailyNegativeEdgeSpentUsdc,
+    },
+  });
+  await traceLogger.write("market_rollover", {
+    status: "daemon_start",
+    startedAt,
+    stateDbPath: config.stateStorePath,
+    initialDailyNegativeEdgeSpentUsdc,
+  });
 
   while (resolvedOptions.maxMarkets === 0 || sessions.length < resolvedOptions.maxMarkets) {
     const report = await runStatefulBotSession(env, {
@@ -56,12 +100,38 @@ export async function runContinuousBotDaemon(
       initialBookWaitMs: resolvedOptions.initialBookWaitMs,
       balanceSyncMs: resolvedOptions.balanceSyncMs,
       marketSelection: "auto",
+      initialDailyNegativeEdgeSpentUsdc: dailyNegativeEdgeSpentUsdc,
     });
 
     sessions.push({
       market: report.market,
       summary: report.summary,
       finalState: report.finalState,
+    });
+    await traceLogger.write("market_rollover", {
+      status: "market_completed",
+      marketSlug: report.market.slug,
+      conditionId: report.market.conditionId,
+      startedAt: report.summary.startedAt,
+      endedAt: report.summary.endedAt,
+      finalDailyNegativeEdgeSpentUsdc: report.finalState.finalDailyNegativeEdgeSpentUsdc,
+    });
+    dailyNegativeEdgeSpentUsdc = report.finalState.finalDailyNegativeEdgeSpentUsdc;
+    stateStore.upsertRiskBudget({
+      wallet,
+      dailyNegativeSpentUsdc: dailyNegativeEdgeSpentUsdc,
+      marketSlug: report.market.slug,
+      marketNegativeSpentUsdc: report.finalState.negativePairEdgeConsumedUsdc,
+      now: new Date(report.summary.endedAt * 1000),
+    });
+    stateStore.recordMarketRollover({
+      status: "market_completed",
+      timestamp: report.summary.endedAt,
+      marketSlug: report.market.slug,
+      conditionId: report.market.conditionId,
+      payload: {
+        finalDailyNegativeEdgeSpentUsdc: report.finalState.finalDailyNegativeEdgeSpentUsdc,
+      },
     });
 
     if (resolvedOptions.maxMarkets !== 0 && sessions.length >= resolvedOptions.maxMarkets) {
@@ -80,15 +150,34 @@ export async function runContinuousBotDaemon(
       initialBookWaitMs: resolvedOptions.initialBookWaitMs,
       balanceSyncMs: resolvedOptions.balanceSyncMs,
       interSessionPauseMs: resolvedOptions.interSessionPauseMs,
+      stateDbPath: config.stateStorePath,
     },
     summary: {
       startedAt,
       endedAt: Math.floor(Date.now() / 1000),
       marketsCompleted: sessions.length,
+      initialDailyNegativeEdgeSpentUsdc,
+      finalDailyNegativeEdgeSpentUsdc: dailyNegativeEdgeSpentUsdc,
     },
     sessions,
   };
 
+  await traceLogger.write("market_rollover", {
+    status: "daemon_end",
+    endedAt: payload.summary.endedAt,
+    marketsCompleted: sessions.length,
+    finalDailyNegativeEdgeSpentUsdc: dailyNegativeEdgeSpentUsdc,
+  });
+  stateStore.recordMarketRollover({
+    status: "daemon_end",
+    timestamp: payload.summary.endedAt,
+    payload: {
+      marketsCompleted: sessions.length,
+      finalDailyNegativeEdgeSpentUsdc: dailyNegativeEdgeSpentUsdc,
+    },
+  });
+  await traceLogger.flush();
+  stateStore.close();
   await writeStructuredLog("orders", { event: "bot_live_daemon", ...payload });
   return payload;
 }

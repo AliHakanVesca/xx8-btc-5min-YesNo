@@ -37,9 +37,9 @@ describe("live paper analytics", () => {
     expect(sample.entryBuyCount).toBe(2);
     expect(sample.balancedPairEntryCount).toBe(2);
     expect(sample.laggingRebalanceCount).toBe(0);
-    expect(sample.buyShares).toBe(40);
-    expect(sample.buyNotional).toBeCloseTo(19.2, 8);
-    expect(sample.mergeShares).toBe(20);
+    expect(sample.buyShares).toBe(10);
+    expect(sample.buyNotional).toBeCloseTo(4.8, 8);
+    expect(sample.mergeShares).toBe(5);
     expect(sample.pairTakerCost).toBeLessThan(1);
   });
 
@@ -109,5 +109,27 @@ describe("live paper analytics", () => {
     });
     expect(summary.bestPairEdge).toBeCloseTo(0.0040576, 8);
     expect(summary.worstPairEdge).toBeCloseTo(-0.036, 8);
+  });
+
+  it("does not mark preopen next-market books as entry-ready", () => {
+    const env = parseEnv({
+      DRY_RUN: "true",
+      POLY_STACK_MODE: "current-prod-v1",
+    });
+    const market = buildOfflineMarket(1713696300);
+    const nowTs = market.startTs - 20;
+    const sample = buildLivePaperSample({
+      env,
+      market,
+      nowTs,
+      upBook: buildBook(market.tokens.UP.tokenId, market.conditionId, 0.47, 0.48, nowTs),
+      downBook: buildBook(market.tokens.DOWN.tokenId, market.conditionId, 0.47, 0.48, nowTs),
+    });
+
+    expect(sample.phase).toBe("PREOPEN");
+    expect(sample.entryBuyCount).toBe(0);
+    expect(sample.allowNewEntries).toBe(false);
+    expect(sample.hardCancel).toBe(true);
+    expect(sample.riskReasons).toEqual(["preopen"]);
   });
 });

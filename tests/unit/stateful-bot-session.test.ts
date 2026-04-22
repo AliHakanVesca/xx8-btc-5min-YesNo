@@ -30,6 +30,39 @@ describe("stateful bot session helpers", () => {
     expect(fill?.price).toBeCloseTo(0.48375, 8);
   });
 
+  it("prefers submitted BUY intent side over maker-side inversion", () => {
+    const market = buildOfflineMarket(1713696000);
+    const fill = inferUserTradeFill({
+      event: {
+        event_type: "trade",
+        asset_id: market.tokens.DOWN.tokenId,
+        id: "trade-2",
+        market: market.conditionId,
+        maker_orders: [{ order_id: "maker-3", matched_amount: "5", price: "0.44", side: "BUY" }],
+      },
+      market,
+      nowTs: 1713696012,
+      submittedPrices: {
+        DOWN: [
+          {
+            side: "BUY",
+            submittedAt: 1713696011,
+            groupId: "pair-1",
+            orderId: "order-1",
+            attributedShares: 0,
+            active: true,
+          },
+        ],
+      },
+    });
+
+    expect(fill).toMatchObject({
+      outcome: "DOWN",
+      side: "BUY",
+      size: 5,
+    });
+  });
+
   it("reconciles state from observed balances by inferring missing buys and scaling down reductions", () => {
     const market = buildOfflineMarket(1713696000);
     let state = createMarketState(market);

@@ -2,6 +2,7 @@ import type { XuanStrategyConfig } from "../../config/strategyPresets.js";
 import { imbalance, mergeableShares } from "./inventoryState.js";
 import type { XuanMarketState } from "./marketState.js";
 import { resolveBundledMergeClusterPrior, resolveBundledMergeTimingPrior } from "../../analytics/xuanExactReference.js";
+import { classifyFlowPressureBudget, type FlowPressureBudgetState } from "./modePolicy.js";
 
 export interface MergePlan {
   mergeable: number;
@@ -55,12 +56,43 @@ export function syncMergeBatchTracker(
   tracker: MergeBatchTracker,
   observedMergeable: number,
   nowTs: number,
+  options?: {
+    flowPressureBudget?: number;
+    activeIndependentFlowCount?: number;
+    flowPressureState?: FlowPressureBudgetState;
+  },
 ): MergeBatchTracker {
   const nextObserved = normalize(Math.max(0, observedMergeable));
   const currentTracked = normalize(Math.max(0, tracker.trackedMergeable));
   const delta = normalize(nextObserved - currentTracked);
 
   if (delta > 1e-6) {
+    const flowPressureState =
+      options?.flowPressureState ??
+      classifyFlowPressureBudget({
+        budget: Math.max(0, options?.flowPressureBudget ?? 0),
+        matchedInventoryQuality: 1,
+      });
+    const activeIndependentFlowCount = Math.max(0, options?.activeIndependentFlowCount ?? 0);
+    const lastWindow = tracker.windows.at(-1);
+    const shouldCoalesceIntoRecentWindow =
+      flowPressureState.confirmed &&
+      flowPressureState.remainingBudget >= 0.45 &&
+      activeIndependentFlowCount >= 2 &&
+      lastWindow !== undefined &&
+      nowTs - lastWindow.firstAvailableAt <= 18;
+    if (shouldCoalesceIntoRecentWindow && lastWindow) {
+      return {
+        trackedMergeable: nextObserved,
+        windows: [
+          ...tracker.windows.slice(0, -1),
+          {
+            amount: normalize(lastWindow.amount + delta),
+            firstAvailableAt: lastWindow.firstAvailableAt,
+          },
+        ],
+      };
+    }
     return {
       trackedMergeable: nextObserved,
       windows: [...tracker.windows, { amount: delta, firstAvailableAt: nowTs }],
@@ -128,6 +160,9 @@ export function evaluateDelayedMergeGate(
     secsToClose: number;
     usdcBalance: number;
     tracker: MergeBatchTracker;
+    flowPressureBudget?: number;
+    activeIndependentFlowCount?: number;
+    flowPressureState?: FlowPressureBudgetState;
   },
 ): MergeGateDecision {
   const metrics = mergeBatchMetrics(args.tracker, args.nowTs);
@@ -154,6 +189,21 @@ export function evaluateDelayedMergeGate(
   const maxMatchedAgeBeforeForcedMergeSec = timingPrior
     ? Math.min(config.maxMatchedAgeBeforeForcedMergeSec, timingPrior.forcedAgeSec)
     : config.maxMatchedAgeBeforeForcedMergeSec;
+  const flowPressureState =
+    args.flowPressureState ??
+    classifyFlowPressureBudget({
+      budget: Math.max(0, args.flowPressureBudget ?? 0),
+      matchedInventoryQuality: 1,
+    });
+  const activeIndependentFlowCount = Math.max(0, args.activeIndependentFlowCount ?? 0);
+  const preserveMultiFlowBudget =
+    flowPressureState.confirmed &&
+    flowPressureState.remainingBudget >= 0.45 &&
+    activeIndependentFlowCount >= 2;
+  const effectiveMinCompletedCyclesBeforeFirstMerge =
+    preserveMultiFlowBudget ? minCompletedCyclesBeforeFirstMerge + 1 : minCompletedCyclesBeforeFirstMerge;
+  const effectiveMinFirstMatchedAgeBeforeMergeSec =
+    preserveMultiFlowBudget ? minFirstMatchedAgeBeforeMergeSec + 12 : minFirstMatchedAgeBeforeMergeSec;
 
   if (config.mergeMode !== "AUTO" || metrics.pendingMatchedQty <= 1e-6) {
     return {
@@ -233,7 +283,7 @@ export function evaluateDelayedMergeGate(
     };
   }
 
-  if (metrics.completedCycles >= minCompletedCyclesBeforeFirstMerge) {
+  if (metrics.completedCycles >= effectiveMinCompletedCyclesBeforeFirstMerge) {
     return {
       allow: true,
       forced: false,
@@ -244,7 +294,7 @@ export function evaluateDelayedMergeGate(
 
   if (
     metrics.oldestMatchedAgeSec !== undefined &&
-    metrics.oldestMatchedAgeSec >= minFirstMatchedAgeBeforeMergeSec
+    metrics.oldestMatchedAgeSec >= effectiveMinFirstMatchedAgeBeforeMergeSec
   ) {
     return {
       allow: true,

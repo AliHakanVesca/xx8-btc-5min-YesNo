@@ -1,15 +1,218 @@
 import { describe, expect, it } from "vitest";
+import { parseEnv } from "../../src/config/env.js";
+import { buildStrategyConfig } from "../../src/config/strategyPresets.js";
 import { buildOfflineMarket } from "../../src/infra/gamma/marketDiscovery.js";
 import { applyFill } from "../../src/strategy/xuan5m/inventoryState.js";
 import { createMarketState } from "../../src/strategy/xuan5m/marketState.js";
 import {
+  applyRuntimeFlowBudgetConsumption,
+  applyRuntimeFlowBudgetLedgerAction,
+  applyRuntimeFlowBudgetLineageLedgerAction,
+  deriveRuntimeFlowCalibrationBias,
+  deriveRuntimeFlowBudgetState,
+  deriveArbitrationCarryExpiry,
+  deriveCarryFlowConfidence,
+  deriveConfirmedCarryAlignmentStreak,
+  restorePersistedArbitrationCarry,
   refreshRuntimeProtectedResidualLock,
   inferImmediateOrderResultFill,
   inferUserTradeFill,
   reconcileStateWithBalances,
+  runtimeFlowBudgetReleaseQuantityForResidualChange,
+  shouldPreserveCarryDrivenOverlap,
 } from "../../src/live/statefulBotSession.js";
 
+function buildConfig(overrides: Record<string, string> = {}) {
+  return buildStrategyConfig(
+    parseEnv({
+      DRY_RUN: "true",
+      POLY_STACK_MODE: "current-prod-v1",
+      BOT_MODE: "XUAN",
+      ALLOW_CONTROLLED_OVERLAP: "true",
+      ...overrides,
+    }),
+  );
+}
+
 describe("stateful bot session helpers", () => {
+  it("derives a shared runtime flow-budget state from carry, quality, density, and pressure", () => {
+    const state = deriveRuntimeFlowBudgetState({
+      matchedInventoryQuality: 0.82,
+      unlockedMatchedInventoryQuality: 0.94,
+      carryFlowConfidence: 0.92,
+      recentSeedFlowCount: 2,
+      activeIndependentFlowCount: 2,
+      residualSeverityPressure: 0.3,
+    });
+
+    expect(state.budget).toBeGreaterThanOrEqual(1);
+    expect(state.confirmed).toBe(true);
+    expect(state.elite).toBe(true);
+    expect(state.pairGateRelief).toBe(0.003);
+    expect(state.unlockedMatchedInventoryQuality).toBe(0.94);
+    expect(state.remainingBudget).toBeGreaterThan(0.7);
+    expect(state.consumedBudget).toBeLessThan(0.3);
+  });
+
+  it("derives soft runtime bias from replay flow calibration focus", () => {
+    const warnBias = deriveRuntimeFlowCalibrationBias({
+      status: "WARN",
+      recommendedFocus: [
+        "increase_lineage_preservation",
+        "allow_more_parallel_flow_when_budget_supports",
+        "tune_completion_patience_and_release",
+      ],
+    });
+    const passBias = deriveRuntimeFlowCalibrationBias({
+      status: "PASS",
+      recommendedFocus: [
+        "increase_lineage_preservation",
+        "allow_more_parallel_flow_when_budget_supports",
+        "tune_completion_patience_and_release",
+      ],
+    });
+
+    expect(warnBias).toMatchObject({
+      lineageFlowCountBonus: 1,
+      activeFlowCountBonus: 1,
+      completionPatienceFlowCountBonus: 1,
+      completionPatienceMultiplier: 1,
+      completionReleaseBias: "neutral",
+    });
+    expect(passBias).toMatchObject({
+      lineageFlowCountBonus: 0,
+      activeFlowCountBonus: 0,
+      completionPatienceFlowCountBonus: 0,
+      completionPatienceMultiplier: 1,
+      completionReleaseBias: "neutral",
+    });
+
+    const releaseEarlierBias = deriveRuntimeFlowCalibrationBias({
+      status: "FAIL",
+      recommendedFocus: ["release_completion_earlier"],
+      completionLatencyDirection: "candidate_late",
+      averageCycleCompletionLatencyDeltaSec: 7,
+    });
+    const waitLongerBias = deriveRuntimeFlowCalibrationBias({
+      status: "FAIL",
+      recommendedFocus: ["increase_completion_patience"],
+      completionLatencyDirection: "candidate_early",
+      averageCycleCompletionLatencyDeltaSec: -7,
+    });
+
+    expect(releaseEarlierBias.completionPatienceMultiplier).toBe(0.45);
+    expect(releaseEarlierBias.completionReleaseBias).toBe("earlier");
+    expect(waitLongerBias.completionPatienceMultiplier).toBe(1.28);
+    expect(waitLongerBias.completionReleaseBias).toBe("later");
+  });
+
+  it("reserves runtime flow budget for active flows, protected residuals, and pending merge windows", () => {
+    const state = deriveRuntimeFlowBudgetState({
+      matchedInventoryQuality: 1,
+      unlockedMatchedInventoryQuality: 1,
+      carryFlowConfidence: 1,
+      recentSeedFlowCount: 3,
+      activeIndependentFlowCount: 3,
+      residualSeverityPressure: 0.45,
+    });
+    const consumedState = applyRuntimeFlowBudgetConsumption(state, {
+      activeIndependentFlowCount: 3,
+      pendingMergeWindowCount: 2,
+      protectedResidualShares: 18,
+      residualSeverityPressure: 0.45,
+      pendingPairExecutionActive: true,
+      realizedActionBudgetLoad: 0.12,
+      lineageActionBudgetLoad: 0.08,
+    });
+
+    expect(consumedState.reservedBudget).toBeGreaterThan(0.3);
+    expect(consumedState.remainingBudget).toBeLessThan(state.remainingBudget);
+    expect(consumedState.consumedBudget).toBeGreaterThan(state.consumedBudget);
+    expect(consumedState.confirmed).toBe(state.confirmed);
+    expect(consumedState.flowLoadReserve).toBeGreaterThan(0);
+    expect(consumedState.mergeReserve).toBeGreaterThan(0);
+    expect(consumedState.residualReserve).toBeGreaterThan(0);
+    expect(consumedState.pendingExecutionReserve).toBeGreaterThan(0);
+    expect(consumedState.realizedActionReserve).toBe(0.12);
+    expect(consumedState.lineageActionReserve).toBe(0.08);
+  });
+
+  it("updates runtime flow-budget ledger load from realized actions and releases it after merge", () => {
+    const afterPair = applyRuntimeFlowBudgetLedgerAction(0, "pair_submit", {
+      quantityShares: 100,
+      baseLot: 100,
+    });
+    const afterSeed = applyRuntimeFlowBudgetLedgerAction(afterPair, "seed_submit", {
+      quantityShares: 100,
+      baseLot: 100,
+    });
+    const afterCompletion = applyRuntimeFlowBudgetLedgerAction(afterSeed, "completion_submit", {
+      quantityShares: 100,
+      baseLot: 100,
+    });
+    const afterMerge = applyRuntimeFlowBudgetLedgerAction(afterCompletion, "merge", {
+      quantityShares: 100,
+      baseLot: 100,
+    });
+
+    expect(afterPair).toBeGreaterThan(0);
+    expect(afterSeed).toBeGreaterThan(afterPair);
+    expect(afterCompletion).toBeLessThan(afterSeed);
+    expect(afterMerge).toBe(0);
+  });
+
+  it("scales runtime flow-budget ledger deltas by clip size and keeps lineage loads separate", () => {
+    const smallPair = applyRuntimeFlowBudgetLedgerAction(0, "pair_submit", {
+      quantityShares: 25,
+      baseLot: 100,
+    });
+    const largePair = applyRuntimeFlowBudgetLedgerAction(0, "pair_submit", {
+      quantityShares: 225,
+      baseLot: 100,
+    });
+    let lineageLoads = applyRuntimeFlowBudgetLineageLedgerAction({}, "pair_submit", {
+      lineage: "favor_independent_overlap|DOWN|UP",
+      quantityShares: 225,
+      baseLot: 100,
+    });
+    lineageLoads = applyRuntimeFlowBudgetLineageLedgerAction(lineageLoads, "pair_submit", {
+      lineage: "favor_independent_overlap|UP|DOWN",
+      quantityShares: 25,
+      baseLot: 100,
+    });
+    lineageLoads = applyRuntimeFlowBudgetLineageLedgerAction(lineageLoads, "merge", {
+      lineage: "favor_independent_overlap|DOWN|UP",
+      quantityShares: 225,
+      baseLot: 100,
+    });
+
+    expect(largePair).toBeGreaterThan(smallPair);
+    expect(lineageLoads["favor_independent_overlap|UP|DOWN"]).toBeGreaterThan(0);
+    expect(lineageLoads["favor_independent_overlap|DOWN|UP"]).toBeUndefined();
+  });
+
+  it("releases runtime flow budget according to realized residual shrink quality", () => {
+    const cleanShrink = runtimeFlowBudgetReleaseQuantityForResidualChange({
+      requestedShares: 20,
+      oldGap: 24,
+      newGap: 4,
+    });
+    const weakShrink = runtimeFlowBudgetReleaseQuantityForResidualChange({
+      requestedShares: 20,
+      oldGap: 24,
+      newGap: 22,
+    });
+    const noShrink = runtimeFlowBudgetReleaseQuantityForResidualChange({
+      requestedShares: 20,
+      oldGap: 24,
+      newGap: 26,
+    });
+
+    expect(cleanShrink).toBe(20);
+    expect(weakShrink).toBe(2);
+    expect(noShrink).toBe(9);
+  });
+
   it("infers taker fills from user trade websocket events", () => {
     const market = buildOfflineMarket(1713696000);
     const fill = inferUserTradeFill({
@@ -256,4 +459,432 @@ describe("stateful bot session helpers", () => {
       sourceMode: "TEMPORAL_SINGLE_LEG_SEED",
     });
   });
+
+  it("extends arbitration carry longer when the same overlap recommendation stays aligned across ticks", () => {
+    const config = buildConfig();
+    const baseExpiry = deriveArbitrationCarryExpiry({
+      config,
+      carry: {
+        createdAt: 100,
+        recommendation: "favor_independent_overlap",
+        protectedResidualSide: "UP",
+        referenceShareGap: 2,
+        alignmentStreak: 1,
+        lastObservedAt: 110,
+        lastProtectedShares: 2,
+        expiresAt: 118,
+      },
+      protectedResidualShares: 1.95,
+      nowTs: 112,
+      recentSeedFlowCount: 1,
+      residualBehaviorState: {
+        carryPersistenceBias: 1.35,
+        riskToleranceBias: 0.72,
+        severityPressure: 0.2,
+      },
+    });
+    const alignedExpiry = deriveArbitrationCarryExpiry({
+      config,
+      carry: {
+        createdAt: 100,
+        recommendation: "favor_independent_overlap",
+        protectedResidualSide: "UP",
+        referenceShareGap: 2,
+        alignmentStreak: 3,
+        lastObservedAt: 110,
+        lastProtectedShares: 2,
+        expiresAt: 118,
+      },
+      protectedResidualShares: 1.95,
+      nowTs: 112,
+      recentSeedFlowCount: 2,
+      residualBehaviorState: {
+        carryPersistenceBias: 1.35,
+        riskToleranceBias: 0.72,
+        severityPressure: 0.2,
+      },
+    });
+
+    expect(alignedExpiry).toBeGreaterThan(baseExpiry);
+  });
+
+  it("preserves overlap eligibility from sticky carry when matched inventory is briefly below target", () => {
+    const config = buildConfig({
+      REQUIRE_MATCHED_INVENTORY_BEFORE_SECOND_GROUP: "true",
+      MAX_OPEN_GROUPS_PER_MARKET: "3",
+      MAX_OPEN_PARTIAL_GROUPS: "2",
+    });
+
+    const withoutCarry = shouldPreserveCarryDrivenOverlap({
+      config,
+      carry: undefined,
+      nowTs: 120,
+      secsToClose: 240,
+      protectedResidualShares: 1.5,
+      completionActive: true,
+      linkageHealthy: true,
+      matchedInventoryTargetMet: false,
+      matchedInventoryQuality: 0.55,
+      recentSeedFlowCount: 1,
+    });
+    const withCarry = shouldPreserveCarryDrivenOverlap({
+      config,
+      carry: {
+        recommendation: "favor_independent_overlap",
+        expiresAt: 150,
+        alignmentStreak: 3,
+      },
+      nowTs: 120,
+      secsToClose: 240,
+      protectedResidualShares: 1.5,
+      completionActive: true,
+      linkageHealthy: true,
+      matchedInventoryTargetMet: false,
+      matchedInventoryQuality: 0.72,
+      recentSeedFlowCount: 1,
+    });
+
+    expect(withoutCarry).toBe(false);
+    expect(withCarry).toBe(true);
+  });
+
+  it("still blocks carry-preserved overlap when matched inventory quality is too weak", () => {
+    const config = buildConfig({
+      REQUIRE_MATCHED_INVENTORY_BEFORE_SECOND_GROUP: "true",
+      MAX_OPEN_GROUPS_PER_MARKET: "3",
+      MAX_OPEN_PARTIAL_GROUPS: "2",
+    });
+
+    const withWeakQuality = shouldPreserveCarryDrivenOverlap({
+      config,
+      carry: {
+        recommendation: "favor_independent_overlap",
+        expiresAt: 150,
+        alignmentStreak: 3,
+      },
+      nowTs: 120,
+      secsToClose: 240,
+      protectedResidualShares: 1.5,
+      completionActive: true,
+      linkageHealthy: true,
+      matchedInventoryTargetMet: false,
+      matchedInventoryQuality: 0.35,
+      recentSeedFlowCount: 1,
+    });
+
+    expect(withWeakQuality).toBe(false);
+  });
+
+  it("clips carry alignment streak when recent execution confirmation is weak", () => {
+    const confirmed = deriveConfirmedCarryAlignmentStreak({
+      carry: { alignmentStreak: 4 },
+      state: {
+        fillHistory: [
+          {
+            outcome: "UP",
+            side: "BUY",
+            size: 10,
+            price: 0.48,
+            timestamp: 100,
+            makerTaker: "taker",
+            executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+          },
+          {
+            outcome: "DOWN",
+            side: "BUY",
+            size: 10,
+            price: 0.49,
+            timestamp: 110,
+            makerTaker: "taker",
+            executionMode: "PAIRGROUP_COVERED_SEED",
+          },
+        ],
+        mergeHistory: [
+          {
+            amount: 10,
+            timestamp: 115,
+            simulated: true,
+            matchedUpCost: 4.8,
+            matchedDownCost: 4.9,
+            mergeReturn: 10,
+            realizedPnl: 0.3,
+            remainingUpShares: 0,
+            remainingDownShares: 0,
+          },
+        ],
+      },
+      nowTs: 120,
+      matchedInventoryQuality: 1,
+      unlockedMatchedInventoryQuality: 1,
+    });
+    const weak = deriveConfirmedCarryAlignmentStreak({
+      carry: { alignmentStreak: 4 },
+      state: {
+        fillHistory: [
+          {
+            outcome: "UP",
+            side: "BUY",
+            size: 10,
+            price: 0.48,
+            timestamp: 100,
+            makerTaker: "taker",
+            executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+          },
+        ],
+        mergeHistory: [],
+      },
+      nowTs: 120,
+      matchedInventoryQuality: 0.3,
+      unlockedMatchedInventoryQuality: 0.2,
+    });
+
+    expect(confirmed).toBe(4);
+    expect(weak).toBe(1);
+  });
+
+  it("raises flow confidence when the same overlap lineage gets side-aligned seed fills and merge confirmation", () => {
+    const strongConfidence = deriveCarryFlowConfidence({
+      carry: {
+        recommendation: "favor_independent_overlap",
+        preferredSeedSide: "DOWN",
+        protectedResidualSide: "UP",
+        alignmentStreak: 3,
+      },
+      state: {
+        fillHistory: [
+          {
+            outcome: "DOWN",
+            side: "BUY",
+            size: 10,
+            price: 0.52,
+            timestamp: 100,
+            makerTaker: "taker",
+            executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+          },
+          {
+            outcome: "UP",
+            side: "BUY",
+            size: 9,
+            price: 0.41,
+            timestamp: 110,
+            makerTaker: "taker",
+            executionMode: "PAIRGROUP_COVERED_SEED",
+          },
+        ],
+        mergeHistory: [
+          {
+            amount: 9,
+            timestamp: 118,
+            simulated: true,
+          },
+        ],
+      },
+      nowTs: 120,
+      matchedInventoryQuality: 0.92,
+      unlockedMatchedInventoryQuality: 1,
+      recentSeedFlowCount: 2,
+    });
+    const weakConfidence = deriveCarryFlowConfidence({
+      carry: {
+        recommendation: "favor_independent_overlap",
+        preferredSeedSide: "DOWN",
+        protectedResidualSide: "UP",
+        alignmentStreak: 3,
+      },
+      state: {
+        fillHistory: [
+          {
+            outcome: "UP",
+            side: "BUY",
+            size: 10,
+            price: 0.48,
+            timestamp: 100,
+            makerTaker: "taker",
+            executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+          },
+        ],
+        mergeHistory: [],
+      },
+      nowTs: 120,
+      matchedInventoryQuality: 0.4,
+      unlockedMatchedInventoryQuality: 0.3,
+      recentSeedFlowCount: 0,
+    });
+
+    expect(strongConfidence).toBeGreaterThan(weakConfidence);
+    expect(strongConfidence).toBeGreaterThanOrEqual(1);
+    expect(weakConfidence).toBeLessThan(0.82);
+  });
+
+  it("prefers same-lineage fills over unrelated recent flow when deriving carry confidence", () => {
+    const sameLineage = deriveCarryFlowConfidence({
+      carry: {
+        recommendation: "favor_independent_overlap",
+        preferredSeedSide: "DOWN",
+        protectedResidualSide: "UP",
+        alignmentStreak: 3,
+      },
+      state: {
+        fillHistory: [
+          {
+            outcome: "DOWN",
+            side: "BUY",
+            size: 10,
+            price: 0.52,
+            timestamp: 100,
+            makerTaker: "taker",
+            executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+            flowLineage: "favor_independent_overlap|DOWN|UP",
+          },
+          {
+            outcome: "UP",
+            side: "BUY",
+            size: 8,
+            price: 0.41,
+            timestamp: 110,
+            makerTaker: "taker",
+            executionMode: "PAIRGROUP_COVERED_SEED",
+            flowLineage: "favor_independent_overlap|DOWN|UP",
+          },
+          {
+            outcome: "UP",
+            side: "BUY",
+            size: 8,
+            price: 0.41,
+            timestamp: 112,
+            makerTaker: "taker",
+            executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+            flowLineage: "favor_independent_overlap|UP|DOWN",
+          },
+        ],
+        mergeHistory: [
+          {
+            amount: 8,
+            timestamp: 118,
+            simulated: true,
+            flowLineage: "favor_independent_overlap|DOWN|UP",
+          },
+        ],
+      },
+      nowTs: 120,
+      matchedInventoryQuality: 0.88,
+      unlockedMatchedInventoryQuality: 1,
+      recentSeedFlowCount: 2,
+    });
+    const mismatchedLineage = deriveCarryFlowConfidence({
+      carry: {
+        recommendation: "favor_independent_overlap",
+        preferredSeedSide: "DOWN",
+        protectedResidualSide: "UP",
+        alignmentStreak: 3,
+      },
+      state: {
+        fillHistory: [
+          {
+            outcome: "UP",
+            side: "BUY",
+            size: 8,
+            price: 0.41,
+            timestamp: 112,
+            makerTaker: "taker",
+            executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+            flowLineage: "favor_independent_overlap|UP|DOWN",
+          },
+        ],
+        mergeHistory: [],
+      },
+      nowTs: 120,
+      matchedInventoryQuality: 0.88,
+      unlockedMatchedInventoryQuality: 1,
+      recentSeedFlowCount: 2,
+    });
+
+    expect(sameLineage).toBeGreaterThan(mismatchedLineage);
+  });
+
+  it("restores persisted carry when residual side and gap still support the same flow", () => {
+    const restored = restorePersistedArbitrationCarry({
+      snapshot: {
+        createdAt: 100,
+        recommendation: "favor_independent_overlap",
+        preferredSeedSide: "DOWN",
+        protectedResidualSide: "UP",
+        referenceShareGap: 8,
+        alignmentStreak: 3,
+        lastObservedAt: 115,
+        lastProtectedShares: 7.5,
+        expiresAt: 160,
+        residualSeverityLevel: "small",
+      },
+      state: {
+        upShares: 8,
+        downShares: 1,
+      },
+      nowTs: 120,
+      minResidualShares: 1,
+    });
+
+    expect(restored).toMatchObject({
+      recommendation: "favor_independent_overlap",
+      preferredSeedSide: "DOWN",
+      protectedResidualSide: "UP",
+      alignmentStreak: 3,
+      lastProtectedShares: 7,
+      residualSeverityLevel: "small",
+    });
+  });
+
+  it("drops persisted carry when the residual side no longer matches the prior flow", () => {
+    const restored = restorePersistedArbitrationCarry({
+      snapshot: {
+        createdAt: 100,
+        recommendation: "favor_independent_overlap",
+        preferredSeedSide: "DOWN",
+        protectedResidualSide: "UP",
+        referenceShareGap: 8,
+        alignmentStreak: 3,
+        lastObservedAt: 115,
+        lastProtectedShares: 7.5,
+        expiresAt: 160,
+        residualSeverityLevel: "small",
+      },
+      state: {
+        upShares: 1,
+        downShares: 8,
+      },
+      nowTs: 120,
+      minResidualShares: 1,
+    });
+
+    expect(restored).toBeUndefined();
+  });
+
+  it("lets strong flow confidence preserve overlap slightly below the default matched-inventory floor", () => {
+    const config = buildConfig({
+      REQUIRE_MATCHED_INVENTORY_BEFORE_SECOND_GROUP: "true",
+      MAX_OPEN_GROUPS_PER_MARKET: "3",
+      MAX_OPEN_PARTIAL_GROUPS: "2",
+    });
+
+    const withStrongConfidence = shouldPreserveCarryDrivenOverlap({
+      config,
+      carry: {
+        recommendation: "favor_independent_overlap",
+        expiresAt: 150,
+        alignmentStreak: 3,
+      },
+      nowTs: 120,
+      secsToClose: 240,
+      protectedResidualShares: 1.5,
+      completionActive: true,
+      linkageHealthy: true,
+      matchedInventoryTargetMet: false,
+      matchedInventoryQuality: 0.52,
+      carryFlowConfidence: 1.05,
+      recentSeedFlowCount: 1,
+    });
+
+    expect(withStrongConfidence).toBe(true);
+  });
+
 });

@@ -8,10 +8,25 @@ import {
   type CompletionDecision,
   type UnwindDecision,
 } from "./completionEngine.js";
-import { evaluateEntryBuys, type EntryBuyDecision, type EntryDecisionTrace } from "./entryLadderEngine.js";
-import type { XuanMarketState } from "./marketState.js";
+import {
+  evaluateEntryBuys,
+  type EntryBuyDecision,
+  type EntryDecisionTrace,
+} from "./entryLadderEngine.js";
+import {
+  countActiveIndependentFlowCount,
+  countRecentSeedFlowCount,
+  type XuanMarketState,
+} from "./marketState.js";
 import { OrderBookState } from "./orderBookState.js";
-import { pairEntryCap } from "./modePolicy.js";
+import {
+  classifyResidualSeverity,
+  type FlowPressureBudgetState,
+  deriveFlowPressureBudgetState,
+  pairEntryCap,
+  residualSeverityPressure,
+  type OverlapRepairArbitration,
+} from "./modePolicy.js";
 import { pairCostWithBothTaker } from "./sumAvgEngine.js";
 import type { StrategyExecutionMode } from "./executionModes.js";
 import type { FairValueSnapshot } from "./fairValueEngine.js";
@@ -54,6 +69,17 @@ export interface TickInput {
   allowControlledOverlap?: boolean | undefined;
   protectedResidualShares?: number | undefined;
   protectedResidualSide?: "UP" | "DOWN" | undefined;
+  recentSeedFlowCount?: number | undefined;
+  activeIndependentFlowCount?: number | undefined;
+  completionPatienceMultiplier?: number | undefined;
+  arbitrationCarry?: {
+    recommendation: OverlapRepairArbitration;
+    preferredSeedSide?: "UP" | "DOWN" | undefined;
+    alignmentStreak?: number | undefined;
+    flowConfidence?: number | undefined;
+  } | undefined;
+  matchedInventoryQuality?: number | undefined;
+  flowPressureState?: FlowPressureBudgetState | undefined;
 }
 
 function overrideRiskForPhase(
@@ -104,20 +130,75 @@ export class Xuan5mBot {
       config.botMode === "XUAN" && config.allowInitialNegativePairSweep
         ? Math.max(pairCap, config.xuanPairSweepSoftCap)
         : pairCap;
-    const inventoryBalanced = shareGap <= config.completionMinQty;
+    const overlapBaseLot = config.liveSmallLotLadder[0] ?? config.defaultLot;
+    const derivedMatchedInventoryQuality = Number(
+      Math.min(1.25, Math.min(state.upShares, state.downShares) / Math.max(overlapBaseLot, 1e-6)).toFixed(6),
+    );
+    const residualSeverity = classifyResidualSeverity(config, shareGap);
+    const residualPressure = residualSeverityPressure(config, shareGap);
+    const carryFlowConfidence = Math.max(0, input.arbitrationCarry?.flowConfidence ?? 0);
+    const carryMatchedInventoryQuality = Math.max(
+      0,
+      input.matchedInventoryQuality ?? derivedMatchedInventoryQuality,
+    );
+    const flowPressureState =
+      input.flowPressureState ??
+      deriveFlowPressureBudgetState({
+        carryFlowConfidence,
+        matchedInventoryQuality: carryMatchedInventoryQuality,
+        recentSeedFlowCount: input.recentSeedFlowCount,
+        activeIndependentFlowCount: input.activeIndependentFlowCount,
+        residualSeverityPressure: residualPressure,
+      });
+    const carryPairGateRelief =
+      config.botMode === "XUAN" && config.allowInitialNegativePairSweep
+        ? flowPressureState.pairGateRelief
+        : 0;
+    const effectivePairDecisionCap =
+      config.botMode === "XUAN"
+        ? Math.min(config.xuanBehaviorCap, pairDecisionCap + carryPairGateRelief)
+        : pairDecisionCap;
+    const pairGatePressure =
+      pairTakerCost <= pairCap
+        ? 0
+        : Number(
+            (
+              (pairTakerCost - pairCap) /
+              Math.max(
+                (config.botMode === "XUAN"
+                  ? Math.max(config.xuanBehaviorCap, effectivePairDecisionCap + 0.01)
+                  : effectivePairDecisionCap + 0.01) -
+                  pairCap,
+                1e-6,
+              )
+            ).toFixed(6),
+          );
+    const inventoryBalanced = residualSeverity.level === "flat" || residualSeverity.level === "micro";
+    const recentSeedFlowCount = input.recentSeedFlowCount ?? countRecentSeedFlowCount(state.fillHistory, nowTs);
+    const activeIndependentFlowCount =
+      input.activeIndependentFlowCount ?? countActiveIndependentFlowCount(state.fillHistory, nowTs);
 
     const lot = chooseLot(config, {
       marketSlug: state.market.slug,
       dryRunOrSmallLive: input.dryRunOrSmallLive,
       secsFromOpen,
       imbalance: shareGap / Math.max(totalShares, 1),
+      residualSeverityLevel: residualSeverity.level,
+      residualSeverityPressure: residualPressure,
+      recentSeedFlowCount,
+      activeIndependentFlowCount,
+      flowPressureState,
+      arbitrationCarryAlignmentStreak: input.arbitrationCarry?.alignmentStreak,
+      arbitrationCarryFlowConfidence: input.arbitrationCarry?.flowConfidence,
+      matchedInventoryQuality: carryMatchedInventoryQuality,
       bookDepthGood:
         Math.min(
           books.depthAtOrBetter("UP", bestAskUp, "ask"),
           books.depthAtOrBetter("DOWN", bestAskDown, "ask"),
         ) >= config.defaultLot,
-      pairCostWithinCap: pairTakerCost <= pairDecisionCap,
-      pairCostComfortable: pairTakerCost <= pairDecisionCap - config.minEdgePerShare,
+      pairCostWithinCap: pairTakerCost <= effectivePairDecisionCap,
+      pairCostComfortable: pairTakerCost <= effectivePairDecisionCap - config.minEdgePerShare,
+      pairGatePressure,
       inventoryBalanced,
       recentBothSidesFilled: state.fillHistory.some((fill) => fill.outcome === "UP") && state.fillHistory.some((fill) => fill.outcome === "DOWN"),
       marketVolumeHigh: true,
@@ -133,6 +214,14 @@ export class Xuan5mBot {
       allowControlledOverlap: input.allowControlledOverlap,
       protectedResidualShares: input.protectedResidualShares,
       protectedResidualSide: input.protectedResidualSide,
+      recentSeedFlowCount,
+      activeIndependentFlowCount,
+      pairGatePressure,
+      forcedOverlapRepairArbitration: input.arbitrationCarry?.recommendation,
+      preferredOverlapSeedSide: input.arbitrationCarry?.preferredSeedSide,
+      carryFlowConfidence,
+      matchedInventoryQuality: carryMatchedInventoryQuality,
+      flowPressureState,
     });
 
     const entryBuys =
@@ -146,6 +235,10 @@ export class Xuan5mBot {
           usdcBalance: riskContext.usdcBalance,
           nowTs,
           fairValueSnapshot: input.fairValueSnapshot,
+          flowPressureState,
+          recentSeedFlowCount,
+          activeIndependentFlowCount,
+          completionPatienceMultiplier: input.completionPatienceMultiplier,
         }) ?? undefined
       : undefined;
     const mergePlan = planMerge(config, projectMergeState(state, entryBuys, inventoryAdjustment?.completion));

@@ -7,9 +7,21 @@ import {
   oldestResidualLotTimestamp,
   projectedShareGapAfterBuy,
 } from "./inventoryState.js";
-import type { XuanMarketState } from "./marketState.js";
+import {
+  countActiveIndependentFlowCount,
+  countRecentSeedFlowCount,
+  type XuanMarketState,
+} from "./marketState.js";
 import { OrderBookState } from "./orderBookState.js";
-import { completionAllowance, resolvePartialCompletionPhase } from "./modePolicy.js";
+import {
+  classifyResidualSeverity,
+  completionAllowance,
+  type FlowPressureBudgetState,
+  deriveFlowPressureBudgetState,
+  resolvePartialCompletionPhase,
+  resolveResidualBehaviorState,
+  shouldDelayResidualCompletion,
+} from "./modePolicy.js";
 import { completionCost } from "./sumAvgEngine.js";
 import type { StrategyExecutionMode } from "./executionModes.js";
 import { buildTakerBuyOrder, buildTakerSellOrder } from "./marketOrderBuilder.js";
@@ -33,6 +45,12 @@ export interface CompletionDecision {
   oppositeAveragePrice: number;
   missingSideAveragePrice: number;
   highLowMismatch: boolean;
+  residualSeverityLevel?: "flat" | "micro" | "small" | "medium" | "aggressive";
+  residualSeverityPressure?: number;
+  residualFlowDensity?: number;
+  completionPatienceBias?: number;
+  overlapRepairArbitration?: "no_overlap_lock" | "standard_pair_reentry" | "favor_independent_overlap" | "favor_residual_repair";
+  arbitrationOutcome?: "completion" | "hold";
 }
 
 export interface UnwindDecision {
@@ -42,6 +60,11 @@ export interface UnwindDecision {
   expectedAveragePrice: number;
   mode: StrategyExecutionMode;
   order: MarketOrderArgs;
+  residualSeverityLevel?: "flat" | "micro" | "small" | "medium" | "aggressive";
+  residualSeverityPressure?: number;
+  residualFlowDensity?: number;
+  overlapRepairArbitration?: "no_overlap_lock" | "standard_pair_reentry" | "favor_independent_overlap" | "favor_residual_repair";
+  arbitrationOutcome?: "unwind";
 }
 
 export interface InventoryAdjustmentDecision {
@@ -54,6 +77,10 @@ export interface CompletionContext {
   usdcBalance?: number;
   nowTs?: number | undefined;
   fairValueSnapshot?: FairValueSnapshot | undefined;
+  flowPressureState?: FlowPressureBudgetState | undefined;
+  recentSeedFlowCount?: number | undefined;
+  activeIndependentFlowCount?: number | undefined;
+  completionPatienceMultiplier?: number | undefined;
 }
 
 export function chooseInventoryAdjustment(
@@ -109,6 +136,28 @@ function chooseCompletion(
 
   const oldGap = absoluteShareGap(state);
   const leadingSide: OutcomeSide = sideToBuy === "UP" ? "DOWN" : "UP";
+  const recentSeedFlowCount =
+    ctx.recentSeedFlowCount ??
+    (ctx.nowTs !== undefined ? countRecentSeedFlowCount(state.fillHistory, ctx.nowTs) : 0);
+  const activeIndependentFlowCount =
+    ctx.activeIndependentFlowCount ??
+    (ctx.nowTs !== undefined ? countActiveIndependentFlowCount(state.fillHistory, ctx.nowTs) : 0);
+  const residualBehaviorState = resolveResidualBehaviorState({
+    config,
+    residualShares: missingShares,
+    shareGap: missingShares,
+    recentSeedFlowCount,
+    activeIndependentFlowCount,
+  });
+  const residualSeverity = residualBehaviorState.severity;
+  const overlapRepairArbitration = residualBehaviorState.overlapRepairArbitration;
+  const flowPressureState =
+    ctx.flowPressureState ??
+    deriveFlowPressureBudgetState({
+      recentSeedFlowCount,
+      activeIndependentFlowCount,
+      residualSeverityPressure: residualBehaviorState.severityPressure,
+    });
   const residualTimestamp = oldestResidualLotTimestamp(state, leadingSide);
   const partialAgeSec =
     ctx.nowTs !== undefined && residualTimestamp !== undefined
@@ -158,12 +207,28 @@ function chooseCompletion(
     ),
   ).sort((left, right) => right - left);
   const prioritizedExactQty = exactCompletionQtyPrior ? normalizeSize(exactCompletionQtyPrior.qty) : undefined;
+  const guidedMinCompletionSize = resolveGuidedMinCompletionSize({
+    config,
+    missingShares,
+    secsToClose: ctx.secsToClose,
+    recentSeedFlowCount,
+    activeIndependentFlowCount,
+    flowPressureState,
+    exactPriorActive: Boolean(exactCompletionQtyPrior),
+  });
   const orderedCandidateSizes =
     prioritizedExactQty !== undefined && candidateSizes.includes(prioritizedExactQty)
       ? [prioritizedExactQty, ...candidateSizes.filter((size) => Math.abs(size - prioritizedExactQty) > 1e-6)]
       : candidateSizes;
 
   for (const candidateSize of orderedCandidateSizes) {
+    if (
+      guidedMinCompletionSize > 0 &&
+      candidateSize + 1e-6 < guidedMinCompletionSize &&
+      (prioritizedExactQty === undefined || Math.abs(candidateSize - prioritizedExactQty) > 1e-6)
+    ) {
+      continue;
+    }
     if (candidateSize > phaseMaxQty) {
       continue;
     }
@@ -237,6 +302,25 @@ function chooseCompletion(
     if (!fairValueDecision.allowed && phase.mode !== "POST_MERGE_RESIDUAL_COMPLETION") {
       continue;
     }
+    if (
+      shouldDelayResidualCompletion({
+        config,
+        residualShares: missingShares,
+        partialAgeSec,
+        secsToClose: ctx.secsToClose,
+        oppositeAveragePrice: existingAverage,
+        missingSidePrice: execution.averagePrice,
+        exactPriorActive: Boolean(exactCompletionQtyPrior),
+        exceptionalMode: Boolean(allowance.highLowMismatch) || cheapLateCompletionChase,
+        recentSeedFlowCount,
+        activeIndependentFlowCount,
+        ...(ctx.completionPatienceMultiplier !== undefined
+          ? { completionPatienceMultiplier: ctx.completionPatienceMultiplier }
+          : {}),
+      })
+    ) {
+      continue;
+    }
 
     if (
       ctx.secsToClose <= config.partialNoChaseLastSec &&
@@ -301,6 +385,12 @@ function chooseCompletion(
       oppositeAveragePrice: existingAverage,
       missingSideAveragePrice: execution.averagePrice,
       highLowMismatch: allowance.highLowMismatch ?? false,
+      residualSeverityLevel: residualSeverity.level,
+      residualSeverityPressure: residualBehaviorState.severityPressure,
+      residualFlowDensity: residualBehaviorState.flowDensity,
+      completionPatienceBias: residualBehaviorState.completionPatienceBias,
+      overlapRepairArbitration,
+      arbitrationOutcome: "completion",
       order: buildTakerBuyOrder({
         state,
         side: sideToBuy,
@@ -340,6 +430,53 @@ function shouldUseCheapLateCompletionChase(args: {
   );
 }
 
+function resolveGuidedMinCompletionSize(args: {
+  config: XuanStrategyConfig;
+  missingShares: number;
+  secsToClose: number;
+  recentSeedFlowCount: number;
+  activeIndependentFlowCount: number;
+  flowPressureState: {
+    supportive: boolean;
+    assertive: boolean;
+    remainingBudget: number;
+  };
+  exactPriorActive: boolean;
+}): number {
+  if (args.config.botMode !== "XUAN" || args.exactPriorActive) {
+    return 0;
+  }
+  if (args.secsToClose <= Math.max(20, args.config.finalWindowCompletionOnlySec)) {
+    return 0;
+  }
+
+  const moderateMultiFlowPressure =
+    args.activeIndependentFlowCount >= 2 &&
+    args.flowPressureState.supportive &&
+    args.flowPressureState.remainingBudget >= 0.3 &&
+    args.missingShares >= args.config.completionMinQty * 4;
+  if (!moderateMultiFlowPressure) {
+    return 0;
+  }
+
+  const baseLot = args.config.liveSmallLotLadder[0] ?? args.config.defaultLot;
+  const strongMultiFlowPressure =
+    args.activeIndependentFlowCount >= 2 &&
+    args.recentSeedFlowCount >= 2 &&
+    args.flowPressureState.assertive &&
+    args.flowPressureState.remainingBudget >= 0.45;
+  const targetFloor = strongMultiFlowPressure
+    ? Math.max(args.missingShares * 0.5, baseLot * 0.22)
+    : Math.max(args.missingShares * 0.35, baseLot * 0.18);
+
+  return normalizeSize(
+    Math.max(
+      args.config.completionMinQty,
+      Math.min(args.missingShares, targetFloor),
+    ),
+  );
+}
+
 function chooseResidualUnwind(
   config: XuanStrategyConfig,
   state: XuanMarketState,
@@ -351,8 +488,40 @@ function chooseResidualUnwind(
   if (!config.sellUnwindEnabled) {
     return null;
   }
+  const residualBehaviorState = resolveResidualBehaviorState({
+    config,
+    residualShares: missingShares,
+    shareGap: missingShares,
+    recentSeedFlowCount:
+      ctx.recentSeedFlowCount ??
+      (ctx.nowTs !== undefined ? countRecentSeedFlowCount(state.fillHistory, ctx.nowTs) : 0),
+    activeIndependentFlowCount:
+      ctx.activeIndependentFlowCount ??
+      (ctx.nowTs !== undefined ? countActiveIndependentFlowCount(state.fillHistory, ctx.nowTs) : 0),
+  });
+  const residualSeverity = residualBehaviorState.severity;
+  const overlapRepairArbitration = residualBehaviorState.overlapRepairArbitration;
+  const flowPressureState =
+    ctx.flowPressureState ??
+    deriveFlowPressureBudgetState({
+      recentSeedFlowCount:
+        ctx.recentSeedFlowCount ??
+        (ctx.nowTs !== undefined ? countRecentSeedFlowCount(state.fillHistory, ctx.nowTs) : 0),
+      activeIndependentFlowCount:
+        ctx.activeIndependentFlowCount ??
+        (ctx.nowTs !== undefined ? countActiveIndependentFlowCount(state.fillHistory, ctx.nowTs) : 0),
+      residualSeverityPressure: residualBehaviorState.severityPressure,
+    });
 
   if (ctx.secsToClose > config.residualUnwindSecToClose || missingShares <= config.maxResidualHoldShares) {
+    return null;
+  }
+  if (
+    flowPressureState.confirmed &&
+    flowPressureState.remainingBudget >= 0.4 &&
+    residualSeverity.level !== "aggressive" &&
+    ctx.secsToClose > Math.max(15, Math.min(config.residualUnwindSecToClose, config.finalWindowCompletionOnlySec))
+  ) {
     return null;
   }
 
@@ -370,8 +539,13 @@ function chooseResidualUnwind(
     sideToSell,
     unwindShares: execution.filledSize,
     residualAfter: normalizeSize(Math.max(0, missingShares - execution.filledSize)),
-    expectedAveragePrice: execution.averagePrice,
-    mode: "UNWIND",
+      expectedAveragePrice: execution.averagePrice,
+      mode: "UNWIND",
+      residualSeverityLevel: residualSeverity.level,
+      residualSeverityPressure: residualBehaviorState.severityPressure,
+      residualFlowDensity: residualBehaviorState.flowDensity,
+      overlapRepairArbitration,
+      arbitrationOutcome: "unwind",
     order: buildTakerSellOrder({
       state,
       side: sideToSell,

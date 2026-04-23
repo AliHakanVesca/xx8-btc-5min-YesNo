@@ -10,9 +10,14 @@ import { applyFill, applyMerge, averageCost, pairVwapSum } from "../strategy/xua
 import { planMerge } from "../strategy/xuan5m/mergeCoordinator.js";
 import { takerFeePerShare } from "../strategy/xuan5m/sumAvgEngine.js";
 import type { FairValueSnapshot } from "../strategy/xuan5m/fairValueEngine.js";
+import type { StrategyExecutionMode } from "../strategy/xuan5m/executionModes.js";
 import { buildFootprintSummary, type FootprintSummary } from "./footprintMetrics.js";
 
 export type PaperSessionVariant = "xuan-flow" | "blocked-completion";
+
+export interface PaperSessionOptions {
+  completionPatienceMultiplier?: number | undefined;
+}
 
 interface ReplayBooks {
   upBid: number;
@@ -42,6 +47,7 @@ export interface PaperSessionFillEvent {
   feeUsd: number;
   effectiveNotional: number;
   reason: string;
+  executionMode?: StrategyExecutionMode | undefined;
 }
 
 export interface PaperSessionStepResult {
@@ -387,6 +393,7 @@ function buildFillEvent(args: {
   size: number;
   price: number;
   reason: string;
+  executionMode?: StrategyExecutionMode | undefined;
 }): PaperSessionFillEvent {
   const rawNotional = args.size * args.price;
   const feeUsd = args.action === "BUY" ? args.size * takerFeePerShare(args.price) : 0;
@@ -400,6 +407,7 @@ function buildFillEvent(args: {
     feeUsd,
     effectiveNotional: rawNotional + feeUsd,
     reason: args.reason,
+    ...(args.executionMode !== undefined ? { executionMode: args.executionMode } : {}),
   };
 }
 
@@ -411,6 +419,7 @@ function applySyntheticFill(state: XuanMarketState, event: PaperSessionFillEvent
     size: event.size,
     timestamp,
     makerTaker: "taker",
+    ...(event.executionMode !== undefined ? { executionMode: event.executionMode } : {}),
   };
   return applyFill(state, fill);
 }
@@ -430,6 +439,50 @@ function buildPaperFairValueSnapshot(step: PaperSessionStepSpec): FairValueSnaps
     livePrice: 0,
     note: "paper_session_assumed_fair_value",
   };
+}
+
+function applyCompletionTimingCalibration(
+  steps: PaperSessionStepSpec[],
+  options: PaperSessionOptions,
+): PaperSessionStepSpec[] {
+  const multiplier = options.completionPatienceMultiplier;
+  if (multiplier === undefined || !Number.isFinite(multiplier) || Math.abs(multiplier - 1) < 0.001) {
+    return steps;
+  }
+
+  const calibrated = steps.map((step, index) => {
+    if (!step.completionFill || index === 0) {
+      return step;
+    }
+    const previous = steps[index - 1];
+    const next = steps[index + 1];
+    if (!previous || step.offsetSec <= previous.offsetSec) {
+      return step;
+    }
+    const originalLatency = step.offsetSec - previous.offsetSec;
+    const calibratedLatency = Math.max(2, Math.round(originalLatency * Math.max(0.35, Math.min(1.4, multiplier))));
+    const latestAllowedOffset =
+      next && next.offsetSec > previous.offsetSec
+        ? Math.max(previous.offsetSec + 1, next.offsetSec - 1)
+        : step.offsetSec;
+    const offsetSec = Math.max(
+      previous.offsetSec + 1,
+      Math.min(latestAllowedOffset, previous.offsetSec + calibratedLatency),
+    );
+    if (offsetSec === step.offsetSec) {
+      return step;
+    }
+    return {
+      ...step,
+      offsetSec,
+      note: `${step.note} Completion timing calibrated from ${step.offsetSec}s to ${offsetSec}s.`,
+    };
+  });
+
+  return calibrated
+    .map((step, index) => ({ step, index }))
+    .sort((left, right) => left.step.offsetSec - right.step.offsetSec || left.index - right.index)
+    .map(({ step }) => step);
 }
 
 function applyEffectiveFill(
@@ -475,7 +528,11 @@ function applyEffectiveMerge(
   };
 }
 
-export function runPaperSession(env: AppEnv, variant: PaperSessionVariant = "xuan-flow"): PaperSessionReport {
+export function runPaperSession(
+  env: AppEnv,
+  variant: PaperSessionVariant = "xuan-flow",
+  options: PaperSessionOptions = {},
+): PaperSessionReport {
   const config = buildStrategyConfig(env);
   const bot = new Xuan5mBot();
   const clock = new SystemClock();
@@ -484,8 +541,9 @@ export function runPaperSession(env: AppEnv, variant: PaperSessionVariant = "xua
   let state = createMarketState(market);
   let effectiveCostState: EffectiveCostState = { up: 0, down: 0 };
   const steps: PaperSessionStepResult[] = [];
+  const replaySteps = applyCompletionTimingCalibration(sessionVariants[variant], options);
 
-  for (const step of sessionVariants[variant]) {
+  for (const step of replaySteps) {
     const nowTs = market.startTs + step.offsetSec;
     const books = new OrderBookState(
       buildSyntheticBook(market.tokens.UP.tokenId, market.conditionId, step.books.upBid, step.books.upAsk),
@@ -508,6 +566,9 @@ export function runPaperSession(env: AppEnv, variant: PaperSessionVariant = "xua
       },
       dryRunOrSmallLive: true,
       fairValueSnapshot: buildPaperFairValueSnapshot(step),
+      ...(options.completionPatienceMultiplier !== undefined
+        ? { completionPatienceMultiplier: options.completionPatienceMultiplier }
+        : {}),
     });
 
     const fills: PaperSessionFillEvent[] = [];
@@ -527,6 +588,7 @@ export function runPaperSession(env: AppEnv, variant: PaperSessionVariant = "xua
         size: entryBuy.size,
         price: entryBuy.expectedAveragePrice,
         reason: entryBuy.reason,
+        executionMode: entryBuy.mode,
       });
       fills.push(fillEvent);
       effectiveCostState = applyEffectiveFill(effectiveCostState, state, fillEvent);
@@ -542,6 +604,7 @@ export function runPaperSession(env: AppEnv, variant: PaperSessionVariant = "xua
           size: decision.completion.missingShares,
           price: decision.completion.order.price ?? 0,
           reason: decision.completion.capMode,
+          executionMode: decision.completion.mode,
         });
         fills.push(fillEvent);
         effectiveCostState = applyEffectiveFill(effectiveCostState, state, fillEvent);
@@ -560,6 +623,7 @@ export function runPaperSession(env: AppEnv, variant: PaperSessionVariant = "xua
           size: decision.unwind.unwindShares,
           price: decision.unwind.expectedAveragePrice,
           reason: "residual_unwind",
+          executionMode: decision.unwind.mode,
         });
         fills.push(fillEvent);
         effectiveCostState = applyEffectiveFill(effectiveCostState, state, fillEvent);

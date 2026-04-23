@@ -17,7 +17,14 @@ import {
   writeCanonicalReferenceBundle,
 } from "./analytics/xuanCanonicalReference.js";
 import { resolveBundledExactReferenceBundle } from "./analytics/xuanExactReference.js";
-import { compareCanonicalReference } from "./analytics/xuanReplayComparator.js";
+import {
+  buildComparisonFlowSummary,
+  buildFlowCalibrationSummary,
+  classifyComparisonFlowSummary,
+  compareCanonicalReference,
+  type ComparisonFlowSummary,
+  type FlowCalibrationSummary,
+} from "./analytics/xuanReplayComparator.js";
 import {
   buildRuntimeCanonicalExtractBundle,
   toCanonicalReferenceBundle,
@@ -57,6 +64,44 @@ async function fileExists(path: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+function extractFlowSummariesFromValidationRuns(
+  runs: ReturnType<PersistentStateStore["recentValidationRuns"]>,
+): ComparisonFlowSummary[] {
+  return runs
+    .map((run) => run.payload?.flowSummary)
+    .filter((summary): summary is ComparisonFlowSummary => {
+      if (!summary || typeof summary !== "object") {
+        return false;
+      }
+      const candidate = summary as Partial<Record<keyof ComparisonFlowSummary, unknown>>;
+      return (
+        typeof candidate.flowLineageSimilarity === "number" &&
+        typeof candidate.activeFlowPeakSimilarity === "number" &&
+        typeof candidate.cycleCompletionLatencySimilarity === "number"
+      );
+    });
+}
+
+function completionPatienceMultiplierFromCalibration(
+  calibration: Pick<
+    FlowCalibrationSummary,
+    "status" | "recommendedFocus" | "completionLatencyDirection" | "averageCycleCompletionLatencyDeltaSec"
+  >,
+): number {
+  if (calibration.status !== "WARN" && calibration.status !== "FAIL") {
+    return 1;
+  }
+  const focus = new Set(calibration.recommendedFocus);
+  const latencyDeltaSec = Math.abs(calibration.averageCycleCompletionLatencyDeltaSec);
+  if (focus.has("release_completion_earlier") || calibration.completionLatencyDirection === "candidate_late") {
+    return latencyDeltaSec >= 6 ? 0.45 : latencyDeltaSec >= 3 ? 0.65 : 0.78;
+  }
+  if (focus.has("increase_completion_patience") || calibration.completionLatencyDirection === "candidate_early") {
+    return latencyDeltaSec >= 6 ? 1.28 : latencyDeltaSec >= 3 ? 1.2 : 1.12;
+  }
+  return 1;
 }
 
 async function runAnalyzeXuan(): Promise<void> {
@@ -186,10 +231,17 @@ async function runXuanComparePaperCommand(options: {
     throw new Error(`Canonical reference bulunamadi: ${options.referenceSlug}`);
   }
 
-  const replay = runPaperSession(env, options.variant);
+  const stateStore = new PersistentStateStore(config.stateStorePath);
+  const preReplayFlowCalibration = buildFlowCalibrationSummary(
+    extractFlowSummariesFromValidationRuns(stateStore.recentValidationRuns("replay", 12)),
+  );
+  const replay = runPaperSession(env, options.variant, {
+    completionPatienceMultiplier: completionPatienceMultiplierFromCalibration(preReplayFlowCalibration),
+  });
   const candidate = buildCanonicalReferenceFromPaperSession(replay);
   const comparison = compareCanonicalReference(reference, { ...candidate, slug: reference.slug });
-  const stateStore = new PersistentStateStore(config.stateStorePath);
+  const flowSummary = buildComparisonFlowSummary(comparison);
+  const flowStatus = classifyComparisonFlowSummary(flowSummary);
   stateStore.recordValidationRun({
     kind: "replay",
     status: comparison.verdict.toLowerCase(),
@@ -200,14 +252,24 @@ async function runXuanComparePaperCommand(options: {
       referenceSlug: options.referenceSlug,
       score: comparison.score,
       verdict: comparison.verdict,
+      preReplayFlowCalibration,
+      flowSummary,
+      flowStatus,
     },
   });
+  const flowCalibration = buildFlowCalibrationSummary(
+    extractFlowSummariesFromValidationRuns(stateStore.recentValidationRuns("replay", 12)),
+  );
   stateStore.close();
 
   const output = {
     reference,
     candidate,
     comparison,
+    flowSummary,
+    flowStatus,
+    flowCalibration,
+    preReplayFlowCalibration,
     sources: bundle.sources,
   };
   const outputPath = options.out && options.out.length > 0 ? options.out : `reports/xuan_compare_${options.variant}_${options.referenceSlug}.json`;
@@ -217,6 +279,10 @@ async function runXuanComparePaperCommand(options: {
     variant: options.variant,
     verdict: comparison.verdict,
     score: comparison.score,
+    flowSummary,
+    flowStatus,
+    flowCalibration,
+    preReplayFlowCalibration,
   });
   await writeJson(outputPath, output);
   console.log(JSON.stringify({ outputPath, output }, null, 2));
@@ -296,6 +362,8 @@ async function runXuanCompareRuntimeCommand(options: {
   const comparison = compareCanonicalReference(reference, candidate, {
     hardFails: runtimeBundle.hardFailsBySlug[options.marketSlug],
   });
+  const flowSummary = buildComparisonFlowSummary(comparison);
+  const flowStatus = classifyComparisonFlowSummary(flowSummary);
   const stateStore = new PersistentStateStore(config.stateStorePath);
   stateStore.recordValidationRun({
     kind: "replay",
@@ -307,8 +375,13 @@ async function runXuanCompareRuntimeCommand(options: {
       marketSlug: options.marketSlug,
       score: comparison.score,
       verdict: comparison.verdict,
+      flowSummary,
+      flowStatus,
     },
   });
+  const flowCalibration = buildFlowCalibrationSummary(
+    extractFlowSummariesFromValidationRuns(stateStore.recentValidationRuns("replay", 12)),
+  );
   stateStore.close();
 
   const output = {
@@ -316,6 +389,9 @@ async function runXuanCompareRuntimeCommand(options: {
     runtimeBundle,
     candidateBundle: toCanonicalReferenceBundle(runtimeBundle),
     comparison,
+    flowSummary,
+    flowStatus,
+    flowCalibration,
   };
   const outputPath =
     options.out && options.out.length > 0
@@ -327,6 +403,9 @@ async function runXuanCompareRuntimeCommand(options: {
     marketSlug: options.marketSlug,
     verdict: comparison.verdict,
     score: comparison.score,
+    flowSummary,
+    flowStatus,
+    flowCalibration,
   });
   await writeJson(outputPath, output);
   console.log(JSON.stringify({ outputPath, output }, null, 2));

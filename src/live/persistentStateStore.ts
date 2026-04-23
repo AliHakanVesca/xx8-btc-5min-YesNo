@@ -55,6 +55,27 @@ export interface ValidationRunRecord {
   payload?: Record<string, unknown> | undefined;
 }
 
+export interface PersistedArbitrationCarrySnapshot {
+  createdAt: number;
+  recommendation: "favor_independent_overlap" | "favor_residual_repair";
+  preferredSeedSide?: OutcomeSide | undefined;
+  protectedResidualSide: OutcomeSide;
+  referenceShareGap: number;
+  alignmentStreak: number;
+  lastObservedAt: number;
+  lastProtectedShares: number;
+  expiresAt: number;
+  residualSeverityLevel?: "flat" | "micro" | "small" | "medium" | "aggressive" | undefined;
+}
+
+export interface PersistedFlowBudgetSnapshot {
+  load: number;
+  updatedAt: number;
+  lastAction?: string | undefined;
+  lastLineage?: string | undefined;
+  lineageLoads?: Record<string, number> | undefined;
+}
+
 export interface PersistentFillContext {
   orderId?: string | undefined;
   groupId?: string | undefined;
@@ -78,6 +99,7 @@ interface StoredLotRow {
   tx_hash: string | null;
   order_id: string | null;
   execution_mode: string | null;
+  flow_lineage: string | null;
   source: PersistentLotSource;
   timestamp: number;
 }
@@ -152,6 +174,13 @@ function computeEffectiveCost(rows: StoredLotRow[]): number {
   return normalize(rows.reduce((acc, row) => acc + row.qty_open * row.effective_price, 0));
 }
 
+function ensureColumn(db: DatabaseSync, table: string, column: string, ddl: string): void {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  if (!rows.some((row) => row.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl};`);
+  }
+}
+
 export class PersistentStateStore {
   private readonly db: DatabaseSync;
 
@@ -200,6 +229,7 @@ export class PersistentStateStore {
         tx_hash TEXT,
         order_id TEXT,
         execution_mode TEXT,
+        flow_lineage TEXT,
         source TEXT NOT NULL,
         timestamp INTEGER NOT NULL,
         closed_at INTEGER,
@@ -233,6 +263,7 @@ export class PersistentStateStore {
         amount REAL NOT NULL,
         timestamp INTEGER NOT NULL,
         simulated INTEGER NOT NULL,
+        flow_lineage TEXT,
         matched_up_cost REAL,
         matched_down_cost REAL,
         merge_return REAL,
@@ -280,6 +311,21 @@ export class PersistentStateStore {
         consecutive_seed_count INTEGER NOT NULL,
         reentry_disabled INTEGER NOT NULL,
         post_merge_completion_only_until INTEGER,
+        carry_created_at INTEGER,
+        carry_recommendation TEXT,
+        carry_preferred_seed_side TEXT,
+        carry_protected_residual_side TEXT,
+        carry_reference_share_gap REAL,
+        carry_alignment_streak INTEGER,
+        carry_last_observed_at INTEGER,
+        carry_last_protected_shares REAL,
+        carry_expires_at INTEGER,
+        carry_residual_severity_level TEXT,
+        flow_budget_load REAL,
+        flow_budget_updated_at INTEGER,
+        flow_budget_last_action TEXT,
+        flow_budget_last_lineage TEXT,
+        flow_budget_lineage_loads_json TEXT,
         updated_at INTEGER NOT NULL,
         no_new_entry_reason TEXT
       );
@@ -360,6 +406,38 @@ export class PersistentStateStore {
         note TEXT
       );
     `);
+    ensureColumn(this.db, "inventory_lots", "flow_lineage", "flow_lineage TEXT");
+    ensureColumn(this.db, "merge_events", "flow_lineage", "flow_lineage TEXT");
+    ensureColumn(this.db, "market_state", "carry_created_at", "carry_created_at INTEGER");
+    ensureColumn(this.db, "market_state", "carry_recommendation", "carry_recommendation TEXT");
+    ensureColumn(this.db, "market_state", "carry_preferred_seed_side", "carry_preferred_seed_side TEXT");
+    ensureColumn(
+      this.db,
+      "market_state",
+      "carry_protected_residual_side",
+      "carry_protected_residual_side TEXT",
+    );
+    ensureColumn(this.db, "market_state", "carry_reference_share_gap", "carry_reference_share_gap REAL");
+    ensureColumn(this.db, "market_state", "carry_alignment_streak", "carry_alignment_streak INTEGER");
+    ensureColumn(this.db, "market_state", "carry_last_observed_at", "carry_last_observed_at INTEGER");
+    ensureColumn(
+      this.db,
+      "market_state",
+      "carry_last_protected_shares",
+      "carry_last_protected_shares REAL",
+    );
+    ensureColumn(this.db, "market_state", "carry_expires_at", "carry_expires_at INTEGER");
+    ensureColumn(
+      this.db,
+      "market_state",
+      "carry_residual_severity_level",
+      "carry_residual_severity_level TEXT",
+    );
+    ensureColumn(this.db, "market_state", "flow_budget_load", "flow_budget_load REAL");
+    ensureColumn(this.db, "market_state", "flow_budget_updated_at", "flow_budget_updated_at INTEGER");
+    ensureColumn(this.db, "market_state", "flow_budget_last_action", "flow_budget_last_action TEXT");
+    ensureColumn(this.db, "market_state", "flow_budget_last_lineage", "flow_budget_last_lineage TEXT");
+    ensureColumn(this.db, "market_state", "flow_budget_lineage_loads_json", "flow_budget_lineage_loads_json TEXT");
   }
 
   close(): void {
@@ -424,10 +502,10 @@ export class PersistentStateStore {
         .prepare(`
           INSERT INTO inventory_lots (
             lot_id, group_id, market_slug, condition_id, outcome, side, qty_original, qty_open, price,
-            effective_price, fee_usdc, tx_hash, order_id, execution_mode, source, timestamp
+            effective_price, fee_usdc, tx_hash, order_id, execution_mode, flow_lineage, source, timestamp
           ) VALUES (
             @lotId, @groupId, @marketSlug, @conditionId, @outcome, @side, @qtyOriginal, @qtyOpen, @price,
-            @effectivePrice, @feeUsdc, @txHash, @orderId, @executionMode, @source, @timestamp
+            @effectivePrice, @feeUsdc, @txHash, @orderId, @executionMode, @flowLineage, @source, @timestamp
           )
         `)
         .run({
@@ -445,6 +523,7 @@ export class PersistentStateStore {
           txHash: context.txHash ?? null,
           orderId: context.orderId ?? null,
           executionMode: context.executionMode ?? fill.executionMode ?? null,
+          flowLineage: fill.flowLineage ?? null,
           source: context.source,
           timestamp: fill.timestamp,
         });
@@ -535,10 +614,10 @@ export class PersistentStateStore {
     this.db
       .prepare(`
         INSERT INTO merge_events (
-          merge_id, market_slug, condition_id, amount, timestamp, simulated, matched_up_cost,
+          merge_id, market_slug, condition_id, amount, timestamp, simulated, flow_lineage, matched_up_cost,
           matched_down_cost, merge_return, realized_pnl, remaining_up_shares, remaining_down_shares, tx_hash
         ) VALUES (
-          @mergeId, @marketSlug, @conditionId, @amount, @timestamp, @simulated, @matchedUpCost,
+          @mergeId, @marketSlug, @conditionId, @amount, @timestamp, @simulated, @flowLineage, @matchedUpCost,
           @matchedDownCost, @mergeReturn, @realizedPnl, @remainingUpShares, @remainingDownShares, @txHash
         )
       `)
@@ -549,6 +628,7 @@ export class PersistentStateStore {
         amount: matchedQty,
         timestamp: merge.timestamp,
         simulated: merge.simulated ? 1 : 0,
+        flowLineage: merge.flowLineage ?? null,
         matchedUpCost: merge.matchedUpCost ?? null,
         matchedDownCost: merge.matchedDownCost ?? null,
         mergeReturn: merge.mergeReturn ?? null,
@@ -946,6 +1026,29 @@ export class PersistentStateStore {
     };
   }
 
+  recentValidationRuns(kind: string, limit = 12): ValidationRunRecord[] {
+    const rows = this.db
+      .prepare(`
+        SELECT kind, status, timestamp, payload_json
+        FROM validation_runs
+        WHERE kind = ?
+        ORDER BY timestamp DESC
+        LIMIT ?
+      `)
+      .all(kind, Math.max(1, Math.floor(limit))) as Array<{
+      kind: string;
+      status: string;
+      timestamp: number;
+      payload_json: string | null;
+    }>;
+    return rows.map((row) => ({
+      kind: row.kind,
+      status: row.status,
+      timestamp: row.timestamp,
+      payload: row.payload_json ? (JSON.parse(row.payload_json) as Record<string, unknown>) : undefined,
+    }));
+  }
+
   recordPriceSnapshot(snapshot: StoredPriceSnapshot): void {
     this.db
       .prepare(`
@@ -1009,7 +1112,14 @@ export class PersistentStateStore {
     };
   }
 
-  upsertMarketState(state: XuanMarketState, noNewEntryReason?: string | undefined): void {
+  upsertMarketState(
+    state: XuanMarketState,
+    noNewEntryReason?: string | undefined,
+    runtimeHints?: {
+      arbitrationCarry?: PersistedArbitrationCarrySnapshot | undefined;
+      flowBudget?: PersistedFlowBudgetSnapshot | undefined;
+    },
+  ): void {
     const upRows = this.loadOpenLotRows(state.market.slug, "UP");
     const downRows = this.loadOpenLotRows(state.market.slug, "DOWN");
     const upShares = computeShares(upRows);
@@ -1021,6 +1131,8 @@ export class PersistentStateStore {
     const residualDownAvgCost = downShares > 0 ? normalize(computeRawCost(downRows) / downShares) : 0;
     const residualUpAvgEffectiveCost = upShares > 0 ? normalize(computeEffectiveCost(upRows) / upShares) : 0;
     const residualDownAvgEffectiveCost = downShares > 0 ? normalize(computeEffectiveCost(downRows) / downShares) : 0;
+    const arbitrationCarry = runtimeHints?.arbitrationCarry;
+    const flowBudget = runtimeHints?.flowBudget;
 
     this.db
       .prepare(`
@@ -1029,13 +1141,25 @@ export class PersistentStateStore {
           residual_up_avg_cost, residual_down_avg_cost, residual_up_avg_effective_cost,
           residual_down_avg_effective_cost, negative_edge_consumed_usdc, negative_pair_edge_consumed_usdc,
           negative_completion_edge_consumed_usdc, last_execution_mode, consecutive_seed_side,
-          consecutive_seed_count, reentry_disabled, post_merge_completion_only_until, updated_at, no_new_entry_reason
+          consecutive_seed_count, reentry_disabled, post_merge_completion_only_until, carry_created_at,
+          carry_recommendation, carry_preferred_seed_side, carry_protected_residual_side,
+          carry_reference_share_gap, carry_alignment_streak, carry_last_observed_at,
+          carry_last_protected_shares, carry_expires_at, carry_residual_severity_level,
+          flow_budget_load, flow_budget_updated_at, flow_budget_last_action,
+          flow_budget_last_lineage, flow_budget_lineage_loads_json,
+          updated_at, no_new_entry_reason
         ) VALUES (
           @marketSlug, @conditionId, @upShares, @downShares, @mergeable, @residualUp, @residualDown,
           @residualUpAvgCost, @residualDownAvgCost, @residualUpAvgEffectiveCost,
           @residualDownAvgEffectiveCost, @negativeEdgeConsumedUsdc, @negativePairEdgeConsumedUsdc,
           @negativeCompletionEdgeConsumedUsdc, @lastExecutionMode, @consecutiveSeedSide,
-          @consecutiveSeedCount, @reentryDisabled, @postMergeCompletionOnlyUntil, @updatedAt, @noNewEntryReason
+          @consecutiveSeedCount, @reentryDisabled, @postMergeCompletionOnlyUntil, @carryCreatedAt,
+          @carryRecommendation, @carryPreferredSeedSide, @carryProtectedResidualSide,
+          @carryReferenceShareGap, @carryAlignmentStreak, @carryLastObservedAt,
+          @carryLastProtectedShares, @carryExpiresAt, @carryResidualSeverityLevel,
+          @flowBudgetLoad, @flowBudgetUpdatedAt, @flowBudgetLastAction,
+          @flowBudgetLastLineage, @flowBudgetLineageLoadsJson, @updatedAt,
+          @noNewEntryReason
         )
         ON CONFLICT(market_slug) DO UPDATE SET
           condition_id = excluded.condition_id,
@@ -1056,6 +1180,21 @@ export class PersistentStateStore {
           consecutive_seed_count = excluded.consecutive_seed_count,
           reentry_disabled = excluded.reentry_disabled,
           post_merge_completion_only_until = excluded.post_merge_completion_only_until,
+          carry_created_at = excluded.carry_created_at,
+          carry_recommendation = excluded.carry_recommendation,
+          carry_preferred_seed_side = excluded.carry_preferred_seed_side,
+          carry_protected_residual_side = excluded.carry_protected_residual_side,
+          carry_reference_share_gap = excluded.carry_reference_share_gap,
+          carry_alignment_streak = excluded.carry_alignment_streak,
+          carry_last_observed_at = excluded.carry_last_observed_at,
+          carry_last_protected_shares = excluded.carry_last_protected_shares,
+          carry_expires_at = excluded.carry_expires_at,
+          carry_residual_severity_level = excluded.carry_residual_severity_level,
+          flow_budget_load = excluded.flow_budget_load,
+          flow_budget_updated_at = excluded.flow_budget_updated_at,
+          flow_budget_last_action = excluded.flow_budget_last_action,
+          flow_budget_last_lineage = excluded.flow_budget_last_lineage,
+          flow_budget_lineage_loads_json = excluded.flow_budget_lineage_loads_json,
           updated_at = excluded.updated_at,
           no_new_entry_reason = excluded.no_new_entry_reason
       `)
@@ -1079,9 +1218,123 @@ export class PersistentStateStore {
         consecutiveSeedCount: state.consecutiveSeedCount,
         reentryDisabled: state.reentryDisabled ? 1 : 0,
         postMergeCompletionOnlyUntil: state.postMergeCompletionOnlyUntil ?? null,
+        carryCreatedAt: arbitrationCarry?.createdAt ?? null,
+        carryRecommendation: arbitrationCarry?.recommendation ?? null,
+        carryPreferredSeedSide: arbitrationCarry?.preferredSeedSide ?? null,
+        carryProtectedResidualSide: arbitrationCarry?.protectedResidualSide ?? null,
+        carryReferenceShareGap: arbitrationCarry?.referenceShareGap ?? null,
+        carryAlignmentStreak: arbitrationCarry?.alignmentStreak ?? null,
+        carryLastObservedAt: arbitrationCarry?.lastObservedAt ?? null,
+        carryLastProtectedShares: arbitrationCarry?.lastProtectedShares ?? null,
+        carryExpiresAt: arbitrationCarry?.expiresAt ?? null,
+        carryResidualSeverityLevel: arbitrationCarry?.residualSeverityLevel ?? null,
+        flowBudgetLoad: flowBudget?.load ?? null,
+        flowBudgetUpdatedAt: flowBudget?.updatedAt ?? null,
+        flowBudgetLastAction: flowBudget?.lastAction ?? null,
+        flowBudgetLastLineage: flowBudget?.lastLineage ?? null,
+        flowBudgetLineageLoadsJson: flowBudget?.lineageLoads
+          ? JSON.stringify(flowBudget.lineageLoads)
+          : null,
         updatedAt: Math.floor(Date.now() / 1000),
         noNewEntryReason: noNewEntryReason ?? null,
       });
+  }
+
+  loadFlowBudgetSnapshot(marketSlug: string): PersistedFlowBudgetSnapshot | undefined {
+    const row = this.db
+      .prepare(`
+        SELECT flow_budget_load, flow_budget_updated_at, flow_budget_last_action,
+               flow_budget_last_lineage, flow_budget_lineage_loads_json
+        FROM market_state
+        WHERE market_slug = ?
+        LIMIT 1
+      `)
+      .get(marketSlug) as
+      | {
+          flow_budget_load: number | null;
+          flow_budget_updated_at: number | null;
+          flow_budget_last_action: string | null;
+          flow_budget_last_lineage: string | null;
+          flow_budget_lineage_loads_json: string | null;
+        }
+      | undefined;
+    if (!row || row.flow_budget_load === null || row.flow_budget_updated_at === null) {
+      return undefined;
+    }
+    let lineageLoads: Record<string, number> | undefined;
+    if (row.flow_budget_lineage_loads_json) {
+      try {
+        const parsed = JSON.parse(row.flow_budget_lineage_loads_json) as Record<string, unknown>;
+        lineageLoads = Object.fromEntries(
+          Object.entries(parsed)
+            .map(([lineage, value]) => [lineage, typeof value === "number" ? normalize(value) : 0] as const)
+            .filter(([, value]) => value > 1e-6),
+        );
+      } catch {
+        lineageLoads = undefined;
+      }
+    }
+    return {
+      load: normalize(row.flow_budget_load),
+      updatedAt: row.flow_budget_updated_at,
+      lastAction: row.flow_budget_last_action ?? undefined,
+      lastLineage: row.flow_budget_last_lineage ?? undefined,
+      lineageLoads,
+    };
+  }
+
+  loadArbitrationCarrySnapshot(marketSlug: string): PersistedArbitrationCarrySnapshot | undefined {
+    const row = this.db
+      .prepare(`
+        SELECT carry_created_at, carry_recommendation, carry_preferred_seed_side, carry_protected_residual_side,
+               carry_reference_share_gap, carry_alignment_streak, carry_last_observed_at,
+               carry_last_protected_shares, carry_expires_at, carry_residual_severity_level
+        FROM market_state
+        WHERE market_slug = ?
+        LIMIT 1
+      `)
+      .get(marketSlug) as
+      | {
+          carry_created_at: number | null;
+          carry_recommendation: PersistedArbitrationCarrySnapshot["recommendation"] | null;
+          carry_preferred_seed_side: OutcomeSide | null;
+          carry_protected_residual_side: OutcomeSide | null;
+          carry_reference_share_gap: number | null;
+          carry_alignment_streak: number | null;
+          carry_last_observed_at: number | null;
+          carry_last_protected_shares: number | null;
+          carry_expires_at: number | null;
+          carry_residual_severity_level:
+            | PersistedArbitrationCarrySnapshot["residualSeverityLevel"]
+            | null;
+        }
+      | undefined;
+    if (
+      !row ||
+      row.carry_created_at === null ||
+      row.carry_recommendation === null ||
+      row.carry_protected_residual_side === null ||
+      row.carry_reference_share_gap === null ||
+      row.carry_alignment_streak === null ||
+      row.carry_last_observed_at === null ||
+      row.carry_last_protected_shares === null ||
+      row.carry_expires_at === null
+    ) {
+      return undefined;
+    }
+
+    return {
+      createdAt: row.carry_created_at,
+      recommendation: row.carry_recommendation,
+      preferredSeedSide: row.carry_preferred_seed_side ?? undefined,
+      protectedResidualSide: row.carry_protected_residual_side,
+      referenceShareGap: row.carry_reference_share_gap,
+      alignmentStreak: row.carry_alignment_streak,
+      lastObservedAt: row.carry_last_observed_at,
+      lastProtectedShares: row.carry_last_protected_shares,
+      expiresAt: row.carry_expires_at,
+      residualSeverityLevel: row.carry_residual_severity_level ?? undefined,
+    };
   }
 
   loadMarketState(state: XuanMarketState): XuanMarketState {
@@ -1107,6 +1360,42 @@ export class PersistentStateStore {
 
     const upRows = this.loadOpenLotRows(state.market.slug, "UP");
     const downRows = this.loadOpenLotRows(state.market.slug, "DOWN");
+    const restoredFillHistory = this.db
+      .prepare(`
+        SELECT outcome, side, price, qty_original, timestamp, execution_mode, flow_lineage
+        FROM inventory_lots
+        WHERE market_slug = ?
+        ORDER BY timestamp ASC, lot_id ASC
+      `)
+      .all(state.market.slug) as Array<{
+      outcome: OutcomeSide;
+      side: "BUY" | "SELL";
+      price: number;
+      qty_original: number;
+      timestamp: number;
+      execution_mode: string | null;
+      flow_lineage: string | null;
+    }>;
+    const restoredMergeHistory = this.db
+      .prepare(`
+        SELECT amount, timestamp, simulated, flow_lineage, matched_up_cost, matched_down_cost, merge_return,
+               realized_pnl, remaining_up_shares, remaining_down_shares
+        FROM merge_events
+        WHERE market_slug = ?
+        ORDER BY timestamp ASC, merge_id ASC
+      `)
+      .all(state.market.slug) as Array<{
+      amount: number;
+      timestamp: number;
+      simulated: number;
+      flow_lineage: string | null;
+      matched_up_cost: number | null;
+      matched_down_cost: number | null;
+      merge_return: number | null;
+      realized_pnl: number | null;
+      remaining_up_shares: number | null;
+      remaining_down_shares: number | null;
+    }>;
     if (upRows.length === 0 && downRows.length === 0 && !snapshot) {
       return state;
     }
@@ -1115,6 +1404,28 @@ export class PersistentStateStore {
       ...state,
       upLots: toInventoryLots(upRows),
       downLots: toInventoryLots(downRows),
+      fillHistory: restoredFillHistory.map((row) => ({
+        outcome: row.outcome,
+        side: row.side,
+        price: row.price,
+        size: normalize(row.qty_original),
+        timestamp: row.timestamp,
+        makerTaker: "unknown",
+        executionMode: row.execution_mode === null ? undefined : (row.execution_mode as StrategyExecutionMode),
+        flowLineage: row.flow_lineage ?? undefined,
+      })),
+      mergeHistory: restoredMergeHistory.map((row) => ({
+        amount: normalize(row.amount),
+        timestamp: row.timestamp,
+        simulated: Boolean(row.simulated),
+        flowLineage: row.flow_lineage ?? undefined,
+        matchedUpCost: row.matched_up_cost ?? undefined,
+        matchedDownCost: row.matched_down_cost ?? undefined,
+        mergeReturn: row.merge_return ?? undefined,
+        realizedPnl: row.realized_pnl ?? undefined,
+        remainingUpShares: row.remaining_up_shares ?? undefined,
+        remainingDownShares: row.remaining_down_shares ?? undefined,
+      })),
       upShares: computeShares(upRows),
       downShares: computeShares(downRows),
       upCost: computeRawCost(upRows),

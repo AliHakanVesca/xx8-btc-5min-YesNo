@@ -29,7 +29,13 @@ import {
 import { TakerCompletionManager } from "../execution/takerCompletionManager.js";
 import { Xuan5mBot } from "../strategy/xuan5m/Xuan5mBot.js";
 import { OrderBookState } from "../strategy/xuan5m/orderBookState.js";
-import { createMarketState, type FillRecord, type XuanMarketState } from "../strategy/xuan5m/marketState.js";
+import {
+  countActiveIndependentFlowCount as countActiveIndependentFlowCountFromHistory,
+  countRecentSeedFlowCount as countRecentSeedFlowCountFromHistory,
+  createMarketState,
+  type FillRecord,
+  type XuanMarketState,
+} from "../strategy/xuan5m/marketState.js";
 import { applyFill, applyMerge, averageCost, shrinkOutcomeToObservedShares } from "../strategy/xuan5m/inventoryState.js";
 import { chooseInventoryAdjustment } from "../strategy/xuan5m/completionEngine.js";
 import {
@@ -38,8 +44,22 @@ import {
   planMerge,
   syncMergeBatchTracker,
 } from "../strategy/xuan5m/mergeCoordinator.js";
-import { estimateNegativeEdgeUsdc } from "../strategy/xuan5m/modePolicy.js";
+import {
+  classifyFlowPressureBudget,
+  classifyResidualSeverity,
+  deriveFlowPressureBudget,
+  deriveFlowPressureBudgetState,
+  estimateNegativeEdgeUsdc,
+  resolveResidualBehaviorState,
+  type OverlapRepairArbitration,
+} from "../strategy/xuan5m/modePolicy.js";
+import type { FlowPressureBudgetState } from "../strategy/xuan5m/modePolicy.js";
 import { resolveBundledMergeClusterPrior } from "../analytics/xuanExactReference.js";
+import {
+  buildFlowCalibrationSummary,
+  type ComparisonFlowSummary,
+  type FlowCalibrationSummary,
+} from "../analytics/xuanReplayComparator.js";
 import { resolveConfiguredFunderAddress } from "./topology.js";
 import { isClassifiedBuyMode, type StrategyExecutionMode } from "../strategy/xuan5m/executionModes.js";
 import type { EntryBuyDecision } from "../strategy/xuan5m/entryLadderEngine.js";
@@ -50,7 +70,12 @@ import {
   type InventoryMarketView,
 } from "./inventoryManager.js";
 import { isOrderResultAccepted, summarizeOrderResult } from "../infra/clob/orderResult.js";
-import { PersistentStateStore } from "./persistentStateStore.js";
+import {
+  PersistentStateStore,
+  type PersistedArbitrationCarrySnapshot,
+  type PersistedFlowBudgetSnapshot,
+  type ValidationRunRecord,
+} from "./persistentStateStore.js";
 import { MarketFairValueRuntime } from "./fairValueRuntime.js";
 import type { FairValueSnapshot } from "../strategy/xuan5m/fairValueEngine.js";
 import { planCloneChildBuyOrders } from "./childOrderPlanner.js";
@@ -144,6 +169,12 @@ export interface BotSessionReport {
     unwindSubmitCount: number;
     mergeCount: number;
     adoptedInventory: boolean;
+    arbitrationCarryCreatedCount: number;
+    arbitrationCarryExtendedCount: number;
+    arbitrationCarryExpiredCount: number;
+    entryArbitrationActionDeltaCount: number;
+    arbitrationCarryExtensionRate: number;
+    entryArbitrationActionDeltaRate: number;
   };
   finalState: {
     upShares: number;
@@ -189,6 +220,19 @@ export interface RuntimeProtectedResidualLock {
   sourceMode: Extract<StrategyExecutionMode, "TEMPORAL_SINGLE_LEG_SEED" | "PAIRGROUP_COVERED_SEED">;
 }
 
+interface ArbitrationCarry {
+  createdAt: number;
+  recommendation: Extract<OverlapRepairArbitration, "favor_independent_overlap" | "favor_residual_repair">;
+  preferredSeedSide?: OutcomeSide | undefined;
+  protectedResidualSide: OutcomeSide;
+  referenceShareGap: number;
+  alignmentStreak: number;
+  lastObservedAt: number;
+  lastProtectedShares: number;
+  expiresAt: number;
+  residualSeverityLevel?: "flat" | "micro" | "small" | "medium" | "aggressive" | undefined;
+}
+
 interface ActivePairSubmission {
   groupId: string;
   expiresAt: number;
@@ -218,6 +262,602 @@ interface DecisionTraceContext {
   decisionLatencyMs: number;
   bookAgeMsUp: number;
   bookAgeMsDown: number;
+  arbitrationCarryRecommendation?: OverlapRepairArbitration | undefined;
+  arbitrationCarryPreferredSeedSide?: OutcomeSide | undefined;
+  runtimeFlowBudgetState?: RuntimeFlowBudgetState | undefined;
+  runtimeFlowBudgetLastLineage?: string | undefined;
+  runtimeFlowBudgetDominantLineageLoad?: number | undefined;
+  runtimeFlowCalibrationBias?: RuntimeFlowCalibrationBias | undefined;
+}
+
+export interface RuntimeFlowBudgetState extends FlowPressureBudgetState {
+  matchedInventoryQuality: number;
+  unlockedMatchedInventoryQuality: number;
+  carryFlowConfidence: number;
+  recentSeedFlowCount: number;
+  activeIndependentFlowCount: number;
+  residualSeverityPressure: number;
+  reservedBudget: number;
+  flowLoadReserve: number;
+  mergeReserve: number;
+  residualReserve: number;
+  pendingExecutionReserve: number;
+  realizedActionReserve: number;
+  lineageActionReserve: number;
+}
+
+export interface RuntimeFlowCalibrationBias {
+  lineageFlowCountBonus: number;
+  activeFlowCountBonus: number;
+  completionPatienceFlowCountBonus: number;
+  completionPatienceMultiplier: number;
+  completionReleaseBias: "neutral" | "earlier" | "later";
+  recommendedFocus: string[];
+}
+
+function extractFlowSummariesFromValidationRuns(runs: ValidationRunRecord[]): ComparisonFlowSummary[] {
+  return runs
+    .map((run) => run.payload?.flowSummary)
+    .filter((summary): summary is ComparisonFlowSummary => {
+      if (!summary || typeof summary !== "object") {
+        return false;
+      }
+      const candidate = summary as Partial<Record<keyof ComparisonFlowSummary, unknown>>;
+      return (
+        typeof candidate.flowLineageSimilarity === "number" &&
+        typeof candidate.activeFlowPeakSimilarity === "number" &&
+        typeof candidate.cycleCompletionLatencySimilarity === "number"
+      );
+    });
+}
+
+export function deriveRuntimeFlowCalibrationBias(
+  calibration: Pick<FlowCalibrationSummary, "recommendedFocus" | "status"> &
+    Partial<Pick<FlowCalibrationSummary, "completionLatencyDirection" | "averageCycleCompletionLatencyDeltaSec">>,
+): RuntimeFlowCalibrationBias {
+  const focus = new Set(calibration.recommendedFocus);
+  const enabled = calibration.status === "WARN" || calibration.status === "FAIL";
+  const releaseEarlier = enabled && (focus.has("release_completion_earlier") || calibration.completionLatencyDirection === "candidate_late");
+  const waitLonger = enabled && (focus.has("increase_completion_patience") || calibration.completionLatencyDirection === "candidate_early");
+  const latencyDeltaSec = Math.abs(calibration.averageCycleCompletionLatencyDeltaSec ?? 0);
+  const completionPatienceMultiplier = releaseEarlier
+    ? latencyDeltaSec >= 6
+      ? 0.45
+      : latencyDeltaSec >= 3
+        ? 0.65
+        : 0.78
+    : waitLonger
+      ? latencyDeltaSec >= 6
+        ? 1.28
+        : latencyDeltaSec >= 3
+          ? 1.2
+          : 1.12
+      : 1;
+  return {
+    lineageFlowCountBonus: enabled && focus.has("increase_lineage_preservation") ? 1 : 0,
+    activeFlowCountBonus: enabled && focus.has("allow_more_parallel_flow_when_budget_supports") ? 1 : 0,
+    completionPatienceFlowCountBonus:
+      enabled &&
+      (focus.has("tune_completion_patience_and_release") ||
+        focus.has("release_completion_earlier") ||
+        focus.has("increase_completion_patience"))
+        ? 1
+        : 0,
+    completionPatienceMultiplier,
+    completionReleaseBias: releaseEarlier ? "earlier" : waitLonger ? "later" : "neutral",
+    recommendedFocus: calibration.recommendedFocus,
+  };
+}
+
+export function deriveRuntimeFlowBudgetState(args: {
+  matchedInventoryQuality: number;
+  unlockedMatchedInventoryQuality?: number;
+  carryFlowConfidence?: number;
+  recentSeedFlowCount?: number;
+  activeIndependentFlowCount?: number;
+  residualSeverityPressure?: number;
+}): RuntimeFlowBudgetState {
+  const matchedInventoryQuality = Math.max(0, args.matchedInventoryQuality);
+  const unlockedMatchedInventoryQuality = Math.max(
+    0,
+    args.unlockedMatchedInventoryQuality ?? matchedInventoryQuality,
+  );
+  const effectiveMatchedInventoryQuality = Math.max(
+    matchedInventoryQuality,
+    unlockedMatchedInventoryQuality,
+  );
+  const carryFlowConfidence = Math.max(0, args.carryFlowConfidence ?? 0);
+  const recentSeedFlowCount = Math.max(0, args.recentSeedFlowCount ?? 0);
+  const activeIndependentFlowCount = Math.max(0, args.activeIndependentFlowCount ?? 0);
+  const residualSeverityPressure = Math.max(0, args.residualSeverityPressure ?? 0);
+  const state = deriveFlowPressureBudgetState({
+    carryFlowConfidence,
+    matchedInventoryQuality: effectiveMatchedInventoryQuality,
+    recentSeedFlowCount,
+    activeIndependentFlowCount,
+    residualSeverityPressure,
+  });
+  return {
+    ...state,
+    matchedInventoryQuality,
+    unlockedMatchedInventoryQuality,
+    carryFlowConfidence,
+    recentSeedFlowCount,
+    activeIndependentFlowCount,
+    residualSeverityPressure,
+    reservedBudget: 0,
+    flowLoadReserve: 0,
+    mergeReserve: 0,
+    residualReserve: 0,
+    pendingExecutionReserve: 0,
+    realizedActionReserve: 0,
+    lineageActionReserve: 0,
+  };
+}
+
+function runtimeFlowBudgetActionWeight(args: {
+  quantityShares?: number | undefined;
+  baseLot?: number | undefined;
+}): number {
+  const quantityShares = Math.max(0, args.quantityShares ?? 0);
+  const baseLot = Math.max(1e-6, args.baseLot ?? 0);
+  if (quantityShares <= 0 || baseLot <= 1e-6) {
+    return 1;
+  }
+  const lotRatio = quantityShares / baseLot;
+  return Number(Math.min(1.8, Math.max(0.45, Math.sqrt(lotRatio))).toFixed(6));
+}
+
+export function runtimeFlowBudgetReleaseQuantityForResidualChange(args: {
+  requestedShares: number;
+  oldGap?: number | undefined;
+  newGap?: number | undefined;
+}): number {
+  const requestedShares = Math.max(0, args.requestedShares);
+  if (args.oldGap === undefined || args.newGap === undefined) {
+    return requestedShares;
+  }
+  const residualShrink = Math.max(0, args.oldGap - args.newGap);
+  if (residualShrink <= 1e-6) {
+    return requestedShares * 0.45;
+  }
+  return Number(Math.min(requestedShares, residualShrink).toFixed(6));
+}
+
+function runtimeFlowBudgetReleaseActionForFillMode(
+  mode: StrategyExecutionMode | undefined,
+): RuntimeFlowBudgetLedgerAction | undefined {
+  if (mode === "UNWIND") {
+    return "unwind_submit";
+  }
+  if (
+    mode === "HIGH_LOW_COMPLETION_CHASE" ||
+    mode === "CHEAP_LATE_COMPLETION_CHASE" ||
+    mode === "PARTIAL_FAST_COMPLETION" ||
+    mode === "PARTIAL_SOFT_COMPLETION" ||
+    mode === "PARTIAL_EMERGENCY_COMPLETION" ||
+    mode === "POST_MERGE_RESIDUAL_COMPLETION"
+  ) {
+    return "completion_submit";
+  }
+  return undefined;
+}
+
+export function applyRuntimeFlowBudgetConsumption(
+  state: RuntimeFlowBudgetState,
+  args: {
+    activeIndependentFlowCount?: number;
+    pendingMergeWindowCount?: number;
+    protectedResidualShares?: number;
+    residualSeverityPressure?: number;
+    pendingPairExecutionActive?: boolean;
+    realizedActionBudgetLoad?: number;
+    lineageActionBudgetLoad?: number;
+  },
+): RuntimeFlowBudgetState {
+  const activeIndependentFlowCount = Math.max(
+    0,
+    args.activeIndependentFlowCount ?? state.activeIndependentFlowCount,
+  );
+  const pendingMergeWindowCount = Math.max(0, args.pendingMergeWindowCount ?? 0);
+  const protectedResidualShares = Math.max(0, args.protectedResidualShares ?? 0);
+  const residualSeverityPressure = Math.max(
+    0,
+    args.residualSeverityPressure ?? state.residualSeverityPressure,
+  );
+  const flowLoadReserve = Math.min(0.18, Math.max(0, activeIndependentFlowCount - 1) * 0.06);
+  const mergeReserve = Math.min(0.14, pendingMergeWindowCount * 0.035);
+  const residualReserve =
+    protectedResidualShares > 0 ? Math.min(0.16, residualSeverityPressure * 0.08 + 0.035) : 0;
+  const pendingExecutionReserve = args.pendingPairExecutionActive ? 0.04 : 0;
+  const realizedActionReserve = Math.min(0.18, Math.max(0, args.realizedActionBudgetLoad ?? 0));
+  const lineageActionReserve = Math.min(0.12, Math.max(0, args.lineageActionBudgetLoad ?? 0));
+  const reservedBudget = Number(
+    Math.min(
+      0.58,
+      flowLoadReserve +
+        mergeReserve +
+        residualReserve +
+        pendingExecutionReserve +
+        realizedActionReserve +
+        lineageActionReserve,
+    ).toFixed(6),
+  );
+  const remainingBudget = Number(Math.max(0, state.remainingBudget - reservedBudget).toFixed(6));
+  const consumedBudget = Number(Math.min(1, state.consumedBudget + reservedBudget).toFixed(6));
+
+  return {
+    ...state,
+    remainingBudget,
+    consumedBudget,
+    reservedBudget,
+    flowLoadReserve,
+    mergeReserve,
+    residualReserve,
+    pendingExecutionReserve,
+    realizedActionReserve,
+    lineageActionReserve,
+  };
+}
+
+export type RuntimeFlowBudgetLedgerAction =
+  | "pair_submit"
+  | "seed_submit"
+  | "completion_submit"
+  | "unwind_submit"
+  | "merge"
+  | "residual_flat"
+  | "balance_adopted";
+
+export function applyRuntimeFlowBudgetLedgerAction(
+  currentLoad: number,
+  action: RuntimeFlowBudgetLedgerAction,
+  args: {
+    quantityShares?: number | undefined;
+    baseLot?: number | undefined;
+  } = {},
+): number {
+  const deltaByAction: Record<RuntimeFlowBudgetLedgerAction, number> = {
+    pair_submit: 0.08,
+    seed_submit: 0.05,
+    completion_submit: -0.05,
+    unwind_submit: -0.07,
+    merge: -0.14,
+    residual_flat: -0.18,
+    balance_adopted: 0.1,
+  };
+  const weightedDelta = deltaByAction[action] * runtimeFlowBudgetActionWeight(args);
+  return Number(Math.max(0, Math.min(0.32, currentLoad + weightedDelta)).toFixed(6));
+}
+
+export function applyRuntimeFlowBudgetLineageLedgerAction(
+  currentLoads: Record<string, number>,
+  action: RuntimeFlowBudgetLedgerAction,
+  args: {
+    lineage?: string | undefined;
+    quantityShares?: number | undefined;
+    baseLot?: number | undefined;
+  } = {},
+): Record<string, number> {
+  const lineage = args.lineage ?? "UNCLASSIFIED";
+  const nextLoad = applyRuntimeFlowBudgetLedgerAction(currentLoads[lineage] ?? 0, action, args);
+  const nextLoads = { ...currentLoads };
+  if (nextLoad <= 1e-6) {
+    delete nextLoads[lineage];
+  } else {
+    nextLoads[lineage] = nextLoad;
+  }
+  return nextLoads;
+}
+
+function dominantRuntimeFlowBudgetLineageLoad(loads: Record<string, number>): number {
+  return Number(Math.max(0, ...Object.values(loads)).toFixed(6));
+}
+
+function deriveCarryFlowLineageKey(args: {
+  recommendation?: Extract<OverlapRepairArbitration, "favor_independent_overlap" | "favor_residual_repair"> | undefined;
+  preferredSeedSide?: OutcomeSide | undefined;
+  protectedResidualSide?: OutcomeSide | undefined;
+}): string | undefined {
+  if (!args.recommendation) {
+    return undefined;
+  }
+  return [
+    args.recommendation,
+    args.preferredSeedSide ?? "NA",
+    args.protectedResidualSide ?? "NA",
+  ].join("|");
+}
+
+function arbitrationCarryPersistenceKey(
+  carry:
+    | Pick<
+        ArbitrationCarry,
+        | "recommendation"
+        | "preferredSeedSide"
+        | "protectedResidualSide"
+        | "alignmentStreak"
+        | "lastObservedAt"
+        | "lastProtectedShares"
+        | "expiresAt"
+        | "residualSeverityLevel"
+      >
+    | undefined,
+): string {
+  if (!carry) {
+    return "none";
+  }
+  return [
+    carry.recommendation,
+    carry.preferredSeedSide ?? "NA",
+    carry.protectedResidualSide,
+    carry.alignmentStreak,
+    carry.lastObservedAt,
+    carry.lastProtectedShares.toFixed(6),
+    carry.expiresAt,
+    carry.residualSeverityLevel ?? "NA",
+  ].join("|");
+}
+
+function arbitrationCarryAlignmentBonus(alignmentStreak: number): number {
+  return Number(Math.min(0.36, Math.max(0, alignmentStreak - 1) * 0.08).toFixed(6));
+}
+
+export function deriveArbitrationCarryExpiry(args: {
+  config: Pick<XuanStrategyConfig, "partialFastWindowSec" | "partialSoftWindowSec" | "partialPatientWindowSec">;
+  carry: ArbitrationCarry;
+  protectedResidualShares: number;
+  nowTs: number;
+  recentSeedFlowCount: number;
+  residualBehaviorState: Pick<
+    ReturnType<typeof resolveResidualBehaviorState>,
+    "carryPersistenceBias" | "riskToleranceBias" | "severityPressure"
+  >;
+}): number {
+  const elapsedSinceObservation = Math.max(1, args.nowTs - args.carry.lastObservedAt);
+  const shrinkShares = Math.max(0, args.carry.lastProtectedShares - args.protectedResidualShares);
+  const shrinkRatio = shrinkShares / Math.max(args.carry.lastProtectedShares, 1e-6);
+  const shrinkRatePerSec = shrinkShares / elapsedSinceObservation;
+  const denseFlow = args.recentSeedFlowCount >= 2;
+  const streakBonus = arbitrationCarryAlignmentBonus(args.carry.alignmentStreak);
+  const stalledResolution = shrinkRatio < 0.08 && shrinkRatePerSec < 0.02;
+  const slowResolution = shrinkRatio < 0.18;
+  const shrinkRegimeMultiplier =
+    stalledResolution
+      ? 1.35
+      : slowResolution
+        ? 1.15
+        : shrinkRatio > 0.45
+          ? 0.85
+          : 1;
+  const baseExtensionSec =
+    args.carry.recommendation === "favor_independent_overlap"
+      ? args.config.partialFastWindowSec * args.residualBehaviorState.carryPersistenceBias * (1 + streakBonus) +
+        args.config.partialSoftWindowSec * (denseFlow ? 0.25 : 0.1) * (1 + args.residualBehaviorState.riskToleranceBias)
+      : args.config.partialFastWindowSec * Math.max(1, args.residualBehaviorState.carryPersistenceBias * (0.85 + streakBonus * 0.45));
+  const maxCarryAgeSec =
+    args.config.partialPatientWindowSec * Math.min(1.65, args.residualBehaviorState.carryPersistenceBias + streakBonus * 0.8);
+  const nextExpiry =
+    args.nowTs +
+    Math.ceil(
+      baseExtensionSec * shrinkRegimeMultiplier +
+        elapsedSinceObservation * (stalledResolution ? 0.12 : 0.08) +
+        args.config.partialFastWindowSec * streakBonus * 0.35,
+    );
+  return Math.min(args.carry.createdAt + maxCarryAgeSec, nextExpiry);
+}
+
+export function shouldPreserveCarryDrivenOverlap(args: {
+  config: Pick<
+    XuanStrategyConfig,
+    | "allowControlledOverlap"
+    | "allowOverlapOnlyAfterPartialClassified"
+    | "allowOverlapOnlyWhenCompletionEngineActive"
+    | "allowOverlapInLast30S"
+    | "finalWindowCompletionOnlySec"
+    | "maxOpenGroupsPerMarket"
+    | "maxOpenPartialGroups"
+    | "requireMatchedInventoryBeforeSecondGroup"
+    | "completionMinQty"
+    | "repairMinQty"
+    | "defaultLot"
+    | "liveSmallLotLadder"
+    | "xuanCloneMode"
+  >;
+  carry:
+    | Pick<ArbitrationCarry, "recommendation" | "expiresAt" | "alignmentStreak">
+    | undefined;
+  nowTs: number;
+  secsToClose: number;
+  protectedResidualShares: number;
+  completionActive: boolean;
+  linkageHealthy: boolean;
+  matchedInventoryTargetMet: boolean;
+  matchedInventoryQuality?: number;
+  unlockedMatchedInventoryQuality?: number;
+  carryFlowConfidence?: number;
+  recentSeedFlowCount?: number;
+  activeIndependentFlowCount?: number;
+}): boolean {
+  if (!args.config.allowControlledOverlap || !args.carry) {
+    return false;
+  }
+  if (args.carry.recommendation !== "favor_independent_overlap" || args.nowTs >= args.carry.expiresAt) {
+    return false;
+  }
+  if (args.config.maxOpenGroupsPerMarket < 2 || args.config.maxOpenPartialGroups < 1) {
+    return false;
+  }
+  if (!args.config.allowOverlapInLast30S && args.secsToClose <= args.config.finalWindowCompletionOnlySec) {
+    return false;
+  }
+  if (args.protectedResidualShares <= Math.max(args.config.repairMinQty, args.config.completionMinQty)) {
+    return false;
+  }
+  if (args.config.allowOverlapOnlyAfterPartialClassified && !args.linkageHealthy) {
+    return false;
+  }
+  if (args.config.allowOverlapOnlyWhenCompletionEngineActive && !args.completionActive) {
+    return false;
+  }
+
+  const residualBehaviorState = resolveResidualBehaviorState({
+    config: args.config,
+    residualShares: args.protectedResidualShares,
+    shareGap: args.protectedResidualShares,
+    ...(args.recentSeedFlowCount !== undefined ? { recentSeedFlowCount: args.recentSeedFlowCount } : {}),
+    ...(args.activeIndependentFlowCount !== undefined ? { activeIndependentFlowCount: args.activeIndependentFlowCount } : {}),
+  });
+  const residualSeverity = residualBehaviorState.severity;
+  if (residualSeverity.level === "flat" || residualSeverity.level === "aggressive") {
+    return false;
+  }
+  if (!args.config.requireMatchedInventoryBeforeSecondGroup || args.matchedInventoryTargetMet) {
+    return true;
+  }
+
+  const carryFlowConfidence = Math.max(0, args.carryFlowConfidence ?? 0);
+  const flowPressureBudget = deriveFlowPressureBudget({
+    carryFlowConfidence,
+    matchedInventoryQuality: Math.max(args.matchedInventoryQuality ?? 0, args.unlockedMatchedInventoryQuality ?? 0),
+    recentSeedFlowCount: args.recentSeedFlowCount,
+    activeIndependentFlowCount: args.activeIndependentFlowCount,
+    residualSeverityPressure: residualBehaviorState.severityPressure,
+  });
+  const flowPressureState = classifyFlowPressureBudget({
+    budget: flowPressureBudget,
+    matchedInventoryQuality: Math.max(args.matchedInventoryQuality ?? 0, args.unlockedMatchedInventoryQuality ?? 0),
+  });
+  return (
+    Math.max(args.matchedInventoryQuality ?? 0, args.unlockedMatchedInventoryQuality ?? 0) >=
+      flowPressureState.requiredMatchedInventoryQuality &&
+    (residualBehaviorState.riskToleranceBias >= 0.48 || args.carry.alignmentStreak >= 2 || flowPressureState.confirmed) &&
+    (residualSeverity.level === "micro" || residualSeverity.level === "small" || residualSeverity.level === "medium")
+  );
+}
+
+export function deriveCarryFlowConfidence(args: {
+  carry:
+    | (Pick<ArbitrationCarry, "alignmentStreak"> &
+        Partial<Pick<ArbitrationCarry, "recommendation" | "preferredSeedSide" | "protectedResidualSide">>)
+    | undefined;
+  state: Pick<XuanMarketState, "fillHistory" | "mergeHistory">;
+  nowTs: number;
+  matchedInventoryQuality: number;
+  unlockedMatchedInventoryQuality?: number | undefined;
+  recentSeedFlowCount?: number | undefined;
+  activeIndependentFlowCount?: number | undefined;
+}): number {
+  if (!args.carry) {
+    return 0;
+  }
+
+  const targetLineage = deriveCarryFlowLineageKey({
+    recommendation: args.carry.recommendation,
+    preferredSeedSide: args.carry.preferredSeedSide,
+    protectedResidualSide: args.carry.protectedResidualSide,
+  });
+  const recentBuyFills = args.state.fillHistory.filter(
+    (fill) => fill.side === "BUY" && isClassifiedBuyMode(fill.executionMode) && args.nowTs - fill.timestamp <= 120,
+  );
+  const lineageBuyFills =
+    targetLineage !== undefined
+      ? recentBuyFills.filter((fill) => fill.flowLineage === targetLineage)
+      : [];
+  const consideredBuyFills = lineageBuyFills.length > 0 ? lineageBuyFills : recentBuyFills;
+  const seedLikeFills = consideredBuyFills.filter(
+    (fill) => fill.executionMode === "TEMPORAL_SINGLE_LEG_SEED" || fill.executionMode === "PAIRGROUP_COVERED_SEED",
+  );
+  const completionLikeFills = consideredBuyFills.filter(
+    (fill) =>
+      fill.executionMode === "PARTIAL_FAST_COMPLETION" ||
+      fill.executionMode === "PARTIAL_SOFT_COMPLETION" ||
+      fill.executionMode === "PARTIAL_EMERGENCY_COMPLETION" ||
+      fill.executionMode === "POST_MERGE_RESIDUAL_COMPLETION" ||
+      fill.executionMode === "CHEAP_LATE_COMPLETION_CHASE" ||
+      fill.executionMode === "HIGH_LOW_COMPLETION_CHASE",
+  );
+  const recentMerges = args.state.mergeHistory.filter((merge) => args.nowTs - merge.timestamp <= 180);
+  const lineageMerges =
+    targetLineage !== undefined
+      ? recentMerges.filter((merge) => merge.flowLineage === targetLineage)
+      : [];
+  const consideredMerges = lineageMerges.length > 0 ? lineageMerges : recentMerges;
+  const fillOutcomes = new Set(consideredBuyFills.map((fill) => fill.outcome));
+  const pairedFillConfirmed = fillOutcomes.size >= 2;
+  const recentMergeConfirmed = consideredMerges.length > 0;
+  const quality = Math.max(0, args.matchedInventoryQuality, args.unlockedMatchedInventoryQuality ?? 0);
+  const lineageBonus = targetLineage !== undefined && lineageBuyFills.length > 0 ? 0.08 : 0;
+  const flowDensityBonus =
+    (args.recentSeedFlowCount ?? 0) >= 2 ? 0.12 : (args.recentSeedFlowCount ?? 0) >= 1 ? 0.06 : 0;
+  const alignmentBonus = Math.min(0.18, Math.max(0, args.carry.alignmentStreak - 1) * 0.06);
+  let confirmationScore =
+    Math.min(0.45, quality * 0.4) + flowDensityBonus + alignmentBonus + lineageBonus + (recentMergeConfirmed ? 0.25 : 0);
+
+  if (args.carry.recommendation === "favor_independent_overlap") {
+    const preferredSeedSide = args.carry.preferredSeedSide;
+    const alignedSeedCount = preferredSeedSide
+      ? seedLikeFills.filter((fill) => fill.outcome === preferredSeedSide).length
+      : 0;
+    confirmationScore += alignedSeedCount >= 2 ? 0.34 : alignedSeedCount >= 1 ? 0.22 : 0;
+    confirmationScore += pairedFillConfirmed ? 0.16 : consideredBuyFills.length >= 2 ? 0.08 : 0;
+  } else if (args.carry.recommendation === "favor_residual_repair") {
+    const repairSide =
+      args.carry.protectedResidualSide === "UP"
+        ? "DOWN"
+        : args.carry.protectedResidualSide === "DOWN"
+          ? "UP"
+          : undefined;
+    const repairCompletionCount = repairSide
+      ? completionLikeFills.filter((fill) => fill.outcome === repairSide).length
+      : 0;
+    const repairBuyCount = repairSide ? recentBuyFills.filter((fill) => fill.outcome === repairSide).length : 0;
+    confirmationScore += repairCompletionCount >= 2 ? 0.38 : repairCompletionCount >= 1 ? 0.26 : 0;
+    confirmationScore += repairBuyCount >= 1 ? 0.08 : 0;
+  } else {
+    confirmationScore += pairedFillConfirmed ? 0.28 : consideredBuyFills.length >= 2 ? 0.12 : 0;
+  }
+
+  return Number(Math.min(1.4, confirmationScore).toFixed(6));
+}
+
+export function deriveConfirmedCarryAlignmentStreak(args: {
+  carry:
+    | (Pick<ArbitrationCarry, "alignmentStreak"> &
+        Partial<Pick<ArbitrationCarry, "recommendation" | "preferredSeedSide" | "protectedResidualSide">>)
+    | undefined;
+  state: Pick<XuanMarketState, "fillHistory" | "mergeHistory">;
+  nowTs: number;
+  matchedInventoryQuality: number;
+  unlockedMatchedInventoryQuality?: number | undefined;
+  recentSeedFlowCount?: number | undefined;
+  activeIndependentFlowCount?: number | undefined;
+  flowConfidence?: number | undefined;
+}): number {
+  if (!args.carry) {
+    return 0;
+  }
+  const flowConfidence =
+    args.flowConfidence ??
+    deriveCarryFlowConfidence({
+      carry: args.carry,
+      state: args.state,
+      nowTs: args.nowTs,
+      matchedInventoryQuality: args.matchedInventoryQuality,
+      unlockedMatchedInventoryQuality: args.unlockedMatchedInventoryQuality,
+      recentSeedFlowCount: args.recentSeedFlowCount,
+    });
+
+  if (flowConfidence >= 1.05) {
+    return args.carry.alignmentStreak;
+  }
+  if (flowConfidence >= 0.82) {
+    return Math.max(1, Math.min(args.carry.alignmentStreak, 3));
+  }
+  if (flowConfidence >= 0.62) {
+    return Math.max(1, Math.min(args.carry.alignmentStreak, 2));
+  }
+  return 1;
 }
 
 function normalizeMergeAmount(mergeable: number, dustLeaveShares: number): number {
@@ -259,11 +899,17 @@ function shouldAllowControlledOverlap(args: {
     | "allowOverlapInLast30S"
     | "finalWindowCompletionOnlySec"
     | "partialFastWindowSec"
+    | "partialSoftWindowSec"
     | "partialPatientWindowSec"
     | "maxOpenGroupsPerMarket"
     | "maxOpenPartialGroups"
     | "requireMatchedInventoryBeforeSecondGroup"
     | "worstCaseAmplificationToleranceShares"
+    | "completionMinQty"
+    | "repairMinQty"
+    | "defaultLot"
+    | "liveSmallLotLadder"
+    | "xuanCloneMode"
   >;
   nowTs: number;
   secsToClose: number;
@@ -271,11 +917,14 @@ function shouldAllowControlledOverlap(args: {
     | Pick<PartialOpenGroupLock, "openedAt">
     | Pick<RuntimeProtectedResidualLock, "openedAt">
     | undefined;
+  protectedResidualShares: number;
   completionActive: boolean;
   linkageHealthy: boolean;
   entryBuys: EntryBuyDecision[];
   matchedInventoryTargetMet: boolean;
   worstCaseAmplificationShares: number;
+  recentSeedFlowCount?: number;
+  activeIndependentFlowCount?: number;
 }): boolean {
   if (!args.config.allowControlledOverlap) {
     return false;
@@ -290,10 +939,28 @@ function shouldAllowControlledOverlap(args: {
     return false;
   }
   const partialAgeSec = Math.max(0, args.nowTs - args.protectedResidualLock.openedAt);
-  if (partialAgeSec < args.config.partialFastWindowSec) {
+  const residualBehaviorState = resolveResidualBehaviorState({
+    config: args.config,
+    residualShares: args.protectedResidualShares,
+    shareGap: args.protectedResidualShares,
+    ...(args.recentSeedFlowCount !== undefined ? { recentSeedFlowCount: args.recentSeedFlowCount } : {}),
+    ...(args.activeIndependentFlowCount !== undefined ? { activeIndependentFlowCount: args.activeIndependentFlowCount } : {}),
+  });
+  const residualSeverity = residualBehaviorState.severity;
+  const flowDensity = residualBehaviorState.flowDensity;
+  const riskToleranceBias = residualBehaviorState.riskToleranceBias;
+  const overlapAgeEligible =
+    residualSeverity.level === "micro" && args.protectedResidualShares > 0
+      ? true
+      : partialAgeSec >= args.config.partialFastWindowSec * Math.max(0.2, 1 - riskToleranceBias * 0.75);
+  if (!overlapAgeEligible) {
     return false;
   }
-  if (partialAgeSec >= args.config.partialPatientWindowSec) {
+  const carryWindowExtensionSec =
+    args.config.partialSoftWindowSec *
+    Math.max(0, residualBehaviorState.carryPersistenceBias - 1) *
+    0.7;
+  if (partialAgeSec >= args.config.partialPatientWindowSec + carryWindowExtensionSec) {
     return false;
   }
   if (args.config.allowOverlapOnlyAfterPartialClassified && !args.linkageHealthy) {
@@ -302,10 +969,19 @@ function shouldAllowControlledOverlap(args: {
   if (args.config.allowOverlapOnlyWhenCompletionEngineActive && !args.completionActive) {
     return false;
   }
-  if (args.config.requireMatchedInventoryBeforeSecondGroup && !args.matchedInventoryTargetMet) {
+  const relaxedMatchedInventoryRequirement =
+    riskToleranceBias >= 0.55 &&
+    (residualSeverity.level === "micro" || residualSeverity.level === "small" || residualSeverity.level === "medium");
+  if (args.config.requireMatchedInventoryBeforeSecondGroup && !args.matchedInventoryTargetMet && !relaxedMatchedInventoryRequirement) {
     return false;
   }
-  if (args.worstCaseAmplificationShares > args.config.worstCaseAmplificationToleranceShares + 1e-6) {
+  const densityAmplificationAllowance =
+    (0.2 + riskToleranceBias * 0.55 + (flowDensity >= 2 ? 0.15 : 0)) *
+    (args.config.liveSmallLotLadder[0] ?? args.config.defaultLot);
+  if (
+    args.worstCaseAmplificationShares >
+    args.config.worstCaseAmplificationToleranceShares + densityAmplificationAllowance + 1e-6
+  ) {
     return false;
   }
   return true;
@@ -417,6 +1093,49 @@ function dominantResidualSide(state: Pick<XuanMarketState, "upShares" | "downSha
   return state.upShares > state.downShares ? "UP" : "DOWN";
 }
 
+export function restorePersistedArbitrationCarry(args: {
+  snapshot: PersistedArbitrationCarrySnapshot | undefined;
+  state: Pick<XuanMarketState, "upShares" | "downShares">;
+  nowTs: number;
+  minResidualShares: number;
+}): ArbitrationCarry | undefined {
+  const snapshot = args.snapshot;
+  if (!snapshot || snapshot.residualSeverityLevel === "flat") {
+    return undefined;
+  }
+  if (args.nowTs >= snapshot.expiresAt) {
+    return undefined;
+  }
+
+  const currentProtectedSide = dominantResidualSide(args.state);
+  const currentProtectedShares = normalizeShares(Math.abs(args.state.upShares - args.state.downShares));
+  if (!currentProtectedSide || currentProtectedShares <= Math.max(1e-6, args.minResidualShares)) {
+    return undefined;
+  }
+  if (currentProtectedSide !== snapshot.protectedResidualSide) {
+    return undefined;
+  }
+
+  const minimumExpectedShares = Math.max(args.minResidualShares, snapshot.referenceShareGap * 0.14);
+  const maximumExpectedShares = Math.max(snapshot.lastProtectedShares, snapshot.referenceShareGap, args.minResidualShares) * 1.9;
+  if (currentProtectedShares + 1e-6 < minimumExpectedShares || currentProtectedShares - 1e-6 > maximumExpectedShares) {
+    return undefined;
+  }
+
+  return {
+    createdAt: Math.min(snapshot.createdAt, snapshot.lastObservedAt),
+    recommendation: snapshot.recommendation,
+    preferredSeedSide: snapshot.preferredSeedSide,
+    protectedResidualSide: snapshot.protectedResidualSide,
+    referenceShareGap: Math.max(snapshot.referenceShareGap, currentProtectedShares),
+    alignmentStreak: Math.max(1, snapshot.alignmentStreak),
+    lastObservedAt: Math.min(snapshot.lastObservedAt, args.nowTs),
+    lastProtectedShares: currentProtectedShares,
+    expiresAt: snapshot.expiresAt,
+    residualSeverityLevel: snapshot.residualSeverityLevel,
+  };
+}
+
 export function refreshRuntimeProtectedResidualLock(args: {
   lock: RuntimeProtectedResidualLock | undefined;
   state: Pick<XuanMarketState, "upShares" | "downShares">;
@@ -491,6 +1210,14 @@ function buildDecisionTraceEvent(
     decision.trace.entry.candidates.length > 0
       ? Math.min(...decision.trace.entry.candidates.map((candidate) => candidate.rawPairCost))
       : null;
+  const entryArbitrationActionDelta =
+    decision.trace.entry.overlapRepairArbitration === "favor_independent_overlap" &&
+    !["overlap_seed", "pair_reentry", "wait"].includes(decision.trace.entry.overlapRepairOutcome ?? "")
+      ? `favor_independent_overlap_but_${decision.trace.entry.overlapRepairOutcome ?? decision.completion?.arbitrationOutcome ?? decision.unwind?.arbitrationOutcome ?? "idle"}`
+      : decision.trace.entry.overlapRepairArbitration === "favor_residual_repair" &&
+          !["repair", "blocked"].includes(decision.trace.entry.overlapRepairOutcome ?? "")
+        ? `favor_residual_repair_but_${decision.trace.entry.overlapRepairOutcome ?? decision.completion?.arbitrationOutcome ?? decision.unwind?.arbitrationOutcome ?? "idle"}`
+        : null;
   return {
     eventSeq: context.eventSeq,
     decisionLatencyMs: context.decisionLatencyMs,
@@ -527,6 +1254,32 @@ function buildDecisionTraceEvent(
     qtyCaps: candidateCaps,
     entryMode: decision.trace.entry.mode,
     entrySkipReason: decision.trace.entry.skipReason ?? null,
+    residualSeverityLevel: decision.trace.entry.residualSeverityLevel ?? null,
+    overlapRepairArbitration: decision.trace.entry.overlapRepairArbitration ?? null,
+    overlapRepairReason: decision.trace.entry.overlapRepairReason ?? null,
+    overlapRepairOutcome: decision.trace.entry.overlapRepairOutcome ?? null,
+    arbitrationCarryRecommendation: context.arbitrationCarryRecommendation ?? null,
+    arbitrationCarryPreferredSeedSide: context.arbitrationCarryPreferredSeedSide ?? null,
+    flowBudget: context.runtimeFlowBudgetState?.budget ?? null,
+    flowBudgetRemaining: context.runtimeFlowBudgetState?.remainingBudget ?? null,
+    flowBudgetConsumed: context.runtimeFlowBudgetState?.consumedBudget ?? null,
+    flowBudgetReserved: context.runtimeFlowBudgetState?.reservedBudget ?? null,
+    flowBudgetFlowLoadReserve: context.runtimeFlowBudgetState?.flowLoadReserve ?? null,
+    flowBudgetMergeReserve: context.runtimeFlowBudgetState?.mergeReserve ?? null,
+    flowBudgetResidualReserve: context.runtimeFlowBudgetState?.residualReserve ?? null,
+    flowBudgetPendingExecutionReserve: context.runtimeFlowBudgetState?.pendingExecutionReserve ?? null,
+    flowBudgetRealizedActionReserve: context.runtimeFlowBudgetState?.realizedActionReserve ?? null,
+    flowBudgetLineageActionReserve: context.runtimeFlowBudgetState?.lineageActionReserve ?? null,
+    flowBudgetLastLineage: context.runtimeFlowBudgetLastLineage ?? null,
+    flowBudgetDominantLineageLoad: context.runtimeFlowBudgetDominantLineageLoad ?? null,
+    flowBudgetMatchedInventoryQuality: context.runtimeFlowBudgetState?.matchedInventoryQuality ?? null,
+    flowBudgetUnlockedMatchedInventoryQuality:
+      context.runtimeFlowBudgetState?.unlockedMatchedInventoryQuality ?? null,
+    flowBudgetCarryConfidence: context.runtimeFlowBudgetState?.carryFlowConfidence ?? null,
+    flowCalibrationReleaseBias: context.runtimeFlowCalibrationBias?.completionReleaseBias ?? null,
+    flowCalibrationPatienceMultiplier: context.runtimeFlowCalibrationBias?.completionPatienceMultiplier ?? null,
+    flowCalibrationRecommendedFocus: context.runtimeFlowCalibrationBias?.recommendedFocus ?? [],
+    entryArbitrationActionDelta,
     gatedByRisk: decision.trace.entry.gatedByRisk ?? false,
     laggingSide: decision.trace.entry.laggingSide ?? null,
     repairSize: decision.trace.entry.repairSize ?? null,
@@ -534,9 +1287,36 @@ function buildDecisionTraceEvent(
     repairCost: decision.trace.entry.repairCost ?? null,
     repairAllowed: decision.trace.entry.repairAllowed ?? null,
     repairCapMode: decision.trace.entry.repairCapMode ?? null,
+    completionMode: decision.completion?.mode ?? null,
+    completionResidualSeverityLevel: decision.completion?.residualSeverityLevel ?? null,
+    completionOverlapRepairArbitration: decision.completion?.overlapRepairArbitration ?? null,
+    completionArbitrationOutcome: decision.completion?.arbitrationOutcome ?? null,
+    unwindMode: decision.unwind?.mode ?? null,
+    unwindResidualSeverityLevel: decision.unwind?.residualSeverityLevel ?? null,
+    unwindOverlapRepairArbitration: decision.unwind?.overlapRepairArbitration ?? null,
+    unwindArbitrationOutcome: decision.unwind?.arbitrationOutcome ?? null,
     candidates: decision.trace.entry.candidates,
     seedCandidates: decision.trace.entry.seedCandidates ?? [],
   };
+}
+
+function computeRecentSeedFlowCount(state: Pick<XuanMarketState, "fillHistory">, nowTs: number): number {
+  return countRecentSeedFlowCountFromHistory(state.fillHistory, nowTs);
+}
+
+function computeActiveIndependentFlowCount(
+  state: Pick<XuanMarketState, "fillHistory">,
+  nowTs: number,
+): number {
+  return countActiveIndependentFlowCountFromHistory(state.fillHistory, nowTs);
+}
+
+function selectPreferredSeedSide(decision: ReturnType<Xuan5mBot["evaluateTick"]>): OutcomeSide | undefined {
+  const overlapSeed = decision.entryBuys.find((entryBuy) => entryBuy.reason === "temporal_single_leg_seed");
+  if (overlapSeed) {
+    return overlapSeed.side;
+  }
+  return decision.trace.entry.seedCandidates?.find((candidate) => candidate.allowed)?.side;
 }
 
 function decisionTraceSignature(decision: ReturnType<Xuan5mBot["evaluateTick"]>): string {
@@ -562,11 +1342,19 @@ function decisionTraceSignature(decision: ReturnType<Xuan5mBot["evaluateTick"]>)
     decision.trace.fairValue?.fairDown?.toFixed(4) ?? "",
     entry.mode,
     entry.skipReason ?? "",
+    entry.residualSeverityLevel ?? "",
+    entry.overlapRepairArbitration ?? "",
+    entry.overlapRepairReason ?? "",
+    entry.overlapRepairOutcome ?? "",
     entry.gatedByRisk ? "gated" : "open",
     candidateSignature,
     seedSignature,
     entry.repairAllowed === undefined ? "" : entry.repairAllowed ? "repair_ok" : "repair_blocked",
     entry.repairCost?.toFixed(6) ?? "",
+    decision.completion?.mode ?? "",
+    decision.completion?.overlapRepairArbitration ?? "",
+    decision.unwind?.mode ?? "",
+    decision.unwind?.overlapRepairArbitration ?? "",
   ].join("::");
 }
 
@@ -1318,6 +2106,14 @@ export async function runStatefulBotSession(
   let completionSubmitCount = 0;
   let unwindSubmitCount = 0;
   let mergeCount = 0;
+  let arbitrationCarryCreatedCount = 0;
+  let arbitrationCarryExtendedCount = 0;
+  let arbitrationCarryExpiredCount = 0;
+  let entryArbitrationActionDeltaCount = 0;
+  let runtimeFlowBudgetLedgerLoad = 0;
+  let runtimeFlowBudgetLastAction: RuntimeFlowBudgetLedgerAction | undefined;
+  let runtimeFlowBudgetLastLineage: string | undefined;
+  let runtimeFlowBudgetLineageLoads: Record<string, number> = {};
   let ticks = 0;
   const submittedPrices: SubmittedIntentBook = {};
   const seenTradeIds = new Set<string>();
@@ -1332,6 +2128,7 @@ export async function runStatefulBotSession(
   let pendingPairExecution: PendingPairExecution | undefined;
   let partialOpenGroupLock: PartialOpenGroupLock | undefined;
   let runtimeProtectedResidualLock: RuntimeProtectedResidualLock | undefined;
+  let arbitrationCarry: ArbitrationCarry | undefined;
   let activePairSubmission: ActivePairSubmission | undefined;
   let lastDecisionTraceAt = 0;
   let lastDecisionTraceSignature = "";
@@ -1346,6 +2143,10 @@ export async function runStatefulBotSession(
   let latestFairValueSnapshot: FairValueSnapshot | undefined;
   const btcPriceFeed = new BtcPriceFeed();
   const fairValueRuntime = new MarketFairValueRuntime(config, market, stateStore, btcPriceFeed);
+  const runtimeFlowCalibration = buildFlowCalibrationSummary(
+    extractFlowSummariesFromValidationRuns(stateStore.recentValidationRuns("replay", 12)),
+  );
+  const runtimeFlowCalibrationBias = deriveRuntimeFlowCalibrationBias(runtimeFlowCalibration);
   const persistedSafeHalt = stateStore.loadSafeHalt();
   if (persistedSafeHalt.active && config.requireManualResumeConfirm) {
     stateStore.close();
@@ -1363,6 +2164,64 @@ export async function runStatefulBotSession(
       now: new Date(clock.now() * 1000),
     });
   };
+  const persistMarketState = (noNewEntryReason?: string | undefined): void => {
+    const flowBudgetSnapshot: PersistedFlowBudgetSnapshot = {
+      load: runtimeFlowBudgetLedgerLoad,
+      updatedAt: clock.now(),
+      lastAction: runtimeFlowBudgetLastAction,
+      lastLineage: runtimeFlowBudgetLastLineage,
+      lineageLoads: runtimeFlowBudgetLineageLoads,
+    };
+    stateStore.upsertMarketState(state, noNewEntryReason, {
+      arbitrationCarry:
+        arbitrationCarry !== undefined
+          ? {
+              createdAt: arbitrationCarry.createdAt,
+              recommendation: arbitrationCarry.recommendation,
+              preferredSeedSide: arbitrationCarry.preferredSeedSide,
+              protectedResidualSide: arbitrationCarry.protectedResidualSide,
+              referenceShareGap: arbitrationCarry.referenceShareGap,
+              alignmentStreak: arbitrationCarry.alignmentStreak,
+              lastObservedAt: arbitrationCarry.lastObservedAt,
+              lastProtectedShares: arbitrationCarry.lastProtectedShares,
+              expiresAt: arbitrationCarry.expiresAt,
+              residualSeverityLevel: arbitrationCarry.residualSeverityLevel,
+            }
+          : undefined,
+      flowBudget: flowBudgetSnapshot,
+    });
+  };
+  const applyRuntimeFlowBudgetAction = (
+    action: RuntimeFlowBudgetLedgerAction,
+    args: {
+      quantityShares?: number | undefined;
+      lineage?: string | undefined;
+    } = {},
+  ): void => {
+    const baseLot = config.liveSmallLotLadder[0] ?? config.defaultLot;
+    runtimeFlowBudgetLedgerLoad = applyRuntimeFlowBudgetLedgerAction(runtimeFlowBudgetLedgerLoad, action, {
+      quantityShares: args.quantityShares,
+      baseLot,
+    });
+    runtimeFlowBudgetLineageLoads = applyRuntimeFlowBudgetLineageLedgerAction(
+      runtimeFlowBudgetLineageLoads,
+      action,
+      {
+        lineage: args.lineage,
+        quantityShares: args.quantityShares,
+        baseLot,
+      },
+    );
+    runtimeFlowBudgetLastAction = action;
+    runtimeFlowBudgetLastLineage = args.lineage;
+  };
+  const currentRuntimeFlowLineage = (fallbackSide?: OutcomeSide | undefined): string | undefined =>
+    deriveCarryFlowLineageKey({
+      recommendation: arbitrationCarry?.recommendation,
+      preferredSeedSide: arbitrationCarry?.preferredSeedSide ?? fallbackSide,
+      protectedResidualSide:
+        arbitrationCarry?.protectedResidualSide ?? (partialOpenGroupLock ?? runtimeProtectedResidualLock)?.protectedSide,
+    });
   const submittedIntentMaxAgeSec = Math.max(15, Math.ceil(config.pairgroupFinalizeTimeoutMs / 1000) + 2);
 
   const rememberOrderResultFillSuppression = (fill: FillRecord): void => {
@@ -1573,7 +2432,7 @@ export async function runStatefulBotSession(
         logger.warn({ error }, "pairgroup repair escalation cancelAll failed.");
       }
     }
-    stateStore.upsertMarketState(state, reason);
+    persistMarketState(reason);
     stateStore.recordReconcileRun({
       scope: "pairgroup_repair_required",
       marketSlug: market.slug,
@@ -1636,6 +2495,7 @@ export async function runStatefulBotSession(
         ),
       };
       runtimeProtectedResidualLock = undefined;
+      arbitrationCarry = undefined;
     } else if (partialOpenGroupLock?.groupId === finalized.group.groupId) {
       partialOpenGroupLock = undefined;
     }
@@ -1670,10 +2530,7 @@ export async function runStatefulBotSession(
       filledDownQty: finalized.filledDownQty,
     });
     stateStore.upsertPairGroup(finalizedGroup);
-    stateStore.upsertMarketState(
-      state,
-      partialOpenGroupLock?.groupId ? "partial_group_open" : undefined,
-    );
+    persistMarketState(partialOpenGroupLock?.groupId ? "partial_group_open" : undefined);
   };
 
   const writeInventorySnapshotTrace = async (
@@ -1717,14 +2574,34 @@ export async function runStatefulBotSession(
       initialDailyNegativeEdgeSpentUsdc,
     },
   });
+  const persistedArbitrationCarry = stateStore.loadArbitrationCarrySnapshot(market.slug);
+  const persistedFlowBudget = stateStore.loadFlowBudgetSnapshot(market.slug);
   state = stateStore.loadMarketState(state);
+  if (persistedFlowBudget) {
+    const snapshotAgeSec = Math.max(0, startedAt - persistedFlowBudget.updatedAt);
+    const decay = Math.min(1, snapshotAgeSec / Math.max(30, config.partialPatientWindowSec));
+    runtimeFlowBudgetLedgerLoad = Number(Math.max(0, persistedFlowBudget.load * (1 - decay)).toFixed(6));
+    runtimeFlowBudgetLineageLoads = Object.fromEntries(
+      Object.entries(persistedFlowBudget.lineageLoads ?? {})
+        .map(([lineage, load]) => [lineage, Number(Math.max(0, load * (1 - decay)).toFixed(6))] as const)
+        .filter(([, load]) => load > 1e-6),
+    );
+    runtimeFlowBudgetLastAction = persistedFlowBudget.lastAction as RuntimeFlowBudgetLedgerAction | undefined;
+    runtimeFlowBudgetLastLineage = persistedFlowBudget.lastLineage;
+  }
   runtimeProtectedResidualLock = refreshRuntimeProtectedResidualLock({
     lock: undefined,
     state,
     nowTs: startedAt,
     mode: state.lastExecutionMode,
   });
-  stateStore.upsertMarketState(state);
+  arbitrationCarry = restorePersistedArbitrationCarry({
+    snapshot: persistedArbitrationCarry,
+    state,
+    nowTs: startedAt,
+    minResidualShares: Math.max(config.repairMinQty, config.completionMinQty),
+  });
+  persistMarketState();
   if (config.restartRestorePartialAsCompletionOnly) {
     const restoredPartialGroup = stateStore.loadLatestOpenPartialPairGroup(market.slug);
     const restoredGap = Math.abs(state.upShares - state.downShares);
@@ -1740,6 +2617,7 @@ export async function runStatefulBotSession(
         protectedShares: normalizeShares(restoredGap),
       };
       runtimeProtectedResidualLock = undefined;
+      arbitrationCarry = undefined;
       startupCompletionOnly = true;
       if (config.blockNewPairWhenRestoredPartialExists) {
         startupBlockNewEntries = true;
@@ -1748,7 +2626,7 @@ export async function runStatefulBotSession(
         ...state,
         reentryDisabled: true,
       };
-      stateStore.upsertMarketState(state, "restored_partial_group_open");
+      persistMarketState("restored_partial_group_open");
       await writeRiskEvent("restored_partial_group_open", {
         groupId: restoredPartialGroup.groupId,
         status: restoredPartialGroup.status,
@@ -1910,6 +2788,13 @@ export async function runStatefulBotSession(
     const normalizedFill: FillRecord = {
       ...fill,
       executionMode: fill.executionMode ?? submittedIntent?.mode,
+      flowLineage:
+        fill.flowLineage ??
+        deriveCarryFlowLineageKey({
+          recommendation: arbitrationCarry?.recommendation,
+          preferredSeedSide: arbitrationCarry?.preferredSeedSide,
+          protectedResidualSide: arbitrationCarry?.protectedResidualSide ?? (partialOpenGroupLock ?? runtimeProtectedResidualLock)?.protectedSide,
+        }),
     };
     const activePairMatch = !submittedIntent?.groupId ? matchActivePairSubmission(normalizedFill) : undefined;
     if (activePairMatch) {
@@ -1963,7 +2848,20 @@ export async function runStatefulBotSession(
         pendingPairGroupId: pendingPairExecution.group.groupId,
       });
     }
+    const fillOldGap = Math.abs(state.upShares - state.downShares);
     state = applyFill(state, normalizedFill);
+    const fillNewGap = Math.abs(state.upShares - state.downShares);
+    const fillReleaseAction = runtimeFlowBudgetReleaseActionForFillMode(normalizedFill.executionMode);
+    if (fillReleaseAction) {
+      applyRuntimeFlowBudgetAction(fillReleaseAction, {
+        quantityShares: runtimeFlowBudgetReleaseQuantityForResidualChange({
+          requestedShares: normalizedFill.size,
+          oldGap: fillOldGap,
+          newGap: fillNewGap,
+        }),
+        lineage: normalizedFill.flowLineage ?? currentRuntimeFlowLineage(normalizedFill.outcome),
+      });
+    }
     stateStore.recordFill(state, normalizedFill, {
       orderId: submittedIntent?.orderId,
       groupId: submittedIntent?.groupId,
@@ -1985,7 +2883,7 @@ export async function runStatefulBotSession(
             nowTs: normalizedFill.timestamp,
             mode: submittedIntent?.mode ?? normalizedFill.executionMode,
           });
-    stateStore.upsertMarketState(state);
+    persistMarketState();
     userTradeCount += 1;
     pushEvent(events, {
       timestamp: normalizedFill.timestamp,
@@ -2036,6 +2934,7 @@ export async function runStatefulBotSession(
     cachedUsdcBalance = (await readCollateralBalanceUsdc(env)) ?? cachedUsdcBalance;
 
     const observedBalances = await readObservedBalances(balanceReader, market, balanceOwnerAddress);
+    const balanceSyncOldGap = Math.abs(state.upShares - state.downShares);
     const reconciled = reconcileStateWithBalances({
       state,
       observed: observedBalances,
@@ -2044,6 +2943,7 @@ export async function runStatefulBotSession(
       shouldIgnoreShortfall: shouldIgnoreTransientBotOwnedShortfall,
     });
     state = reconciled.state;
+    const balanceSyncNewGap = Math.abs(state.upShares - state.downShares);
     balanceCorrectionCount += reconciled.corrections.length;
 
     for (const fill of reconciled.inferredFills) {
@@ -2067,6 +2967,13 @@ export async function runStatefulBotSession(
       const normalizedFill: FillRecord = {
         ...fill,
         executionMode: fill.executionMode ?? submittedIntent?.mode,
+        flowLineage:
+          fill.flowLineage ??
+          deriveCarryFlowLineageKey({
+            recommendation: arbitrationCarry?.recommendation,
+            preferredSeedSide: arbitrationCarry?.preferredSeedSide,
+            protectedResidualSide: arbitrationCarry?.protectedResidualSide ?? (partialOpenGroupLock ?? runtimeProtectedResidualLock)?.protectedSide,
+          }),
       };
       if (pendingPairExecution && !submittedIntent?.groupId) {
         await markPairgroupRepairRequired("pairgroup_repair_required", {
@@ -2074,6 +2981,17 @@ export async function runStatefulBotSession(
           outcome: normalizedFill.outcome,
           size: normalizedFill.size,
           pendingPairGroupId: pendingPairExecution.group.groupId,
+        });
+      }
+      const fillReleaseAction = runtimeFlowBudgetReleaseActionForFillMode(normalizedFill.executionMode);
+      if (fillReleaseAction) {
+        applyRuntimeFlowBudgetAction(fillReleaseAction, {
+          quantityShares: runtimeFlowBudgetReleaseQuantityForResidualChange({
+            requestedShares: normalizedFill.size,
+            oldGap: balanceSyncOldGap,
+            newGap: balanceSyncNewGap,
+          }),
+          lineage: normalizedFill.flowLineage ?? currentRuntimeFlowLineage(normalizedFill.outcome),
         });
       }
       stateStore.recordFill(state, normalizedFill, {
@@ -2161,7 +3079,7 @@ export async function runStatefulBotSession(
             state,
             nowTs: args.nowTs,
           });
-    stateStore.upsertMarketState(state);
+    persistMarketState();
     stateStore.recordReconcileRun({
       scope: args.scope,
       marketSlug: market.slug,
@@ -2252,9 +3170,16 @@ export async function runStatefulBotSession(
           source: "BALANCE_RECONCILE",
         });
       }
-      stateStore.upsertMarketState(state);
+      persistMarketState();
       adoptedInventory = adopted.inferredFills.length > 0 || adopted.corrections.length > 0;
       if (adoptedInventory) {
+        applyRuntimeFlowBudgetAction("balance_adopted", {
+          quantityShares:
+            adopted.inferredFills.reduce((sum, fill) => sum + fill.size, 0) +
+            adopted.corrections.reduce((sum, correction) => sum + Math.abs(correction.fromShares - correction.toShares), 0),
+          lineage: currentRuntimeFlowLineage(),
+        });
+        persistMarketState("startup_inventory_adopted");
         pushEvent(events, {
           timestamp: startedAt,
           type: "startup_inventory_adopted",
@@ -2318,16 +3243,77 @@ export async function runStatefulBotSession(
           pendingMergeFillSnapshot,
           config,
         );
+        const mergeResidualLock = partialOpenGroupLock ?? runtimeProtectedResidualLock;
+        const mergeProtectedResidualShares = mergeResidualLock
+          ? Math.min(mergeResidualLock.protectedShares, Math.abs(state.upShares - state.downShares))
+          : 0;
+        const mergeRecentSeedFlowCount = computeRecentSeedFlowCount(state, nowTs);
+        const mergeActiveIndependentFlowCount = computeActiveIndependentFlowCount(state, nowTs);
+        const calibratedMergeRecentSeedFlowCount =
+          mergeRecentSeedFlowCount +
+          runtimeFlowCalibrationBias.lineageFlowCountBonus +
+          runtimeFlowCalibrationBias.completionPatienceFlowCountBonus;
+        const calibratedMergeActiveIndependentFlowCount =
+          mergeActiveIndependentFlowCount + runtimeFlowCalibrationBias.activeFlowCountBonus;
+        const mergeResidualBehaviorState = resolveResidualBehaviorState({
+          config,
+          residualShares: mergeProtectedResidualShares,
+          shareGap: mergeProtectedResidualShares,
+          recentSeedFlowCount: calibratedMergeRecentSeedFlowCount,
+          activeIndependentFlowCount: calibratedMergeActiveIndependentFlowCount,
+        });
+        const mergeOverlapBaseLot = config.liveSmallLotLadder[0] ?? config.defaultLot;
+        const mergeMatchedInventoryQuality = Number(
+          Math.min(
+            1.25,
+            Math.min(state.upShares, state.downShares) / Math.max(mergeOverlapBaseLot, 1e-6),
+          ).toFixed(6),
+        );
+        const mergeCarryFlowConfidence = arbitrationCarry
+          ? deriveCarryFlowConfidence({
+              carry: arbitrationCarry,
+              state,
+              nowTs,
+              matchedInventoryQuality: mergeMatchedInventoryQuality,
+              recentSeedFlowCount: calibratedMergeRecentSeedFlowCount,
+              activeIndependentFlowCount: calibratedMergeActiveIndependentFlowCount,
+            })
+          : 0;
+        const mergeRuntimeFlowBudgetState = applyRuntimeFlowBudgetConsumption(
+          deriveRuntimeFlowBudgetState({
+            matchedInventoryQuality: mergeMatchedInventoryQuality,
+            carryFlowConfidence: mergeCarryFlowConfidence,
+            recentSeedFlowCount: calibratedMergeRecentSeedFlowCount,
+            activeIndependentFlowCount: calibratedMergeActiveIndependentFlowCount,
+            residualSeverityPressure: mergeResidualBehaviorState.severityPressure,
+          }),
+          {
+            activeIndependentFlowCount: calibratedMergeActiveIndependentFlowCount,
+            pendingMergeWindowCount: mergeBatchTracker.windows.length,
+            protectedResidualShares: mergeProtectedResidualShares,
+            residualSeverityPressure: mergeResidualBehaviorState.severityPressure,
+            pendingPairExecutionActive: pendingPairExecution !== undefined,
+            realizedActionBudgetLoad: runtimeFlowBudgetLedgerLoad,
+            lineageActionBudgetLoad: dominantRuntimeFlowBudgetLineageLoad(runtimeFlowBudgetLineageLoads),
+          },
+        );
         const mergeableUnlocked = config.mergeOnlyConfirmedMatchedUnlockedLots
           ? unlockedMergeableShares(state, lockedPendingShares)
           : mergePlan.mergeable;
-        mergeBatchTracker = syncMergeBatchTracker(mergeBatchTracker, mergeableUnlocked, nowTs);
+        mergeBatchTracker = syncMergeBatchTracker(mergeBatchTracker, mergeableUnlocked, nowTs, {
+          flowPressureBudget: mergeRuntimeFlowBudgetState.budget,
+          activeIndependentFlowCount: calibratedMergeActiveIndependentFlowCount,
+          flowPressureState: mergeRuntimeFlowBudgetState,
+        });
         const mergeGate = evaluateDelayedMergeGate(config, state, {
           nowTs,
           secsFromOpen: nowTs - market.startTs,
           secsToClose: market.endTs - nowTs,
           usdcBalance: cachedUsdcBalance,
           tracker: mergeBatchTracker,
+          flowPressureBudget: mergeRuntimeFlowBudgetState.budget,
+          activeIndependentFlowCount: calibratedMergeActiveIndependentFlowCount,
+          flowPressureState: mergeRuntimeFlowBudgetState,
         });
         const mergeClusterPrior =
           config.xuanCloneMode === "PUBLIC_FOOTPRINT"
@@ -2359,6 +3345,12 @@ export async function runStatefulBotSession(
               amount: mergeAmount,
               timestamp: nowTs,
               simulated: mergeResult.simulated,
+              flowLineage: deriveCarryFlowLineageKey({
+                recommendation: arbitrationCarry?.recommendation,
+                preferredSeedSide: arbitrationCarry?.preferredSeedSide,
+                protectedResidualSide:
+                  arbitrationCarry?.protectedResidualSide ?? mergeResidualLock?.protectedSide,
+              }),
             });
             stateStore.recordMerge(preMergeState, state.mergeHistory.at(-1) ?? {
               amount: mergeAmount,
@@ -2392,6 +3384,10 @@ export async function runStatefulBotSession(
             mergeCount += 1;
             mergeTxCount += 1;
             lastMergeAtMs = Date.now();
+            applyRuntimeFlowBudgetAction("merge", {
+              quantityShares: mergeAmount,
+              lineage: currentRuntimeFlowLineage(),
+            });
             const pendingPostMergeFillSnapshot = pendingPairExecution
               ? stateStore.loadPairGroupFillSnapshot(pendingPairExecution.group.groupId)
               : undefined;
@@ -2404,7 +3400,7 @@ export async function runStatefulBotSession(
               ? unlockedMergeableShares(state, postMergeLockedPendingShares)
               : Math.min(state.upShares, state.downShares);
             mergeBatchTracker = syncMergeBatchTracker(mergeBatchTracker, postMergeObserved, nowTs);
-            stateStore.upsertMarketState(state, state.reentryDisabled ? "post_merge_completion_only" : undefined);
+            persistMarketState(state.reentryDisabled ? "post_merge_completion_only" : undefined);
           }
           actionCooldownUntil = Date.now() + config.reentryDelayMs;
           pushEvent(events, {
@@ -2466,13 +3462,30 @@ export async function runStatefulBotSession(
         Math.abs(state.upShares - state.downShares) <= Math.max(config.repairMinQty, config.completionMinQty)
       ) {
         partialOpenGroupLock = undefined;
-        stateStore.upsertMarketState(state);
+        if (arbitrationCarry) {
+          arbitrationCarryExpiredCount += 1;
+        }
+        arbitrationCarry = undefined;
+        applyRuntimeFlowBudgetAction("residual_flat", {
+          quantityShares: Math.abs(state.upShares - state.downShares),
+          lineage: currentRuntimeFlowLineage(),
+        });
+        persistMarketState();
       }
       if (
         runtimeProtectedResidualLock &&
         Math.abs(state.upShares - state.downShares) <= Math.max(config.repairMinQty, config.completionMinQty)
       ) {
         runtimeProtectedResidualLock = undefined;
+        if (arbitrationCarry) {
+          arbitrationCarryExpiredCount += 1;
+        }
+        arbitrationCarry = undefined;
+        applyRuntimeFlowBudgetAction("residual_flat", {
+          quantityShares: Math.abs(state.upShares - state.downShares),
+          lineage: currentRuntimeFlowLineage(),
+        });
+        persistMarketState();
       }
       if (
         state.reentryDisabled &&
@@ -2485,7 +3498,7 @@ export async function runStatefulBotSession(
           postMergeCompletionOnlyUntil:
             nowTs + Math.ceil(config.postMergePairReopenCooldownMs / 1000),
         };
-        stateStore.upsertMarketState(state);
+        persistMarketState();
       }
       const activeProtectedResidualLock = partialOpenGroupLock ?? runtimeProtectedResidualLock;
       const overlapCompletionProbe =
@@ -2495,15 +3508,197 @@ export async function runStatefulBotSession(
               usdcBalance: cachedUsdcBalance,
               nowTs,
               fairValueSnapshot: latestFairValueSnapshot,
+              completionPatienceMultiplier: runtimeFlowCalibrationBias.completionPatienceMultiplier,
             })
           : undefined;
       const overlapCompletionActive = Boolean(overlapCompletionProbe?.completion);
       const partialAgeSec =
         activeProtectedResidualLock !== undefined ? Math.max(0, nowTs - activeProtectedResidualLock.openedAt) : undefined;
+      const protectedResidualShares = activeProtectedResidualLock
+        ? Math.min(activeProtectedResidualLock.protectedShares, Math.abs(state.upShares - state.downShares))
+        : 0;
+      const residualSeverity = classifyResidualSeverity(config, protectedResidualShares);
+      const recentSeedFlowCount = computeRecentSeedFlowCount(state, nowTs);
+      const activeIndependentFlowCount = computeActiveIndependentFlowCount(state, nowTs);
+      const calibratedRecentSeedFlowCount =
+        recentSeedFlowCount +
+        runtimeFlowCalibrationBias.lineageFlowCountBonus +
+        runtimeFlowCalibrationBias.completionPatienceFlowCountBonus;
+      const calibratedActiveIndependentFlowCount =
+        activeIndependentFlowCount + runtimeFlowCalibrationBias.activeFlowCountBonus;
+      const carryPersistenceKeyBeforeTick = arbitrationCarryPersistenceKey(arbitrationCarry);
       const overlapBaseLot = config.liveSmallLotLadder[0] ?? config.defaultLot;
+      const pendingDecisionFillSnapshot = pendingPairExecution
+        ? stateStore.loadPairGroupFillSnapshot(pendingPairExecution.group.groupId)
+        : undefined;
+      const decisionLockedPendingShares = computePendingLockedShares(
+        pendingPairExecution,
+        pendingDecisionFillSnapshot,
+        config,
+      );
       const openMatchedQty = Number(Math.min(state.upShares, state.downShares).toFixed(6));
+      const unlockedMatchedQty = unlockedMergeableShares(state, decisionLockedPendingShares);
       const matchedInventoryTargetMet =
         mergeBatchTracker.windows.length >= 1 || openMatchedQty + 1e-6 >= overlapBaseLot;
+      const matchedInventoryQuality = Number(
+        Math.min(
+          1.25,
+          Math.max(
+            mergeBatchTracker.windows.length >= 1 ? 1 : 0,
+            openMatchedQty / Math.max(overlapBaseLot, 1e-6),
+          ),
+        ).toFixed(6),
+      );
+      const unlockedMatchedInventoryQuality = Number(
+        Math.min(
+          1.25,
+          Math.max(
+            mergeBatchTracker.windows.length >= 1 ? 1 : 0,
+            unlockedMatchedQty / Math.max(overlapBaseLot, 1e-6),
+          ),
+        ).toFixed(6),
+      );
+      const carryFlowConfidence = arbitrationCarry
+        ? deriveCarryFlowConfidence({
+            carry: arbitrationCarry,
+            state,
+            nowTs,
+            matchedInventoryQuality,
+            unlockedMatchedInventoryQuality,
+            recentSeedFlowCount: calibratedRecentSeedFlowCount,
+            activeIndependentFlowCount: calibratedActiveIndependentFlowCount,
+          })
+        : 0;
+      const residualBehaviorState = resolveResidualBehaviorState({
+        config,
+        residualShares: protectedResidualShares,
+        shareGap: protectedResidualShares,
+        recentSeedFlowCount: calibratedRecentSeedFlowCount,
+        activeIndependentFlowCount: calibratedActiveIndependentFlowCount,
+      });
+      const baseRuntimeFlowBudgetState = deriveRuntimeFlowBudgetState({
+        matchedInventoryQuality,
+        unlockedMatchedInventoryQuality,
+        carryFlowConfidence,
+        recentSeedFlowCount: calibratedRecentSeedFlowCount,
+        activeIndependentFlowCount: calibratedActiveIndependentFlowCount,
+        residualSeverityPressure: residualBehaviorState.severityPressure,
+      });
+      const runtimeFlowBudgetState = applyRuntimeFlowBudgetConsumption(baseRuntimeFlowBudgetState, {
+        activeIndependentFlowCount: calibratedActiveIndependentFlowCount,
+        pendingMergeWindowCount: mergeBatchTracker.windows.length,
+        protectedResidualShares,
+        residualSeverityPressure: residualBehaviorState.severityPressure,
+        pendingPairExecutionActive: pendingPairExecution !== undefined,
+        realizedActionBudgetLoad: runtimeFlowBudgetLedgerLoad,
+        lineageActionBudgetLoad: dominantRuntimeFlowBudgetLineageLoad(runtimeFlowBudgetLineageLoads),
+      });
+      if (arbitrationCarry) {
+        arbitrationCarry = {
+          ...arbitrationCarry,
+          alignmentStreak: deriveConfirmedCarryAlignmentStreak({
+            carry: arbitrationCarry,
+            state,
+            nowTs,
+            matchedInventoryQuality,
+            unlockedMatchedInventoryQuality,
+            recentSeedFlowCount: calibratedRecentSeedFlowCount,
+            flowConfidence: carryFlowConfidence,
+          }),
+        };
+      }
+      if (
+        arbitrationCarry &&
+        activeProtectedResidualLock &&
+        activeProtectedResidualLock.protectedSide === arbitrationCarry.protectedResidualSide &&
+        protectedResidualShares > Math.max(config.repairMinQty, config.completionMinQty)
+      ) {
+        const currentCarry: ArbitrationCarry = arbitrationCarry;
+        const nextExpiry = deriveArbitrationCarryExpiry({
+          config,
+          carry: currentCarry,
+          protectedResidualShares,
+          nowTs,
+          recentSeedFlowCount: calibratedRecentSeedFlowCount,
+          residualBehaviorState: resolveResidualBehaviorState({
+            config,
+            residualShares: protectedResidualShares,
+            shareGap: protectedResidualShares,
+            recentSeedFlowCount: calibratedRecentSeedFlowCount,
+            activeIndependentFlowCount: calibratedActiveIndependentFlowCount,
+          }),
+        });
+        if (nextExpiry > currentCarry.expiresAt + 1e-6) {
+          arbitrationCarryExtendedCount += 1;
+        }
+        arbitrationCarry = {
+          ...currentCarry,
+          expiresAt: nextExpiry,
+          lastObservedAt: nowTs,
+          lastProtectedShares: protectedResidualShares,
+          residualSeverityLevel: residualBehaviorState.severity.level,
+        };
+      }
+      if (
+        arbitrationCarry &&
+        (
+          nowTs >= arbitrationCarry.expiresAt ||
+          !activeProtectedResidualLock ||
+          activeProtectedResidualLock.protectedSide !== arbitrationCarry.protectedResidualSide ||
+          protectedResidualShares <=
+            Math.max(
+              Math.max(config.repairMinQty, config.completionMinQty),
+              arbitrationCarry.referenceShareGap *
+                (resolveResidualBehaviorState({
+                  config,
+                  residualShares: protectedResidualShares,
+                  shareGap: protectedResidualShares,
+                  recentSeedFlowCount: calibratedRecentSeedFlowCount,
+                  activeIndependentFlowCount: calibratedActiveIndependentFlowCount,
+                }).riskToleranceBias >= 0.55
+                  ? arbitrationCarry.recommendation === "favor_independent_overlap"
+                    ? 0.18
+                    : 0.3
+                  : arbitrationCarry.recommendation === "favor_independent_overlap"
+                    ? 0.25
+                    : 0.4),
+            )
+        )
+      ) {
+        arbitrationCarryExpiredCount += 1;
+        arbitrationCarry = undefined;
+      }
+      const riskToleranceBias = residualBehaviorState.riskToleranceBias;
+      const overlapAgeEligible =
+        partialAgeSec !== undefined &&
+        partialAgeSec <
+          config.partialPatientWindowSec +
+            config.partialSoftWindowSec *
+              Math.max(0, residualBehaviorState.carryPersistenceBias - 1) *
+              0.7 &&
+        (residualSeverity.level === "micro" && protectedResidualShares > 0
+          ? true
+          : partialAgeSec >= config.partialFastWindowSec * Math.max(0.2, 1 - riskToleranceBias * 0.75));
+      const relaxedMatchedInventoryRequirement =
+        riskToleranceBias >= 0.55 &&
+        (residualSeverity.level === "micro" || residualSeverity.level === "small" || residualSeverity.level === "medium");
+      const carryPreservedOverlapAllowed =
+        activeProtectedResidualLock !== undefined &&
+        shouldPreserveCarryDrivenOverlap({
+          config,
+          carry: arbitrationCarry,
+          nowTs,
+          secsToClose: market.endTs - nowTs,
+          protectedResidualShares,
+          completionActive: overlapCompletionActive,
+          linkageHealthy: pairgroupLinkageHealthy,
+          matchedInventoryTargetMet,
+          matchedInventoryQuality,
+          unlockedMatchedInventoryQuality,
+          carryFlowConfidence,
+          recentSeedFlowCount: calibratedRecentSeedFlowCount,
+          activeIndependentFlowCount: calibratedActiveIndependentFlowCount,
+        });
       const previewControlledOverlapAllowed =
         activeProtectedResidualLock !== undefined &&
         config.allowControlledOverlap &&
@@ -2511,11 +3706,10 @@ export async function runStatefulBotSession(
         config.maxOpenPartialGroups >= 1 &&
         (!config.allowOverlapOnlyAfterPartialClassified || pairgroupLinkageHealthy) &&
         (!config.allowOverlapOnlyWhenCompletionEngineActive || overlapCompletionActive) &&
-        (!config.requireMatchedInventoryBeforeSecondGroup || matchedInventoryTargetMet) &&
-        partialAgeSec !== undefined &&
-        partialAgeSec >= config.partialFastWindowSec &&
-        partialAgeSec < config.partialPatientWindowSec &&
-        (config.allowOverlapInLast30S || nowTs < market.endTs - config.finalWindowCompletionOnlySec);
+        (!config.requireMatchedInventoryBeforeSecondGroup || matchedInventoryTargetMet || relaxedMatchedInventoryRequirement) &&
+        overlapAgeEligible &&
+        (config.allowOverlapInLast30S || nowTs < market.endTs - config.finalWindowCompletionOnlySec) ||
+        carryPreservedOverlapAllowed;
       const postMergeCompletionOnlyActive =
         config.postMergeOnlyCompletion &&
         (state.reentryDisabled ||
@@ -2524,10 +3718,12 @@ export async function runStatefulBotSession(
         config.blockNewPairWhilePartialOpen &&
         partialOpenGroupLock !== undefined &&
         config.maxOpenPartialGroups <= 1 &&
-        !previewControlledOverlapAllowed;
-      const protectedResidualShares = activeProtectedResidualLock
-        ? Math.min(activeProtectedResidualLock.protectedShares, Math.abs(state.upShares - state.downShares))
-        : 0;
+        !previewControlledOverlapAllowed &&
+        !(
+          riskToleranceBias >= 0.55 &&
+          calibratedRecentSeedFlowCount >= 1 &&
+          (residualSeverity.level === "micro" || residualSeverity.level === "small" || residualSeverity.level === "medium")
+        );
       const decision = bot.evaluateTick({
         config,
         state,
@@ -2559,13 +3755,108 @@ export async function runStatefulBotSession(
         allowControlledOverlap: previewControlledOverlapAllowed,
         protectedResidualShares,
         protectedResidualSide: activeProtectedResidualLock?.protectedSide,
+        recentSeedFlowCount: calibratedRecentSeedFlowCount,
+        activeIndependentFlowCount: calibratedActiveIndependentFlowCount,
+        completionPatienceMultiplier: runtimeFlowCalibrationBias.completionPatienceMultiplier,
+        matchedInventoryQuality: unlockedMatchedInventoryQuality,
+        flowPressureState: runtimeFlowBudgetState,
+        arbitrationCarry:
+          arbitrationCarry &&
+          activeProtectedResidualLock &&
+          arbitrationCarry.protectedResidualSide === activeProtectedResidualLock.protectedSide
+            ? {
+                recommendation: arbitrationCarry.recommendation,
+                preferredSeedSide: arbitrationCarry.preferredSeedSide,
+                alignmentStreak: arbitrationCarry.alignmentStreak,
+                flowConfidence: carryFlowConfidence,
+              }
+            : undefined,
       });
       const decisionTraceContext: DecisionTraceContext = {
         eventSeq: marketEventSeq,
         decisionLatencyMs: Math.max(0, Date.now() - Math.max(latestBookEventAtMs, decisionEvalStartedAtMs)),
         bookAgeMsUp: Math.max(0, Date.now() - lastBookEventAtMs.UP),
         bookAgeMsDown: Math.max(0, Date.now() - lastBookEventAtMs.DOWN),
+        arbitrationCarryRecommendation: arbitrationCarry?.recommendation,
+        arbitrationCarryPreferredSeedSide: arbitrationCarry?.preferredSeedSide,
+        runtimeFlowBudgetState,
+        runtimeFlowBudgetLastLineage,
+        runtimeFlowBudgetDominantLineageLoad: dominantRuntimeFlowBudgetLineageLoad(runtimeFlowBudgetLineageLoads),
+        runtimeFlowCalibrationBias,
       };
+      if (activeProtectedResidualLock && decision.trace.entry.overlapRepairArbitration === "favor_independent_overlap") {
+        const preferredSeedSide = selectPreferredSeedSide(decision);
+        const stickyOutcome = decision.trace.entry.overlapRepairOutcome;
+        if (stickyOutcome === "overlap_seed" || stickyOutcome === "pair_reentry" || stickyOutcome === "wait") {
+          const nextCarry: ArbitrationCarry = {
+            createdAt: arbitrationCarry?.createdAt ?? nowTs,
+            recommendation: "favor_independent_overlap",
+            preferredSeedSide,
+            protectedResidualSide: activeProtectedResidualLock.protectedSide,
+            referenceShareGap: Math.max(protectedResidualShares, Math.abs(state.upShares - state.downShares)),
+            alignmentStreak:
+              arbitrationCarry?.recommendation === "favor_independent_overlap" &&
+              (arbitrationCarry.preferredSeedSide === preferredSeedSide || preferredSeedSide === undefined)
+                ? arbitrationCarry.alignmentStreak + 1
+                : 1,
+            lastObservedAt: nowTs,
+            lastProtectedShares: protectedResidualShares,
+            expiresAt: nowTs + Math.max(6, config.partialFastWindowSec),
+            residualSeverityLevel: residualBehaviorState.severity.level,
+          };
+          if (!arbitrationCarry || arbitrationCarry.recommendation !== nextCarry.recommendation) {
+            arbitrationCarryCreatedCount += 1;
+          }
+          arbitrationCarry = {
+            ...nextCarry,
+            expiresAt: deriveArbitrationCarryExpiry({
+              config,
+              carry: nextCarry,
+              protectedResidualShares,
+              nowTs,
+              recentSeedFlowCount: calibratedRecentSeedFlowCount,
+              residualBehaviorState,
+            }),
+          };
+        }
+      } else if (activeProtectedResidualLock && decision.trace.entry.overlapRepairArbitration === "favor_residual_repair") {
+        if (decision.trace.entry.overlapRepairOutcome === "repair" || decision.trace.entry.overlapRepairOutcome === "blocked") {
+          const nextCarry: ArbitrationCarry = {
+            createdAt: arbitrationCarry?.createdAt ?? nowTs,
+            recommendation: "favor_residual_repair",
+            protectedResidualSide: activeProtectedResidualLock.protectedSide,
+            referenceShareGap: Math.max(protectedResidualShares, Math.abs(state.upShares - state.downShares)),
+            alignmentStreak:
+              arbitrationCarry?.recommendation === "favor_residual_repair"
+                ? arbitrationCarry.alignmentStreak + 1
+                : 1,
+            lastObservedAt: nowTs,
+            lastProtectedShares: protectedResidualShares,
+            expiresAt: nowTs + Math.max(4, Math.min(config.partialFastWindowSec, 12)),
+            residualSeverityLevel: residualBehaviorState.severity.level,
+          };
+          if (!arbitrationCarry || arbitrationCarry.recommendation !== nextCarry.recommendation) {
+            arbitrationCarryCreatedCount += 1;
+          }
+          arbitrationCarry = {
+            ...nextCarry,
+            expiresAt: deriveArbitrationCarryExpiry({
+              config,
+              carry: nextCarry,
+              protectedResidualShares,
+              nowTs,
+              recentSeedFlowCount: calibratedRecentSeedFlowCount,
+              residualBehaviorState,
+            }),
+          };
+        }
+      } else if (!activeProtectedResidualLock) {
+        arbitrationCarry = undefined;
+      }
+      const carryPersistenceChanged = carryPersistenceKeyBeforeTick !== arbitrationCarryPersistenceKey(arbitrationCarry);
+      if (carryPersistenceChanged) {
+        persistMarketState(state.reentryDisabled ? "post_merge_completion_only" : undefined);
+      }
 
       if (decision.entryBuys.length === 0 && !decision.completion && !decision.unwind) {
         const traceSignature = decisionTraceSignature(decision);
@@ -2579,6 +3870,9 @@ export async function runStatefulBotSession(
             ...buildDecisionTraceEvent(decision, decisionTraceContext),
           });
           const decisionTraceEvent = buildDecisionTraceEvent(decision, decisionTraceContext);
+          if (decisionTraceEvent.entryArbitrationActionDelta) {
+            entryArbitrationActionDeltaCount += 1;
+          }
           await traceLogger.write("decision_trace", decisionTraceEvent);
           emitLiveMirror("decision_trace", {
             marketSlug: market.slug,
@@ -2595,6 +3889,28 @@ export async function runStatefulBotSession(
             bestRawPair: decisionTraceEvent.bestRawPair,
             selectedMode: decision.trace.selectedMode ?? null,
             skipReason: decision.trace.entry.skipReason ?? null,
+            residualSeverityLevel: decision.trace.entry.residualSeverityLevel ?? null,
+            overlapRepairArbitration: decision.trace.entry.overlapRepairArbitration ?? null,
+            overlapRepairReason: decision.trace.entry.overlapRepairReason ?? null,
+            overlapRepairOutcome: decision.trace.entry.overlapRepairOutcome ?? null,
+            arbitrationCarryRecommendation: decisionTraceEvent.arbitrationCarryRecommendation ?? null,
+            arbitrationCarryPreferredSeedSide: decisionTraceEvent.arbitrationCarryPreferredSeedSide ?? null,
+            flowBudget: decisionTraceEvent.flowBudget ?? null,
+            flowBudgetRemaining: decisionTraceEvent.flowBudgetRemaining ?? null,
+            flowBudgetReserved: decisionTraceEvent.flowBudgetReserved ?? null,
+            flowBudgetRealizedActionReserve: decisionTraceEvent.flowBudgetRealizedActionReserve ?? null,
+            flowBudgetLineageActionReserve: decisionTraceEvent.flowBudgetLineageActionReserve ?? null,
+            flowBudgetLastLineage: decisionTraceEvent.flowBudgetLastLineage ?? null,
+            flowBudgetDominantLineageLoad: decisionTraceEvent.flowBudgetDominantLineageLoad ?? null,
+            flowBudgetFlowLoadReserve: decisionTraceEvent.flowBudgetFlowLoadReserve ?? null,
+            flowBudgetMergeReserve: decisionTraceEvent.flowBudgetMergeReserve ?? null,
+            flowBudgetResidualReserve: decisionTraceEvent.flowBudgetResidualReserve ?? null,
+            flowBudgetPendingExecutionReserve: decisionTraceEvent.flowBudgetPendingExecutionReserve ?? null,
+            entryArbitrationActionDelta: decisionTraceEvent.entryArbitrationActionDelta ?? null,
+            completionMode: decisionTraceEvent.completionMode ?? null,
+            completionOverlapRepairArbitration: decisionTraceEvent.completionOverlapRepairArbitration ?? null,
+            unwindMode: decisionTraceEvent.unwindMode ?? null,
+            unwindOverlapRepairArbitration: decisionTraceEvent.unwindOverlapRepairArbitration ?? null,
             gateReasons: decision.trace.entry.candidates
               .map((candidate) => candidate.gateReason)
               .filter((reason): reason is string => Boolean(reason)),
@@ -2633,11 +3949,14 @@ export async function runStatefulBotSession(
         nowTs,
         secsToClose: market.endTs - nowTs,
         protectedResidualLock: controlledOverlapLock,
+        protectedResidualShares,
         completionActive: overlapCompletionActive,
         linkageHealthy: pairgroupLinkageHealthy,
         entryBuys: decision.entryBuys,
         matchedInventoryTargetMet,
         worstCaseAmplificationShares,
+        recentSeedFlowCount: calibratedRecentSeedFlowCount,
+        activeIndependentFlowCount: calibratedActiveIndependentFlowCount,
       });
 
       if (controlledOverlapLock && decision.entryBuys.length > 1 && !controlledOverlapActive) {
@@ -2646,6 +3965,8 @@ export async function runStatefulBotSession(
           partialGroupId: partialOpenGroupLock?.groupId ?? null,
           partialStatus: partialOpenGroupLock?.status ?? "SEED_ONLY",
           partialAgeSec,
+          protectedResidualShares,
+          residualSeverityLevel: residualSeverity.level,
           completionActive: overlapCompletionActive,
           linkageHealthy: pairgroupLinkageHealthy,
           matchedInventoryTargetMet,
@@ -2760,6 +4081,13 @@ export async function runStatefulBotSession(
             (upResult && isOrderResultAccepted(upResult)) ||
               (downResult && isOrderResultAccepted(downResult)),
           );
+          if (anyAccepted) {
+            applyRuntimeFlowBudgetAction("pair_submit", {
+              quantityShares: group.intendedQty,
+              lineage: currentRuntimeFlowLineage(orderedEntries[0]?.side),
+            });
+            persistMarketState("pair_group_pending");
+          }
           const pairFinalizeTimeoutMs = anyAccepted
             ? Math.max(config.pairgroupFinalizeTimeoutMs, submittedIntentMaxAgeSec * 1000)
             : config.pairgroupFinalizeTimeoutMs;
@@ -2788,24 +4116,35 @@ export async function runStatefulBotSession(
             return fill ? [{ fill, result, mode }] : [];
           });
           for (const immediateFill of immediateOrderResultFills) {
-            state = applyFill(state, immediateFill.fill);
-            stateStore.recordFill(state, immediateFill.fill, {
+            const normalizedImmediateFill: FillRecord = {
+              ...immediateFill.fill,
+              flowLineage:
+                immediateFill.fill.flowLineage ??
+                deriveCarryFlowLineageKey({
+                  recommendation: arbitrationCarry?.recommendation,
+                  preferredSeedSide: arbitrationCarry?.preferredSeedSide,
+                  protectedResidualSide:
+                    arbitrationCarry?.protectedResidualSide ?? (partialOpenGroupLock ?? runtimeProtectedResidualLock)?.protectedSide,
+                }),
+            };
+            state = applyFill(state, normalizedImmediateFill);
+            stateStore.recordFill(state, normalizedImmediateFill, {
               orderId: immediateFill.result?.orderId,
               groupId: group.groupId,
               executionMode: immediateFill.mode,
               source: "ORDER_RESULT",
             });
-            rememberBotOwnedBuyFill(immediateFill.fill, {
+            rememberBotOwnedBuyFill(normalizedImmediateFill, {
               groupId: group.groupId,
               orderId: immediateFill.result?.orderId,
             });
-            consumeSubmittedIntent(submittedPrices, immediateFill.fill.outcome, immediateFill.fill.size);
-            rememberOrderResultFillSuppression(immediateFill.fill);
+            consumeSubmittedIntent(submittedPrices, normalizedImmediateFill.outcome, normalizedImmediateFill.size);
+            rememberOrderResultFillSuppression(normalizedImmediateFill);
             pushEvent(events, {
               timestamp: nowTs,
               type: "order_result_fill",
               groupId: group.groupId,
-              outcome: immediateFill.fill.outcome,
+              outcome: normalizedImmediateFill.outcome,
               size: immediateFill.fill.size,
               price: immediateFill.fill.price,
               orderId: immediateFill.result?.orderId ?? null,
@@ -2837,7 +4176,7 @@ export async function runStatefulBotSession(
               ...pendingPairExecution,
               status: immediateFinalizedPairExecution.status,
             };
-            stateStore.upsertMarketState(state, "order_result_fill");
+            persistMarketState("order_result_fill");
           }
           pushEvent(events, {
             timestamp: nowTs,
@@ -3021,10 +4360,14 @@ export async function runStatefulBotSession(
             };
           }
           if (accepted && !temporalSeedGroup) {
+            applyRuntimeFlowBudgetAction("seed_submit", {
+              quantityShares: entryBuy.size,
+              lineage: currentRuntimeFlowLineage(entryBuy.side),
+            });
             state = reserveNegativeEdgeBudget(state, entryBuy.negativeEdgeUsdc ?? 0, "pair");
             persistDailyBudget(state);
             state = updateSeedSubmissionState(state, entryBuy.mode, entryBuy.side);
-            stateStore.upsertMarketState(state);
+            persistMarketState();
           } else if (!accepted) {
             await logRejectedOrder({
               traceLogger,
@@ -3038,6 +4381,13 @@ export async function runStatefulBotSession(
             });
           }
           if (temporalSeedGroup && pendingPairExecution) {
+            if (accepted) {
+              applyRuntimeFlowBudgetAction("seed_submit", {
+                quantityShares: entryBuy.size,
+                lineage: currentRuntimeFlowLineage(entryBuy.side),
+              });
+              persistMarketState("pair_group_pending");
+            }
             let sawImmediateFill = false;
             for (const execution of executions) {
               const immediateFill = inferImmediateOrderResultFill({
@@ -3051,14 +4401,25 @@ export async function runStatefulBotSession(
                 continue;
               }
               sawImmediateFill = true;
-              state = applyFill(state, immediateFill);
-              stateStore.recordFill(state, immediateFill, {
+              const normalizedImmediateFill: FillRecord = {
+                ...immediateFill,
+                flowLineage:
+                  immediateFill.flowLineage ??
+                  deriveCarryFlowLineageKey({
+                    recommendation: arbitrationCarry?.recommendation,
+                    preferredSeedSide: arbitrationCarry?.preferredSeedSide,
+                    protectedResidualSide:
+                      arbitrationCarry?.protectedResidualSide ?? (partialOpenGroupLock ?? runtimeProtectedResidualLock)?.protectedSide,
+                  }),
+              };
+              state = applyFill(state, normalizedImmediateFill);
+              stateStore.recordFill(state, normalizedImmediateFill, {
                 orderId: execution.result.orderId,
                 groupId: temporalSeedGroup.groupId,
                 executionMode: entryBuy.mode,
                 source: "ORDER_RESULT",
               });
-              rememberBotOwnedBuyFill(immediateFill, {
+              rememberBotOwnedBuyFill(normalizedImmediateFill, {
                 groupId: temporalSeedGroup.groupId,
                 orderId: execution.result.orderId,
               });
@@ -3206,10 +4567,18 @@ export async function runStatefulBotSession(
         );
         const accepted = isOrderResultAccepted(result);
         if (accepted) {
+          applyRuntimeFlowBudgetAction("completion_submit", {
+            quantityShares: runtimeFlowBudgetReleaseQuantityForResidualChange({
+              requestedShares: decision.completion.missingShares,
+              oldGap: decision.completion.oldGap,
+              newGap: decision.completion.newGap,
+            }),
+            lineage: currentRuntimeFlowLineage(decision.completion.sideToBuy),
+          });
           state = reserveNegativeEdgeBudget(state, decision.completion.negativeEdgeUsdc, "completion");
           persistDailyBudget(state);
           state = updateSeedSubmissionState(state, decision.completion.mode, decision.completion.sideToBuy);
-          stateStore.upsertMarketState(state);
+          persistMarketState();
         } else {
           await logRejectedOrder({
             traceLogger,
@@ -3312,8 +4681,16 @@ export async function runStatefulBotSession(
         );
         const accepted = isOrderResultAccepted(result);
         if (accepted) {
+          applyRuntimeFlowBudgetAction("unwind_submit", {
+            quantityShares: runtimeFlowBudgetReleaseQuantityForResidualChange({
+              requestedShares: decision.unwind.unwindShares,
+              oldGap: Math.abs(state.upShares - state.downShares),
+              newGap: decision.unwind.residualAfter,
+            }),
+            lineage: currentRuntimeFlowLineage(decision.unwind.sideToSell),
+          });
           state = updateSeedSubmissionState(state, decision.unwind.mode, decision.unwind.sideToSell);
-          stateStore.upsertMarketState(state);
+          persistMarketState();
         } else {
           await logRejectedOrder({
             traceLogger,
@@ -3453,6 +4830,12 @@ export async function runStatefulBotSession(
         amount: closingMergeAmount,
         timestamp: endedAt,
         simulated: closingMergeResult.simulated,
+        flowLineage: deriveCarryFlowLineageKey({
+          recommendation: arbitrationCarry?.recommendation,
+          preferredSeedSide: arbitrationCarry?.preferredSeedSide,
+          protectedResidualSide:
+            arbitrationCarry?.protectedResidualSide ?? (partialOpenGroupLock ?? runtimeProtectedResidualLock)?.protectedSide,
+        }),
       });
       stateStore.recordMerge(preMergeState, state.mergeHistory.at(-1) ?? {
         amount: closingMergeAmount,
@@ -3484,7 +4867,11 @@ export async function runStatefulBotSession(
         }
       }
       mergeCount += 1;
-      stateStore.upsertMarketState(state, state.reentryDisabled ? "post_merge_completion_only" : undefined);
+      applyRuntimeFlowBudgetAction("merge", {
+        quantityShares: closingMergeAmount,
+        lineage: currentRuntimeFlowLineage(),
+      });
+      persistMarketState(state.reentryDisabled ? "post_merge_completion_only" : undefined);
     }
     await traceLogger.write("merge_redeem", {
       action: "merge",
@@ -3547,6 +4934,15 @@ export async function runStatefulBotSession(
     dailyNegativeEdgeSpentUsdc:
       resolvedOptions.initialDailyNegativeEdgeSpentUsdc + state.negativeEdgeConsumedUsdc,
     fairValueSnapshot: latestFairValueSnapshot,
+    recentSeedFlowCount: computeRecentSeedFlowCount(state, endedAt),
+    arbitrationCarry:
+      arbitrationCarry !== undefined
+        ? {
+            recommendation: arbitrationCarry.recommendation,
+            preferredSeedSide: arbitrationCarry.preferredSeedSide,
+            alignmentStreak: arbitrationCarry.alignmentStreak,
+          }
+        : undefined,
   });
 
   const payload: BotSessionReport = {
@@ -3585,6 +4981,18 @@ export async function runStatefulBotSession(
       unwindSubmitCount,
       mergeCount,
       adoptedInventory,
+      arbitrationCarryCreatedCount,
+      arbitrationCarryExtendedCount,
+      arbitrationCarryExpiredCount,
+      entryArbitrationActionDeltaCount,
+      arbitrationCarryExtensionRate:
+        arbitrationCarryCreatedCount > 0
+          ? Number((arbitrationCarryExtendedCount / arbitrationCarryCreatedCount).toFixed(6))
+          : 0,
+      entryArbitrationActionDeltaRate:
+        entrySubmitCount > 0
+          ? Number((entryArbitrationActionDeltaCount / entrySubmitCount).toFixed(6))
+          : 0,
     },
     finalState: {
       upShares: state.upShares,

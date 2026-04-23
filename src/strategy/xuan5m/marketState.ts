@@ -16,12 +16,14 @@ export interface FillRecord {
   timestamp: number;
   makerTaker: "maker" | "taker" | "unknown";
   executionMode?: StrategyExecutionMode | undefined;
+  flowLineage?: string | undefined;
 }
 
 export interface MergeRecord {
   amount: number;
   timestamp: number;
   simulated: boolean;
+  flowLineage?: string | undefined;
   matchedUpCost?: number | undefined;
   matchedDownCost?: number | undefined;
   mergeReturn?: number | undefined;
@@ -52,6 +54,37 @@ export interface XuanMarketState {
   consecutiveSeedCount: number;
   reentryDisabled: boolean;
   postMergeCompletionOnlyUntil?: number | undefined;
+}
+
+function isRecentSeedFill(fill: FillRecord, nowTs: number, windowSec: number): boolean {
+  return (
+    fill.side === "BUY" &&
+    (fill.executionMode === "TEMPORAL_SINGLE_LEG_SEED" || fill.executionMode === "PAIRGROUP_COVERED_SEED") &&
+    nowTs - fill.timestamp <= windowSec
+  );
+}
+
+export function countRecentSeedFlowCount(
+  fillHistory: FillRecord[],
+  nowTs: number,
+  windowSec = 120,
+): number {
+  return fillHistory.filter((fill) => isRecentSeedFill(fill, nowTs, windowSec)).length;
+}
+
+export function countActiveIndependentFlowCount(
+  fillHistory: FillRecord[],
+  nowTs: number,
+  windowSec = 120,
+): number {
+  const uniqueFlowKeys = new Set<string>();
+  for (const fill of fillHistory) {
+    if (!isRecentSeedFill(fill, nowTs, windowSec)) {
+      continue;
+    }
+    uniqueFlowKeys.add(fill.flowLineage ?? `UNCLASSIFIED_${fill.outcome}`);
+  }
+  return uniqueFlowKeys.size;
 }
 
 export function createMarketState(market: MarketInfo): XuanMarketState {

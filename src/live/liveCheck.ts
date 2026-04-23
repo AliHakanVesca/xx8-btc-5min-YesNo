@@ -26,6 +26,10 @@ import { assessMergeExecutionReadiness, classifyWalletTopology, resolveConfigure
 import { buildInventoryActionPlan, fetchInventorySnapshot } from "./inventoryManager.js";
 import { resolveExchangeSpender } from "../infra/polygon/polymarketContracts.js";
 import { PersistentStateStore } from "./persistentStateStore.js";
+import {
+  classifyComparisonFlowSummary,
+  type ComparisonFlowSummary,
+} from "../analytics/xuanReplayComparator.js";
 
 interface ProbeStatus {
   ok: boolean;
@@ -132,6 +136,22 @@ function hasApiCreds(env: AppEnv): boolean {
 
 function isReplayComparatorStatus(status: string | undefined): status is "pass" | "warn" | "fail" {
   return status === "pass" || status === "warn" || status === "fail";
+}
+
+function extractComparisonFlowSummary(payload: Record<string, unknown> | undefined): ComparisonFlowSummary | undefined {
+  const summary = payload?.flowSummary;
+  if (!summary || typeof summary !== "object") {
+    return undefined;
+  }
+  const candidate = summary as Partial<Record<keyof ComparisonFlowSummary, unknown>>;
+  if (
+    typeof candidate.flowLineageSimilarity !== "number" ||
+    typeof candidate.activeFlowPeakSimilarity !== "number" ||
+    typeof candidate.cycleCompletionLatencySimilarity !== "number"
+  ) {
+    return undefined;
+  }
+  return summary as ComparisonFlowSummary;
 }
 
 function recommendedCanaryEnv(): Record<string, string> {
@@ -387,8 +407,21 @@ export async function runLiveCheck(env: AppEnv): Promise<LiveCheckReport> {
       blockers.push("En son replay kaydi comparator verdict degil. Plain paper/session kaydi live gate icin yeterli degil.");
     } else if (latestReplayValidation.status === "fail") {
       blockers.push("Replay validation FAIL durumda. Live oncesi comparator FAIL duzeltilmeli.");
-    } else if (latestReplayValidation.status === "warn") {
-      warnings.push("Replay validation WARN. Footprint similarity orta seviyede; live smoke oncesi sonucu dikkatle degerlendir.");
+    } else {
+      if (latestReplayValidation.status === "warn") {
+        warnings.push("Replay validation WARN. Footprint similarity orta seviyede; live smoke oncesi sonucu dikkatle degerlendir.");
+      }
+      const flowSummary = extractComparisonFlowSummary(latestReplayValidation.payload);
+      if (flowSummary) {
+        const flowStatus = classifyComparisonFlowSummary(flowSummary);
+        if (flowStatus.status === "FAIL") {
+          blockers.push(`Replay flowSummary FAIL: ${flowStatus.reasons.join(",")}. Live oncesi flow davranisi duzeltilmeli.`);
+        } else if (flowStatus.status === "WARN") {
+          warnings.push(`Replay flowSummary WARN: ${flowStatus.reasons.join(",")}. Multi-flow benzerligi dikkatle izlenmeli.`);
+        }
+      } else {
+        warnings.push("Replay validation flowSummary icermiyor. Flow-lineage/active-peak alt skorlari icin compare komutunu tekrar calistir.");
+      }
     }
   }
 

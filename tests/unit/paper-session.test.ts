@@ -79,6 +79,16 @@ describe("paper session replay", () => {
     expect(lastMerge?.execution.realizedMergeProfit).toBeGreaterThan(0);
   });
 
+  it("calibrates scripted completion opportunities without changing the default replay", () => {
+    const report = runPaperSession(env, "xuan-flow", {
+      completionPatienceMultiplier: 0.45,
+    });
+    const completionStep = report.steps.find((step) => step.name === "patient-up-completion");
+
+    expect(report.summary.stepCount).toBe(24);
+    expect(completionStep?.timestamp).toBe(report.market.startTs + 122);
+  });
+
   it("runs the blocked-completion session and finishes with residual inventory", () => {
     const report = runPaperSession(env, "blocked-completion");
     const canonical = buildCanonicalReferenceFromPaperSession(report);

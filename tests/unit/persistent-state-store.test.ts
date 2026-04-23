@@ -23,6 +23,7 @@ describe("persistent state store", () => {
       size: 10,
       timestamp: createdAt,
       makerTaker: "taker",
+      flowLineage: "favor_independent_overlap|UP|DOWN",
     });
     state = applyFill(state, {
       outcome: "DOWN",
@@ -31,12 +32,36 @@ describe("persistent state store", () => {
       size: 10,
       timestamp: createdAt + 1,
       makerTaker: "taker",
+      flowLineage: "favor_independent_overlap|UP|DOWN",
     });
 
     const store = new PersistentStateStore(dbPath);
     store.recordFill(state, state.fillHistory[0]!, { source: "USER_WS" });
     store.recordFill(state, state.fillHistory[1]!, { source: "USER_WS" });
-    store.upsertMarketState(state);
+    const arbitrationCarry = {
+      createdAt,
+      recommendation: "favor_independent_overlap" as const,
+      preferredSeedSide: "UP" as const,
+      protectedResidualSide: "DOWN" as const,
+      referenceShareGap: 10,
+      alignmentStreak: 3,
+      lastObservedAt: createdAt + 2,
+      lastProtectedShares: 10,
+      expiresAt: createdAt + 60,
+      residualSeverityLevel: "small" as const,
+    };
+    store.upsertMarketState(state, undefined, {
+      arbitrationCarry,
+      flowBudget: {
+        load: 0.18,
+        updatedAt: createdAt + 2,
+        lastAction: "pair_submit",
+        lastLineage: "favor_independent_overlap|UP|DOWN",
+        lineageLoads: {
+          "favor_independent_overlap|UP|DOWN": 0.18,
+        },
+      },
+    });
     store.recordPriceSnapshot({
       marketSlug: market.slug,
       conditionId: market.conditionId,
@@ -53,13 +78,31 @@ describe("persistent state store", () => {
       amount: 6,
       timestamp: market.startTs + 20,
       simulated: false,
+      flowLineage: "favor_independent_overlap|UP|DOWN",
     });
     store.recordMerge(preMerge, state.mergeHistory.at(-1)!);
-    store.upsertMarketState(state);
+    store.upsertMarketState(state, undefined, {
+      arbitrationCarry: {
+        ...arbitrationCarry,
+        lastObservedAt: market.startTs + 20,
+        lastProtectedShares: 4,
+      },
+      flowBudget: {
+        load: 0.04,
+        updatedAt: market.startTs + 20,
+        lastAction: "merge",
+        lastLineage: "favor_independent_overlap|UP|DOWN",
+        lineageLoads: {
+          "favor_independent_overlap|UP|DOWN": 0.04,
+        },
+      },
+    });
     store.close();
 
     const reopened = new PersistentStateStore(dbPath);
     const restored = reopened.loadMarketState(createMarketState(market));
+    const restoredCarry = reopened.loadArbitrationCarrySnapshot(market.slug);
+    const restoredFlowBudget = reopened.loadFlowBudgetSnapshot(market.slug);
     const snapshot = reopened.loadLatestPriceSnapshot(market.slug, "threshold");
     reopened.close();
 
@@ -73,6 +116,40 @@ describe("persistent state store", () => {
         price: 0.2,
       }),
     ]);
+    expect(restored.fillHistory).toEqual([
+      expect.objectContaining({
+        outcome: "UP",
+        flowLineage: "favor_independent_overlap|UP|DOWN",
+      }),
+      expect.objectContaining({
+        outcome: "DOWN",
+        flowLineage: "favor_independent_overlap|UP|DOWN",
+      }),
+    ]);
+    expect(restored.mergeHistory).toEqual([
+      expect.objectContaining({
+        amount: 6,
+        flowLineage: "favor_independent_overlap|UP|DOWN",
+      }),
+    ]);
+    expect(restoredCarry).toEqual(
+      expect.objectContaining({
+        recommendation: "favor_independent_overlap",
+        preferredSeedSide: "UP",
+        protectedResidualSide: "DOWN",
+        alignmentStreak: 3,
+        residualSeverityLevel: "small",
+      }),
+    );
+    expect(restoredFlowBudget).toEqual({
+      load: 0.04,
+      updatedAt: market.startTs + 20,
+      lastAction: "merge",
+      lastLineage: "favor_independent_overlap|UP|DOWN",
+      lineageLoads: {
+        "favor_independent_overlap|UP|DOWN": 0.04,
+      },
+    });
     expect(snapshot).toMatchObject({
       price: 78000,
       source: "rtds",
@@ -198,9 +275,23 @@ describe("persistent state store", () => {
         marketSlug: market.slug,
       },
     });
+    store.recordValidationRun({
+      kind: "replay",
+      status: "warn",
+      timestamp: market.startTs + 20,
+      payload: {
+        marketSlug: market.slug,
+        flowSummary: {
+          flowLineageSimilarity: 0.7,
+          activeFlowPeakSimilarity: 0.8,
+          cycleCompletionLatencySimilarity: 0.9,
+        },
+      },
+    });
 
     const partial = store.loadLatestOpenPartialPairGroup(market.slug);
     const validation = store.latestValidationRun("replay");
+    const recentValidations = store.recentValidationRuns("replay", 2);
     store.close();
 
     expect(partial).toEqual({
@@ -210,10 +301,19 @@ describe("persistent state store", () => {
     });
     expect(validation).toMatchObject({
       kind: "replay",
-      status: "ok",
-      timestamp: market.startTs + 15,
+      status: "warn",
+      timestamp: market.startTs + 20,
       payload: {
         marketSlug: market.slug,
+      },
+    });
+    expect(recentValidations).toHaveLength(2);
+    expect(recentValidations[0]).toMatchObject({
+      status: "warn",
+      payload: {
+        flowSummary: {
+          flowLineageSimilarity: 0.7,
+        },
       },
     });
 

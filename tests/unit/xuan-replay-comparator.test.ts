@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { compareCanonicalReference } from "../../src/analytics/xuanReplayComparator.js";
+import {
+  buildComparisonFlowSummary,
+  buildFlowCalibrationSummary,
+  classifyComparisonFlowSummary,
+  compareCanonicalReference,
+} from "../../src/analytics/xuanReplayComparator.js";
 import type {
   CanonicalReferenceExtract,
   CanonicalSequenceEvent,
@@ -267,6 +272,101 @@ describe("xuan replay comparator", () => {
     expect(result.verdict).toBe("FAIL");
     expect(result.hardFailTotal).toBe(1);
     expect(result.hardFails.overshoot).toBe(1);
+  });
+
+  it("scores flow lineage shape, active-flow peak, and completion latency", () => {
+    const reference = buildReference({
+      orderedClipSequence: [
+        buildEvent({ sequenceIndex: 0, clipIndex: 1, cycleId: 1, phase: "ENTRY", tOffsetSec: 4, tOffsetMs: 4000 }),
+        buildEvent({
+          sequenceIndex: 1,
+          clipIndex: 2,
+          cycleId: 2,
+          phase: "OVERLAP",
+          tOffsetSec: 8,
+          tOffsetMs: 8000,
+          outcome: "UP",
+        }),
+        buildEvent({
+          sequenceIndex: 2,
+          clipIndex: 3,
+          cycleId: 1,
+          phase: "COMPLETION",
+          tOffsetSec: 14,
+          tOffsetMs: 14000,
+          outcome: "UP",
+        }),
+        buildEvent({
+          sequenceIndex: 3,
+          clipIndex: 4,
+          cycleId: 2,
+          phase: "COMPLETION",
+          tOffsetSec: 18,
+          tOffsetMs: 18000,
+          outcome: "DOWN",
+        }),
+      ],
+      cycleCount: 2,
+      completionCount: 2,
+      overlapClipCount: 1,
+      hasOverlap: true,
+      buySequence: ["DOWN", "UP", "UP", "DOWN"],
+      alternatingTransitionCount: 2,
+    });
+    const collapsedCandidate = buildReference({
+      slug: "candidate-market",
+      orderedClipSequence: [
+        buildEvent({ sequenceIndex: 0, clipIndex: 1, cycleId: 1, phase: "ENTRY", tOffsetSec: 4, tOffsetMs: 4000 }),
+        buildEvent({
+          sequenceIndex: 1,
+          clipIndex: 2,
+          cycleId: 1,
+          phase: "COMPLETION",
+          tOffsetSec: 18,
+          tOffsetMs: 18000,
+          outcome: "UP",
+        }),
+      ],
+      cycleCount: 1,
+      completionCount: 1,
+      overlapClipCount: 0,
+      hasOverlap: false,
+      buySequence: ["DOWN", "UP"],
+      alternatingTransitionCount: 1,
+    });
+
+    const identical = compareCanonicalReference(reference, { ...reference, slug: "identical-candidate" });
+    const collapsed = compareCanonicalReference(reference, collapsedCandidate);
+
+    expect(identical.details.referenceActiveFlowPeak).toBe(2);
+    expect(identical.details.activeFlowPeakSimilarity).toBe(1);
+    expect(collapsed.details.candidateActiveFlowPeak).toBe(1);
+    expect(collapsed.details.flowLineageSimilarity).toBeLessThan(identical.details.flowLineageSimilarity);
+    expect(collapsed.breakdown.cycleCompletionLatencyScore).toBeLessThan(1);
+    expect(collapsed.details.averageCycleCompletionLatencyDeltaSec).toBeGreaterThan(0);
+    expect(collapsed.score).toBeLessThan(identical.score);
+  });
+
+  it("classifies flow summary status and builds calibration focus from recent summaries", () => {
+    const reference = buildReference();
+    const passSummary = buildComparisonFlowSummary(
+      compareCanonicalReference(reference, { ...reference, slug: "candidate-pass" }),
+    );
+    const weakSummary = {
+      ...passSummary,
+      flowLineageSimilarity: 0.5,
+      activeFlowPeakSimilarity: 0.45,
+      cycleCompletionLatencySimilarity: 0.4,
+    };
+    const status = classifyComparisonFlowSummary(weakSummary);
+    const calibration = buildFlowCalibrationSummary([passSummary, weakSummary]);
+
+    expect(classifyComparisonFlowSummary(passSummary).status).toBe("PASS");
+    expect(status.status).toBe("FAIL");
+    expect(status.reasons).toContain("flow_lineage_similarity_low");
+    expect(calibration.sampleCount).toBe(2);
+    expect(calibration.status).toBe("WARN");
+    expect(calibration.recommendedFocus.length).toBeGreaterThan(0);
   });
 
   it("penalizes side-first sequence mismatches against the bundled public-sequence fixture", () => {

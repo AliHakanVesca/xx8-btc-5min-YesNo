@@ -4,6 +4,7 @@ import { buildStrategyConfig } from "../../src/config/strategyPresets.js";
 import { buildOfflineMarket } from "../../src/infra/gamma/marketDiscovery.js";
 import { resolveBundledMergeClusterPrior } from "../../src/analytics/xuanExactReference.js";
 import { createMarketState } from "../../src/strategy/xuan5m/marketState.js";
+import { classifyFlowPressureBudget } from "../../src/strategy/xuan5m/modePolicy.js";
 import {
   createMergeBatchTracker,
   evaluateDelayedMergeGate,
@@ -169,6 +170,112 @@ describe("merge coordinator", () => {
     expect(gate.forced).toBe(false);
     expect(gate.reason).toBe("cycle_target");
     expect(gate.completedCycles).toBe(5);
+  });
+
+  it("delays non-forced merge slightly longer when strong multi-flow pressure is still active", () => {
+    const config = buildConfig({
+      BOT_MODE: "XUAN",
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+    });
+    const market = buildOfflineMarket(1713696000);
+    const state = createMarketState(market);
+    let tracker = createMergeBatchTracker();
+    tracker = syncMergeBatchTracker(tracker, 5, market.startTs);
+    tracker = syncMergeBatchTracker(tracker, 10, market.startTs + 10);
+    tracker = syncMergeBatchTracker(tracker, 15, market.startTs + 20);
+    tracker = syncMergeBatchTracker(tracker, 20, market.startTs + 30);
+    tracker = syncMergeBatchTracker(tracker, 25, market.startTs + 40);
+
+    const delayedGate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 76,
+      secsFromOpen: 76,
+      secsToClose: 224,
+      usdcBalance: 100,
+      tracker,
+      flowPressureBudget: 0.9,
+      activeIndependentFlowCount: 2,
+    });
+    const releasedGate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 89,
+      secsFromOpen: 89,
+      secsToClose: 211,
+      usdcBalance: 100,
+      tracker,
+      flowPressureBudget: 0.9,
+      activeIndependentFlowCount: 2,
+    });
+
+    expect(delayedGate.allow).toBe(false);
+    expect(delayedGate.reason).toBe("not_ready");
+    expect(releasedGate.allow).toBe(true);
+    expect(releasedGate.reason).toBe("age_target");
+  });
+
+  it("coalesces nearby matched windows when strong multi-flow pressure is still active", () => {
+    const market = buildOfflineMarket(1713696000);
+    let tracker = createMergeBatchTracker();
+    tracker = syncMergeBatchTracker(tracker, 5, market.startTs, {
+      flowPressureBudget: 0.9,
+      activeIndependentFlowCount: 2,
+    });
+    tracker = syncMergeBatchTracker(tracker, 10, market.startTs + 10, {
+      flowPressureBudget: 0.9,
+      activeIndependentFlowCount: 2,
+    });
+
+    expect(tracker.trackedMergeable).toBe(10);
+    expect(tracker.windows).toHaveLength(1);
+    expect(tracker.windows[0]).toMatchObject({
+      amount: 10,
+      firstAvailableAt: market.startTs,
+    });
+  });
+
+  it("accepts a precomputed flow-budget state when delaying merge release under strong multi-flow pressure", () => {
+    const config = buildConfig({
+      BOT_MODE: "XUAN",
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+    });
+    const market = buildOfflineMarket(1713696000);
+    const state = createMarketState(market);
+    let tracker = createMergeBatchTracker();
+    const flowPressureState = classifyFlowPressureBudget({
+      budget: 0.9,
+      matchedInventoryQuality: 1,
+    });
+    tracker = syncMergeBatchTracker(tracker, 5, market.startTs, {
+      activeIndependentFlowCount: 2,
+      flowPressureState,
+    });
+    tracker = syncMergeBatchTracker(tracker, 10, market.startTs + 10, {
+      activeIndependentFlowCount: 2,
+      flowPressureState,
+    });
+    tracker = syncMergeBatchTracker(tracker, 15, market.startTs + 20, {
+      activeIndependentFlowCount: 2,
+      flowPressureState,
+    });
+    tracker = syncMergeBatchTracker(tracker, 20, market.startTs + 30, {
+      activeIndependentFlowCount: 2,
+      flowPressureState,
+    });
+    tracker = syncMergeBatchTracker(tracker, 25, market.startTs + 40, {
+      activeIndependentFlowCount: 2,
+      flowPressureState,
+    });
+
+    const delayedGate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 76,
+      secsFromOpen: 76,
+      secsToClose: 224,
+      usdcBalance: 100,
+      tracker,
+      activeIndependentFlowCount: 2,
+      flowPressureState,
+    });
+
+    expect(delayedGate.allow).toBe(false);
+    expect(delayedGate.reason).toBe("not_ready");
   });
 
   it("uses the exact 1776253500 first merge cluster timing and qty envelope", () => {

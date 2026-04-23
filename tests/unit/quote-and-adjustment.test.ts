@@ -4,6 +4,7 @@ import { buildStrategyConfig } from "../../src/config/strategyPresets.js";
 import { buildOfflineMarket } from "../../src/infra/gamma/marketDiscovery.js";
 import { createMarketState } from "../../src/strategy/xuan5m/marketState.js";
 import { chooseInventoryAdjustment } from "../../src/strategy/xuan5m/completionEngine.js";
+import { classifyFlowPressureBudget } from "../../src/strategy/xuan5m/modePolicy.js";
 import { chooseEntryBuys } from "../../src/strategy/xuan5m/entryLadderEngine.js";
 import { OrderBookState } from "../../src/strategy/xuan5m/orderBookState.js";
 import { Xuan5mBot } from "../../src/strategy/xuan5m/Xuan5mBot.js";
@@ -261,8 +262,96 @@ describe("entry and inventory adjustment", () => {
       missingShares: 10,
       residualAfter: 50,
       capMode: "strict",
+      arbitrationOutcome: "completion",
     });
     expect(adjustment?.unwind).toBeUndefined();
+  });
+
+  it("avoids tiny nibble completions while confirmed multi-flow pressure is still active", () => {
+    const xuanConfig = buildStrategyConfig(
+      parseEnv({
+        DRY_RUN: "true",
+        POLY_STACK_MODE: "current-prod-v1",
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        PARTIAL_SOFT_CAP: "1.04",
+        COMPLETION_SOFT_CAP: "1.04",
+      }),
+    );
+    const market = buildOfflineMarket(1713696000);
+    const weakState = createMarketState(market);
+    weakState.upShares = 20;
+    weakState.upCost = 8.4;
+    weakState.upLots = [{ size: 20, price: 0.42, timestamp: market.endTs - 130 }];
+
+    const strongState = createMarketState(market);
+    strongState.upShares = 20;
+    strongState.upCost = 8.4;
+    strongState.upLots = [{ size: 20, price: 0.42, timestamp: market.endTs - 130 }];
+    strongState.fillHistory = [
+      {
+        outcome: "UP",
+        side: "BUY",
+        size: 20,
+        price: 0.46,
+        timestamp: market.endTs - 70,
+        makerTaker: "taker",
+        executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+        flowLineage: "favor_independent_overlap|UP|DOWN",
+      },
+      {
+        outcome: "DOWN",
+        side: "BUY",
+        size: 20,
+        price: 0.54,
+        timestamp: market.endTs - 68,
+        makerTaker: "taker",
+        executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+        flowLineage: "favor_independent_overlap|DOWN|UP",
+      },
+    ];
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.41, size: 120 }], [{ price: 0.42, size: 120 }]),
+      buildBook(
+        market.tokens.DOWN.tokenId,
+        market.conditionId,
+        [{ price: 0.55, size: 120 }],
+        [
+          { price: 0.56, size: 10 },
+          { price: 0.74, size: 110 },
+        ],
+      ),
+    );
+
+    const weakAdjustment = chooseInventoryAdjustment(xuanConfig, weakState, books, {
+      secsToClose: 80,
+      nowTs: market.endTs - 80,
+      fairValueSnapshot: {
+        status: "valid",
+        estimatedThreshold: false,
+        fairUp: 0.42,
+        fairDown: 0.6,
+      },
+    });
+    const strongAdjustment = chooseInventoryAdjustment(xuanConfig, strongState, books, {
+      secsToClose: 80,
+      nowTs: market.endTs - 80,
+      fairValueSnapshot: {
+        status: "valid",
+        estimatedThreshold: false,
+        fairUp: 0.42,
+        fairDown: 0.6,
+      },
+    });
+
+    expect(weakAdjustment?.completion).toMatchObject({
+      sideToBuy: "DOWN",
+      missingShares: 10,
+      residualAfter: 10,
+      arbitrationOutcome: "completion",
+    });
+    expect(strongAdjustment).toBeNull();
   });
 
   it("holds residual inventory near the close when sell unwind is disabled", () => {
@@ -307,6 +396,117 @@ describe("entry and inventory adjustment", () => {
       sideToSell: "UP",
       unwindShares: 50,
       residualAfter: 10,
+      arbitrationOutcome: "unwind",
+    });
+  });
+
+  it("waits a bit longer before unwind when multi-flow pressure is still strong", () => {
+    const sellUnwindConfig = buildStrategyConfig(
+      parseEnv({
+        DRY_RUN: "true",
+        POLY_STACK_MODE: "current-prod-v1",
+        BOT_MODE: "XUAN",
+        SELL_UNWIND_ENABLED: "true",
+        ALLOW_UNRESOLVED_SELL: "true",
+      }),
+    );
+    const market = buildOfflineMarket(1713696000);
+    const state = createMarketState(market);
+    state.upShares = 60;
+    state.upCost = 27.6;
+    state.fillHistory = [
+      {
+        outcome: "UP",
+        side: "BUY",
+        size: 20,
+        price: 0.46,
+        timestamp: market.endTs - 40,
+        makerTaker: "taker",
+        executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+        flowLineage: "favor_independent_overlap|UP|DOWN",
+      },
+      {
+        outcome: "DOWN",
+        side: "BUY",
+        size: 20,
+        price: 0.54,
+        timestamp: market.endTs - 38,
+        makerTaker: "taker",
+        executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+        flowLineage: "favor_independent_overlap|DOWN|UP",
+      },
+    ];
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.43, size: 80 }], [{ price: 0.44, size: 80 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.58, size: 80 }], [{ price: 0.59, size: 80 }]),
+    );
+
+    const adjustment = chooseInventoryAdjustment(sellUnwindConfig, state, books, {
+      secsToClose: 20,
+      nowTs: market.endTs - 20,
+    });
+
+    expect(adjustment).toBeNull();
+  });
+
+  it("does not hold unwind when the injected flow-budget state shows low remaining budget", () => {
+    const sellUnwindConfig = buildStrategyConfig(
+      parseEnv({
+        DRY_RUN: "true",
+        POLY_STACK_MODE: "current-prod-v1",
+        BOT_MODE: "XUAN",
+        SELL_UNWIND_ENABLED: "true",
+        ALLOW_UNRESOLVED_SELL: "true",
+      }),
+    );
+    const market = buildOfflineMarket(1713696000);
+    const state = createMarketState(market);
+    state.upShares = 60;
+    state.upCost = 27.6;
+    state.fillHistory = [
+      {
+        outcome: "UP",
+        side: "BUY",
+        size: 20,
+        price: 0.46,
+        timestamp: market.endTs - 40,
+        makerTaker: "taker",
+        executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+        flowLineage: "favor_independent_overlap|UP|DOWN",
+      },
+      {
+        outcome: "DOWN",
+        side: "BUY",
+        size: 20,
+        price: 0.54,
+        timestamp: market.endTs - 38,
+        makerTaker: "taker",
+        executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+        flowLineage: "favor_independent_overlap|DOWN|UP",
+      },
+    ];
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.43, size: 80 }], [{ price: 0.44, size: 80 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.58, size: 80 }], [{ price: 0.59, size: 80 }]),
+    );
+
+    const adjustment = chooseInventoryAdjustment(sellUnwindConfig, state, books, {
+      secsToClose: 12,
+      nowTs: market.endTs - 12,
+      recentSeedFlowCount: 2,
+      activeIndependentFlowCount: 2,
+      flowPressureState: classifyFlowPressureBudget({
+        budget: 0.5,
+        matchedInventoryQuality: 1,
+      }),
+    });
+
+    expect(adjustment?.completion).toBeUndefined();
+    expect(adjustment?.unwind).toMatchObject({
+      sideToSell: "UP",
+      arbitrationOutcome: "unwind",
     });
   });
 });

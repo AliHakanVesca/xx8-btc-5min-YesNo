@@ -36,6 +36,9 @@ export interface ComparatorBreakdown {
   eventQtyScore: number;
   mergeClusterQtyScore: number;
   redeemClusterQtyScore: number;
+  flowLineageScore: number;
+  activeFlowPeakScore: number;
+  cycleCompletionLatencyScore: number;
 }
 
 export interface CanonicalComparisonResult {
@@ -62,7 +65,45 @@ export interface CanonicalComparisonResult {
     eventQtySimilarity: number;
     mergeClusterQtySimilarity: number;
     redeemClusterQtySimilarity: number;
+    flowLineageSimilarity: number;
+    activeFlowPeakSimilarity: number;
+    cycleCompletionLatencySimilarity: number;
+    referenceActiveFlowPeak: number;
+    candidateActiveFlowPeak: number;
+    referenceAverageCycleCompletionLatencySec: number;
+    candidateAverageCycleCompletionLatencySec: number;
+    averageCycleCompletionLatencyDeltaSec: number;
   };
+}
+
+export interface ComparisonFlowSummary {
+  flowLineageSimilarity: number;
+  activeFlowPeakSimilarity: number;
+  cycleCompletionLatencySimilarity: number;
+  referenceActiveFlowPeak: number;
+  candidateActiveFlowPeak: number;
+  referenceAverageCycleCompletionLatencySec: number;
+  candidateAverageCycleCompletionLatencySec: number;
+  averageCycleCompletionLatencyDeltaSec: number;
+  flowLineageScore: number;
+  activeFlowPeakScore: number;
+  cycleCompletionLatencyScore: number;
+}
+
+export interface ComparisonFlowStatus {
+  status: ComparatorVerdict;
+  reasons: string[];
+}
+
+export interface FlowCalibrationSummary {
+  sampleCount: number;
+  averageFlowLineageSimilarity: number;
+  averageActiveFlowPeakSimilarity: number;
+  averageCycleCompletionLatencySimilarity: number;
+  averageCycleCompletionLatencyDeltaSec: number;
+  completionLatencyDirection: "candidate_early" | "candidate_late" | "aligned";
+  status: ComparatorVerdict;
+  recommendedFocus: string[];
 }
 
 export interface CanonicalBundleComparison {
@@ -215,6 +256,63 @@ function phaseFamilySimilarity(reference: CanonicalReferenceExtract, candidate: 
   return longestCommonSubsequenceLength(left, right) / Math.max(left.length, right.length);
 }
 
+function flowLineageToken(event: { cycleId: number; phase: CanonicalPhase }): string {
+  return `${event.cycleId}:${phaseToken(event.phase)}`;
+}
+
+function flowLineageSimilarity(reference: CanonicalReferenceExtract, candidate: CanonicalReferenceExtract): number {
+  const left = reference.orderedClipSequence
+    .filter((event) => event.kind === "BUY")
+    .map((event) => flowLineageToken(event));
+  const right = candidate.orderedClipSequence
+    .filter((event) => event.kind === "BUY")
+    .map((event) => flowLineageToken(event));
+  if (left.length === 0 && right.length === 0) return 1;
+  if (left.length === 0 || right.length === 0) return 0;
+  return longestCommonSubsequenceLength(left, right) / Math.max(left.length, right.length);
+}
+
+function activeFlowPeak(extract: CanonicalReferenceExtract): number {
+  const activeCycles = new Set<number>();
+  let peak = 0;
+  for (const event of extract.orderedClipSequence) {
+    if (event.kind === "BUY") {
+      if (event.phase === "ENTRY" || event.phase === "OVERLAP") {
+        activeCycles.add(event.cycleId);
+      }
+      peak = Math.max(peak, activeCycles.size);
+      if (event.phase === "COMPLETION" || event.phase === "HIGH_LOW_COMPLETION") {
+        activeCycles.delete(event.cycleId);
+      }
+    } else if (event.kind === "MERGE" || event.kind === "REDEEM") {
+      activeCycles.clear();
+    }
+    peak = Math.max(peak, activeCycles.size);
+  }
+  return peak;
+}
+
+function cycleCompletionLatencies(extract: CanonicalReferenceExtract): number[] {
+  const openedAtByCycle = new Map<number, number>();
+  const latencies: number[] = [];
+  for (const event of extract.orderedClipSequence) {
+    if (event.kind !== "BUY") {
+      continue;
+    }
+    if ((event.phase === "ENTRY" || event.phase === "OVERLAP") && !openedAtByCycle.has(event.cycleId)) {
+      openedAtByCycle.set(event.cycleId, event.tOffsetSec);
+    }
+    if (event.phase === "COMPLETION" || event.phase === "HIGH_LOW_COMPLETION") {
+      const openedAt = openedAtByCycle.get(event.cycleId);
+      if (openedAt !== undefined) {
+        latencies.push(Math.max(0, event.tOffsetSec - openedAt));
+        openedAtByCycle.delete(event.cycleId);
+      }
+    }
+  }
+  return latencies;
+}
+
 function sequenceQtySimilarity(
   left: number[],
   right: number[],
@@ -226,6 +324,12 @@ function sequenceQtySimilarity(
     score += boundedRatioSimilarity(left[index] ?? 0, right[index] ?? 0);
   }
   return score / maxLength;
+}
+
+function averageNumber(values: number[]): number {
+  return values.length > 0
+    ? Number((values.reduce((sum, value) => sum + value, 0) / values.length).toFixed(6))
+    : 0;
 }
 
 function buyEventQtySimilarity(reference: CanonicalReferenceExtract, candidate: CanonicalReferenceExtract): number {
@@ -262,6 +366,98 @@ function numericDeltaScore(reference: number, candidate: number, exactWeight = 1
   return 0;
 }
 
+export function buildComparisonFlowSummary(comparison: CanonicalComparisonResult): ComparisonFlowSummary {
+  return {
+    flowLineageSimilarity: comparison.details.flowLineageSimilarity,
+    activeFlowPeakSimilarity: comparison.details.activeFlowPeakSimilarity,
+    cycleCompletionLatencySimilarity: comparison.details.cycleCompletionLatencySimilarity,
+    referenceActiveFlowPeak: comparison.details.referenceActiveFlowPeak,
+    candidateActiveFlowPeak: comparison.details.candidateActiveFlowPeak,
+    referenceAverageCycleCompletionLatencySec: comparison.details.referenceAverageCycleCompletionLatencySec,
+    candidateAverageCycleCompletionLatencySec: comparison.details.candidateAverageCycleCompletionLatencySec,
+    averageCycleCompletionLatencyDeltaSec: comparison.details.averageCycleCompletionLatencyDeltaSec,
+    flowLineageScore: comparison.breakdown.flowLineageScore,
+    activeFlowPeakScore: comparison.breakdown.activeFlowPeakScore,
+    cycleCompletionLatencyScore: comparison.breakdown.cycleCompletionLatencyScore,
+  };
+}
+
+export function classifyComparisonFlowSummary(summary: ComparisonFlowSummary): ComparisonFlowStatus {
+  const failReasons: string[] = [];
+  const warnReasons: string[] = [];
+  if (summary.flowLineageSimilarity < 0.55) {
+    failReasons.push("flow_lineage_similarity_low");
+  } else if (summary.flowLineageSimilarity < 0.75) {
+    warnReasons.push("flow_lineage_similarity_warn");
+  }
+  if (summary.activeFlowPeakSimilarity < 0.5) {
+    failReasons.push("active_flow_peak_similarity_low");
+  } else if (summary.activeFlowPeakSimilarity < 0.75) {
+    warnReasons.push("active_flow_peak_similarity_warn");
+  }
+  if (summary.cycleCompletionLatencySimilarity < 0.45) {
+    failReasons.push("cycle_completion_latency_similarity_low");
+  } else if (summary.cycleCompletionLatencySimilarity < 0.65) {
+    warnReasons.push("cycle_completion_latency_similarity_warn");
+  }
+
+  if (failReasons.length > 0) {
+    return { status: "FAIL", reasons: failReasons };
+  }
+  if (warnReasons.length > 0) {
+    return { status: "WARN", reasons: warnReasons };
+  }
+  return { status: "PASS", reasons: [] };
+}
+
+export function buildFlowCalibrationSummary(summaries: ComparisonFlowSummary[]): FlowCalibrationSummary {
+  const sampleCount = summaries.length;
+  const average = (selector: (summary: ComparisonFlowSummary) => number): number =>
+    sampleCount > 0
+      ? Number((summaries.reduce((sum, summary) => sum + selector(summary), 0) / sampleCount).toFixed(6))
+      : 0;
+  const aggregate: ComparisonFlowSummary = {
+    flowLineageSimilarity: average((summary) => summary.flowLineageSimilarity),
+    activeFlowPeakSimilarity: average((summary) => summary.activeFlowPeakSimilarity),
+    cycleCompletionLatencySimilarity: average((summary) => summary.cycleCompletionLatencySimilarity),
+    referenceActiveFlowPeak: average((summary) => summary.referenceActiveFlowPeak),
+    candidateActiveFlowPeak: average((summary) => summary.candidateActiveFlowPeak),
+    referenceAverageCycleCompletionLatencySec: average((summary) => summary.referenceAverageCycleCompletionLatencySec ?? 0),
+    candidateAverageCycleCompletionLatencySec: average((summary) => summary.candidateAverageCycleCompletionLatencySec ?? 0),
+    averageCycleCompletionLatencyDeltaSec: average((summary) => summary.averageCycleCompletionLatencyDeltaSec ?? 0),
+    flowLineageScore: average((summary) => summary.flowLineageScore),
+    activeFlowPeakScore: average((summary) => summary.activeFlowPeakScore),
+    cycleCompletionLatencyScore: average((summary) => summary.cycleCompletionLatencyScore),
+  };
+  const status = classifyComparisonFlowSummary(aggregate);
+  const completionLatencyDirection =
+    aggregate.averageCycleCompletionLatencyDeltaSec > 1
+      ? "candidate_late"
+      : aggregate.averageCycleCompletionLatencyDeltaSec < -1
+        ? "candidate_early"
+        : "aligned";
+  const recommendedFocus = status.reasons.map((reason) => {
+    if (reason.includes("flow_lineage")) return "increase_lineage_preservation";
+    if (reason.includes("active_flow_peak")) return "allow_more_parallel_flow_when_budget_supports";
+    if (reason.includes("completion_latency")) {
+      if (completionLatencyDirection === "candidate_late") return "release_completion_earlier";
+      if (completionLatencyDirection === "candidate_early") return "increase_completion_patience";
+      return "tune_completion_patience_and_release";
+    }
+    return "inspect_flow_similarity";
+  });
+  return {
+    sampleCount,
+    averageFlowLineageSimilarity: aggregate.flowLineageSimilarity,
+    averageActiveFlowPeakSimilarity: aggregate.activeFlowPeakSimilarity,
+    averageCycleCompletionLatencySimilarity: aggregate.cycleCompletionLatencySimilarity,
+    averageCycleCompletionLatencyDeltaSec: aggregate.averageCycleCompletionLatencyDeltaSec,
+    completionLatencyDirection,
+    status: sampleCount === 0 ? "WARN" : status.status,
+    recommendedFocus: [...new Set(sampleCount === 0 ? ["collect_replay_flow_samples"] : recommendedFocus)],
+  };
+}
+
 export function compareCanonicalReference(
   reference: CanonicalReferenceExtract,
   candidate: CanonicalReferenceExtract,
@@ -291,6 +487,21 @@ export function compareCanonicalReference(
   const eventQty = buyEventQtySimilarity(reference, candidate);
   const mergeClusterQty = clusterQtySimilarity(reference, candidate, "MERGE");
   const redeemClusterQty = clusterQtySimilarity(reference, candidate, "REDEEM");
+  const lineageFlow = flowLineageSimilarity(reference, candidate);
+  const referenceActiveFlowPeak = activeFlowPeak(reference);
+  const candidateActiveFlowPeak = activeFlowPeak(candidate);
+  const referenceCompletionLatencies = cycleCompletionLatencies(reference);
+  const candidateCompletionLatencies = cycleCompletionLatencies(candidate);
+  const referenceAverageCycleCompletionLatencySec = averageNumber(referenceCompletionLatencies);
+  const candidateAverageCycleCompletionLatencySec = averageNumber(candidateCompletionLatencies);
+  const averageCycleCompletionLatencyDeltaSec = Number(
+    (candidateAverageCycleCompletionLatencySec - referenceAverageCycleCompletionLatencySec).toFixed(6),
+  );
+  const activeFlowPeakSimilarity = boundedRatioSimilarity(referenceActiveFlowPeak, candidateActiveFlowPeak);
+  const cycleCompletionLatencySimilarity = sequenceQtySimilarity(
+    referenceCompletionLatencies,
+    candidateCompletionLatencies,
+  );
 
   const correctnessScore =
     cycleCountScore * 15 +
@@ -301,14 +512,17 @@ export function compareCanonicalReference(
     residualBucketScore * 10;
 
   const familyScore =
-    clipBucketSimilarity * 8 +
+    clipBucketSimilarity * 7 +
     alternationSimilarity * 4 +
     sideSequence.similarity * 4 +
     overlapFamily * 4 +
     phaseFamily * 4 +
-    eventQty * 8 +
-    mergeClusterQty * 4 +
-    redeemClusterQty * 4;
+    eventQty * 6 +
+    mergeClusterQty * 3 +
+    redeemClusterQty * 3 +
+    lineageFlow * 3 +
+    activeFlowPeakSimilarity * 1 +
+    cycleCompletionLatencySimilarity * 1;
 
   const score = Math.round((correctnessScore + familyScore) * 100) / 100;
 
@@ -345,6 +559,9 @@ export function compareCanonicalReference(
       eventQtyScore: eventQty,
       mergeClusterQtyScore: mergeClusterQty,
       redeemClusterQtyScore: redeemClusterQty,
+      flowLineageScore: lineageFlow,
+      activeFlowPeakScore: activeFlowPeakSimilarity,
+      cycleCompletionLatencyScore: cycleCompletionLatencySimilarity,
     },
     details: {
       referenceSlug: reference.slug,
@@ -364,6 +581,14 @@ export function compareCanonicalReference(
       eventQtySimilarity: eventQty,
       mergeClusterQtySimilarity: mergeClusterQty,
       redeemClusterQtySimilarity: redeemClusterQty,
+      flowLineageSimilarity: lineageFlow,
+      activeFlowPeakSimilarity,
+      cycleCompletionLatencySimilarity,
+      referenceActiveFlowPeak,
+      candidateActiveFlowPeak,
+      referenceAverageCycleCompletionLatencySec,
+      candidateAverageCycleCompletionLatencySec,
+      averageCycleCompletionLatencyDeltaSec,
     },
   };
 }

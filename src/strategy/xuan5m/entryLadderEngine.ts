@@ -1454,7 +1454,7 @@ function evaluateSingleLegSeed(
 function buildCandidateSizes(ladder: number[], maxCandidateSize: number, minOrderSize: number): number[] {
   const normalized = Array.from(
     new Set(
-      ladder
+      [...ladder, maxCandidateSize]
         .map((size) => normalizeOrderSize(size, minOrderSize))
         .filter((size) => size > 0 && size <= maxCandidateSize),
     ),

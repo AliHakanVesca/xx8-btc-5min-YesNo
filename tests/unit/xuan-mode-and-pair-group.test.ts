@@ -394,7 +394,7 @@ describe("xuan mode and pair order groups", () => {
     expect(lot).toBe(90);
   });
 
-  it("can escalate the opener clip to the clone maximum when an exact opening prior is active", () => {
+  it("can escalate the opener clip to the exact opening reference size when an exact prior is active", () => {
     const lot = chooseLot(
       buildConfig({
         BOT_MODE: "XUAN",
@@ -415,7 +415,7 @@ describe("xuan mode and pair order groups", () => {
       },
     );
 
-    expect(lot).toBe(125);
+    expect(lot).toBeCloseTo(127.53312, 5);
   });
 
   it("does not clamp public footprint clone lots to the smallest clip in dry-run style contexts", () => {

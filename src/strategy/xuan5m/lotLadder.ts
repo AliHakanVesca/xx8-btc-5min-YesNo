@@ -38,19 +38,20 @@ export function chooseLot(config: XuanStrategyConfig, ctx: LotContext): number {
       return clippedBase;
     }
     if (config.xuanCloneMode === "PUBLIC_FOOTPRINT") {
-    if (!ctx.inventoryBalanced) {
-      return cloneBase;
-    }
-    if (
-      sequencePrior?.phase === "ENTRY" &&
-      ctx.secsFromOpen <= sequencePrior.activeUntilSec + 1e-9 &&
-      ctx.bookDepthGood
-    ) {
-      return cloneMax;
-    }
-    if (ctx.secsFromOpen < 45) {
-      if (!ctx.bookDepthGood) {
+      if (!ctx.inventoryBalanced) {
         return cloneBase;
+      }
+      if (
+        sequencePrior &&
+        ctx.secsFromOpen >= sequencePrior.activeFromSec - 1e-9 &&
+        ctx.secsFromOpen <= sequencePrior.activeUntilSec + 1e-9 &&
+        ctx.bookDepthGood
+      ) {
+        return Number(Math.max(cloneBase, sequencePrior.qty).toFixed(6));
+      }
+      if (ctx.secsFromOpen < 45) {
+        if (!ctx.bookDepthGood) {
+          return cloneBase;
         }
         return ctx.pairCostWithinCap ? cloneHigh : cloneMid;
       }

@@ -522,7 +522,7 @@ export function buildStrategyConfig(env: AppEnv): XuanStrategyConfig {
 function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConfig {
   const ladder = [80, 90, 100, 125];
   const elevatedBehaviorCap = Math.max(config.xuanBehaviorCap, 1.25);
-  const maxLadderLot = ladder[ladder.length - 1] ?? 125;
+  const maxLadderLot = Math.max(ladder[ladder.length - 1] ?? 125, 130);
 
   return {
     ...config,

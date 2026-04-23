@@ -437,6 +437,7 @@ interface SeedSequencePrior {
   phase: SeedPhase;
   sourceSlug: string;
   anchorSec: number;
+  qty: number;
   activeFromSec: number;
   activeUntilSec: number;
   scope: "exact" | "family";
@@ -491,6 +492,7 @@ function resolveSeedPriorFromReference(
     phase: event.phase,
     sourceSlug: reference.slug,
     anchorSec: event.tOffsetSec,
+    qty: event.qty,
     activeFromSec,
     activeUntilSec,
     scope,

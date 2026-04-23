@@ -1,5 +1,6 @@
 import type { XuanStrategyConfig } from "../../config/strategyPresets.js";
 import type { MarketOrderArgs, OutcomeSide } from "../../infra/clob/types.js";
+import { resolveBundledCompletionSequencePrior } from "../../analytics/xuanExactReference.js";
 import {
   absoluteShareGap,
   averageEffectiveCost,
@@ -124,14 +125,32 @@ function chooseCompletion(
           ctx.nowTs !== undefined &&
           ctx.nowTs < state.postMergeCompletionOnlyUntil)),
   });
+  const secsFromOpen =
+    ctx.nowTs !== undefined
+      ? Math.max(0, ctx.nowTs - state.market.startTs)
+      : Math.max(0, state.market.endTs - ctx.secsToClose - state.market.startTs);
+  const completionQtyPrior =
+    config.xuanCloneMode === "PUBLIC_FOOTPRINT"
+      ? resolveBundledCompletionSequencePrior(state.market.slug, secsFromOpen, sideToBuy)
+      : undefined;
+  const exactCompletionQtyPrior = completionQtyPrior?.scope === "exact" ? completionQtyPrior : undefined;
+  const phaseMaxQty =
+    exactCompletionQtyPrior && Number.isFinite(phase.maxQty)
+      ? Math.max(phase.maxQty, exactCompletionQtyPrior.qty)
+      : phase.maxQty;
   const candidateSizes = Array.from(
     new Set(
-      buildCandidateSizes(config.partialCompletionFractions, missingShares, config.completionMinQty)
+      buildCandidateSizes(
+        config.partialCompletionFractions,
+        missingShares,
+        config.completionMinQty,
+        exactCompletionQtyPrior ? [exactCompletionQtyPrior.qty] : [],
+      )
         .map((size) =>
           normalizeSize(
             Math.min(
               size,
-              Number.isFinite(phase.maxQty) ? phase.maxQty : size,
+              Number.isFinite(phaseMaxQty) ? phaseMaxQty : size,
             ),
           ),
         )
@@ -140,7 +159,7 @@ function chooseCompletion(
   ).sort((left, right) => right - left);
 
   for (const candidateSize of candidateSizes) {
-    if (candidateSize > phase.maxQty) {
+    if (candidateSize > phaseMaxQty) {
       continue;
     }
     const execution = books.quoteForSize(sideToBuy, "ask", candidateSize);
@@ -319,7 +338,12 @@ function chooseResidualUnwind(
   };
 }
 
-function buildCandidateSizes(fractions: number[], missingShares: number, minOrderSize: number): number[] {
+function buildCandidateSizes(
+  fractions: number[],
+  missingShares: number,
+  minOrderSize: number,
+  extraCandidateSizes: number[] = [],
+): number[] {
   const uniqueFractions = [...new Set([...fractions, 1])]
     .filter((fraction) => fraction > 0)
     .sort((left, right) => right - left);
@@ -330,6 +354,13 @@ function buildCandidateSizes(fractions: number[], missingShares: number, minOrde
 
   if (missingShares >= minOrderSize) {
     candidateSizes.push(normalizeSize(missingShares));
+  }
+
+  for (const extraSize of extraCandidateSizes) {
+    const normalizedExtra = normalizeSize(extraSize);
+    if (normalizedExtra >= minOrderSize) {
+      candidateSizes.push(normalizedExtra);
+    }
   }
 
   return [...new Set(candidateSizes)].sort((left, right) => right - left);

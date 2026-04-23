@@ -431,6 +431,7 @@ function resolveBundledFamilyReferences(referenceSlug: string): CanonicalReferen
 }
 
 type SeedPhase = Extract<CanonicalPhase, "ENTRY" | "OVERLAP">;
+type CompletionPhase = Extract<CanonicalPhase, "COMPLETION" | "HIGH_LOW_COMPLETION">;
 
 interface SeedSequencePrior {
   side: OutcomeSide;
@@ -443,11 +444,33 @@ interface SeedSequencePrior {
   scope: "exact" | "family";
 }
 
+export interface CompletionSequencePrior {
+  side: OutcomeSide;
+  phase: CompletionPhase;
+  sourceSlug: string;
+  anchorSec: number;
+  qty: number;
+  activeFromSec: number;
+  activeUntilSec: number;
+  cycleId: number;
+  scope: "exact" | "family";
+}
+
 export interface MergeTimingPrior {
   sourceSlug: string;
   firstMergeSec: number;
   completedCyclesBeforeMerge: number;
   forcedAgeSec: number;
+  scope: "exact" | "family";
+}
+
+export interface MergeClusterPrior {
+  sourceSlug: string;
+  anchorSec: number;
+  totalQty: number;
+  completedCyclesBeforeMerge: number;
+  activeFromSec: number;
+  activeUntilSec: number;
   scope: "exact" | "family";
 }
 
@@ -457,6 +480,17 @@ function seedEvents(reference: CanonicalReferenceExtract): Array<CanonicalSequen
       event.kind === "BUY" &&
       event.outcome !== null &&
       (event.phase === "ENTRY" || event.phase === "OVERLAP"),
+  );
+}
+
+function completionEvents(
+  reference: CanonicalReferenceExtract,
+): Array<CanonicalSequenceEvent & { outcome: OutcomeSide; phase: CompletionPhase }> {
+  return reference.orderedClipSequence.filter(
+    (event): event is CanonicalSequenceEvent & { outcome: OutcomeSide; phase: CompletionPhase } =>
+      event.kind === "BUY" &&
+      event.outcome !== null &&
+      (event.phase === "COMPLETION" || event.phase === "HIGH_LOW_COMPLETION"),
   );
 }
 
@@ -526,6 +560,75 @@ export function resolveBundledSeedSequencePrior(
   return bestPrior;
 }
 
+function resolveCompletionPriorFromReference(
+  reference: CanonicalReferenceExtract,
+  secsFromOpen: number,
+  side: OutcomeSide,
+  scope: "exact" | "family",
+): CompletionSequencePrior | undefined {
+  const events = completionEvents(reference).filter((event) => event.outcome === side);
+  if (events.length === 0) {
+    return undefined;
+  }
+
+  let bestIndex = 0;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (let index = 0; index < events.length; index += 1) {
+    const event = events[index]!;
+    const distance = Math.abs(secsFromOpen - event.tOffsetSec);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestIndex = index;
+    }
+  }
+
+  const event = events[bestIndex]!;
+  const previous = bestIndex > 0 ? events[bestIndex - 1] : undefined;
+  const next = bestIndex + 1 < events.length ? events[bestIndex + 1] : undefined;
+  const activeFromSec = previous ? Math.floor((previous.tOffsetSec + event.tOffsetSec) / 2) : 0;
+  const activeUntilSec = next ? Math.ceil((event.tOffsetSec + next.tOffsetSec) / 2) : event.tOffsetSec + 20;
+
+  return {
+    side: event.outcome,
+    phase: event.phase,
+    sourceSlug: reference.slug,
+    anchorSec: event.tOffsetSec,
+    qty: event.qty,
+    activeFromSec,
+    activeUntilSec,
+    cycleId: event.cycleId,
+    scope,
+  };
+}
+
+export function resolveBundledCompletionSequencePrior(
+  referenceSlug: string,
+  secsFromOpen: number,
+  side: OutcomeSide,
+): CompletionSequencePrior | undefined {
+  const exact = resolveBundledExactReference(referenceSlug);
+  const exactPrior = exact ? resolveCompletionPriorFromReference(exact, secsFromOpen, side, "exact") : undefined;
+  if (exactPrior && secsFromOpen >= exactPrior.activeFromSec - 1e-9 && secsFromOpen <= exactPrior.activeUntilSec + 1e-9) {
+    return exactPrior;
+  }
+
+  const familyReferences = resolveBundledFamilyReferences(referenceSlug).filter((reference) => reference.slug !== referenceSlug);
+  let bestPrior: CompletionSequencePrior | undefined;
+  for (const reference of familyReferences) {
+    const prior = resolveCompletionPriorFromReference(reference, secsFromOpen, side, "family");
+    if (!prior) {
+      continue;
+    }
+    if (secsFromOpen < prior.activeFromSec - 1e-9 || secsFromOpen > prior.activeUntilSec + 1e-9) {
+      continue;
+    }
+    if (!bestPrior || Math.abs(prior.anchorSec - secsFromOpen) < Math.abs(bestPrior.anchorSec - secsFromOpen)) {
+      bestPrior = prior;
+    }
+  }
+  return bestPrior;
+}
+
 export function resolveBundledOpenSequencePrior(
   referenceSlug: string,
 ): { side: OutcomeSide; activeUntilSec: number } | undefined {
@@ -577,6 +680,69 @@ function completedCyclesBeforeFirstMerge(reference: CanonicalReferenceExtract, f
     cycleBuys.set(event.cycleId, (cycleBuys.get(event.cycleId) ?? 0) + 1);
   }
   return [...cycleBuys.values()].filter((count) => count >= 2).length;
+}
+
+function mergeClusterPriorsFromReference(
+  reference: CanonicalReferenceExtract,
+  scope: "exact" | "family",
+): MergeClusterPrior[] {
+  const mergeEvents = reference.orderedClipSequence.filter((event) => event.kind === "MERGE");
+  if (mergeEvents.length === 0) {
+    return [];
+  }
+
+  const grouped = new Map<number, CanonicalSequenceEvent[]>();
+  for (const event of mergeEvents) {
+    const bucket = grouped.get(event.tOffsetSec) ?? [];
+    bucket.push(event);
+    grouped.set(event.tOffsetSec, bucket);
+  }
+
+  const anchors = [...grouped.keys()].sort((left, right) => left - right);
+  return anchors.map((anchorSec, index) => {
+    const previous = index > 0 ? anchors[index - 1] : undefined;
+    const next = index + 1 < anchors.length ? anchors[index + 1] : undefined;
+    const cluster = grouped.get(anchorSec) ?? [];
+    const totalQty = Number(cluster.reduce((sum, event) => sum + event.qty, 0).toFixed(6));
+    return {
+      sourceSlug: reference.slug,
+      anchorSec,
+      totalQty,
+      completedCyclesBeforeMerge: completedCyclesBeforeFirstMerge(reference, anchorSec),
+      activeFromSec: previous !== undefined ? Math.floor((previous + anchorSec) / 2) : anchorSec,
+      activeUntilSec: next !== undefined ? Math.ceil((anchorSec + next) / 2) : anchorSec + 60,
+      scope,
+    };
+  });
+}
+
+export function resolveBundledMergeClusterPrior(
+  referenceSlug: string,
+  secsFromOpen: number,
+): MergeClusterPrior | undefined {
+  const exact = resolveBundledExactReference(referenceSlug);
+  const exactClusters = exact ? mergeClusterPriorsFromReference(exact, "exact") : [];
+  const exactPrior = exactClusters.find(
+    (prior) => secsFromOpen >= prior.activeFromSec - 1e-9 && secsFromOpen <= prior.activeUntilSec + 1e-9,
+  );
+  if (exactPrior) {
+    return exactPrior;
+  }
+
+  const familyReferences = resolveBundledFamilyReferences(referenceSlug).filter((reference) => reference.slug !== referenceSlug);
+  let bestPrior: MergeClusterPrior | undefined;
+  for (const reference of familyReferences) {
+    const prior = mergeClusterPriorsFromReference(reference, "family").find(
+      (candidate) => secsFromOpen >= candidate.activeFromSec - 1e-9 && secsFromOpen <= candidate.activeUntilSec + 1e-9,
+    );
+    if (!prior) {
+      continue;
+    }
+    if (!bestPrior || Math.abs(prior.anchorSec - secsFromOpen) < Math.abs(bestPrior.anchorSec - secsFromOpen)) {
+      bestPrior = prior;
+    }
+  }
+  return bestPrior;
 }
 
 export function resolveBundledMergeTimingPrior(referenceSlug: string): MergeTimingPrior | undefined {

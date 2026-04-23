@@ -19,6 +19,7 @@ import { OrderBookState } from "./orderBookState.js";
 import type { StrategyExecutionMode } from "./executionModes.js";
 import { buildTakerBuyOrder } from "./marketOrderBuilder.js";
 import {
+  resolveBundledCompletionSequencePrior,
   resolveBundledLateCheapGuardSec,
   resolveBundledOpenSequencePrior,
   resolveBundledSeedSequencePrior,
@@ -369,8 +370,13 @@ export function evaluateEntryBuys(
       return overlapSeedEvaluation;
     }
   }
+  const completionQtyPrior =
+    config.xuanCloneMode === "PUBLIC_FOOTPRINT"
+      ? resolveBundledCompletionSequencePrior(state.market.slug, ctx.secsFromOpen, laggingSide)
+      : undefined;
+  const exactCompletionQtyPrior = completionQtyPrior?.scope === "exact" ? completionQtyPrior : undefined;
   const repairRequestedQty = Math.min(
-    Math.max(ctx.lot, shareGap),
+    exactCompletionQtyPrior?.qty ?? Math.max(ctx.lot, shareGap),
     ctx.lot * config.rebalanceMaxLaggingMultiplier,
     Math.max(0, config.maxMarketSharesPerSide - (laggingSide === "UP" ? state.upShares : state.downShares)),
     Math.max(0, config.maxOneSidedExposureShares),
@@ -379,8 +385,9 @@ export function evaluateEntryBuys(
     config.completionQtyMode === "ALLOW_OVERSHOOT"
       ? shareGap + config.maxCompletionOvershootShares
       : shareGap;
+  const repairEffectiveQtyCap = exactCompletionQtyPrior ? Math.max(repairQtyCap, exactCompletionQtyPrior.qty) : repairQtyCap;
   const repairSize = normalizeOrderSize(
-    Math.min(repairRequestedQty, repairQtyCap),
+    Math.min(repairRequestedQty, repairEffectiveQtyCap),
     config.repairMinQty,
   );
   const trace: EntryDecisionTrace = {
@@ -425,8 +432,12 @@ export function evaluateEntryBuys(
     partialAgeSec <= config.temporalRepairUltraFastWindowSec
       ? Math.max(phase.cap, config.temporalRepairUltraFastCap)
       : phase.cap;
+  const phaseMaxQty =
+    exactCompletionQtyPrior && Number.isFinite(phase.maxQty)
+      ? Math.max(phase.maxQty, exactCompletionQtyPrior.qty)
+      : phase.maxQty;
   const phasedRepairSize = normalizeOrderSize(
-    Math.min(repairSize, Number.isFinite(phase.maxQty) ? phase.maxQty : repairSize),
+    Math.min(repairSize, Number.isFinite(phaseMaxQty) ? phaseMaxQty : repairSize),
     config.repairMinQty,
   );
   if (phasedRepairSize <= 0) {
@@ -483,7 +494,7 @@ export function evaluateEntryBuys(
     partialAgeSec,
   });
   const highLowPhaseCapOverride = Boolean(allowance.highLowMismatch && allowance.allowed);
-  if ((repairCost > phaseCap && !highLowPhaseCapOverride) || executableSize > phase.maxQty) {
+  if ((repairCost > phaseCap && !highLowPhaseCapOverride) || executableSize > phaseMaxQty) {
     return withCloneOverlapFallback({
       decisions: [],
       trace: {
@@ -498,7 +509,7 @@ export function evaluateEntryBuys(
         repairWouldIncreaseImbalance: wouldIncreaseImbalance,
         repairOppositeAveragePrice: oppositeAveragePrice,
         repairHighLowMismatch: allowance.highLowMismatch ?? false,
-        skipReason: executableSize > phase.maxQty ? "repair_phase_qty_cap" : "repair_phase_cap",
+        skipReason: executableSize > phaseMaxQty ? "repair_phase_qty_cap" : "repair_phase_cap",
       },
     });
   }

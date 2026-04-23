@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { parseEnv } from "../../src/config/env.js";
 import { buildStrategyConfig } from "../../src/config/strategyPresets.js";
 import { buildOfflineMarket } from "../../src/infra/gamma/marketDiscovery.js";
+import { resolveBundledMergeClusterPrior } from "../../src/analytics/xuanExactReference.js";
 import { createMarketState } from "../../src/strategy/xuan5m/marketState.js";
 import {
   createMergeBatchTracker,
@@ -168,5 +169,43 @@ describe("merge coordinator", () => {
     expect(gate.forced).toBe(false);
     expect(gate.reason).toBe("cycle_target");
     expect(gate.completedCycles).toBe(5);
+  });
+
+  it("uses the exact 1776253500 first merge cluster timing and qty envelope", () => {
+    const config = buildConfig({
+      BOT_MODE: "XUAN",
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+    });
+    const market = buildOfflineMarket(1776253500);
+    const state = createMarketState(market);
+    let tracker = createMergeBatchTracker();
+    tracker = syncMergeBatchTracker(tracker, 127.05792, market.startTs + 6);
+    tracker = syncMergeBatchTracker(tracker, 214.23151, market.startTs + 20);
+    tracker = syncMergeBatchTracker(tracker, 341.31645, market.startTs + 42);
+    tracker = syncMergeBatchTracker(tracker, 427.9023, market.startTs + 60);
+    tracker = syncMergeBatchTracker(tracker, 513.83511, market.startTs + 70);
+
+    const prior = resolveBundledMergeClusterPrior(market.slug, 76);
+    const shieldedGate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 75,
+      secsFromOpen: 75,
+      secsToClose: 225,
+      usdcBalance: 100,
+      tracker,
+    });
+    const releasedGate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 76,
+      secsFromOpen: 76,
+      secsToClose: 224,
+      usdcBalance: 100,
+      tracker,
+    });
+
+    expect(prior?.totalQty).toBeCloseTo(513.83511, 5);
+    expect(shieldedGate.allow).toBe(false);
+    expect(shieldedGate.reason).toBe("entry_shield");
+    expect(releasedGate.allow).toBe(true);
+    expect(releasedGate.reason).toBe("cycle_target");
+    expect(releasedGate.pendingMatchedQty).toBeCloseTo(513.83511, 5);
   });
 });

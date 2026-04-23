@@ -39,6 +39,7 @@ import {
   syncMergeBatchTracker,
 } from "../strategy/xuan5m/mergeCoordinator.js";
 import { estimateNegativeEdgeUsdc } from "../strategy/xuan5m/modePolicy.js";
+import { resolveBundledMergeClusterPrior } from "../analytics/xuanExactReference.js";
 import { resolveConfiguredFunderAddress } from "./topology.js";
 import { isClassifiedBuyMode, type StrategyExecutionMode } from "../strategy/xuan5m/executionModes.js";
 import type { EntryBuyDecision } from "../strategy/xuan5m/entryLadderEngine.js";
@@ -2246,7 +2247,12 @@ export async function runStatefulBotSession(
           usdcBalance: cachedUsdcBalance,
           tracker: mergeBatchTracker,
         });
-        const mergeAmount = normalizeMergeAmount(mergeableUnlocked, config.mergeDustLeaveShares);
+        const mergeClusterPrior =
+          config.xuanCloneMode === "PUBLIC_FOOTPRINT"
+            ? resolveBundledMergeClusterPrior(market.slug, nowTs - market.startTs)
+            : undefined;
+        const mergeTargetQty = mergeClusterPrior ? Math.min(mergeableUnlocked, mergeClusterPrior.totalQty) : mergeableUnlocked;
+        const mergeAmount = normalizeMergeAmount(mergeTargetQty, config.mergeDustLeaveShares);
         const mergeAllowed =
           mergePlan.shouldMerge &&
           mergeGate.allow &&

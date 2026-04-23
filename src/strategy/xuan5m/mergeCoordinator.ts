@@ -133,13 +133,18 @@ export function evaluateDelayedMergeGate(
   const timingPrior =
     config.xuanCloneMode === "PUBLIC_FOOTPRINT" ? resolveBundledMergeTimingPrior(state.market.slug) : undefined;
   const mergeShieldSecFromOpen = timingPrior
-    ? Math.max(0, Math.min(config.mergeShieldSecFromOpen, timingPrior.firstMergeSec - 1))
+    ? Math.max(
+        config.mergeShieldSecFromOpen,
+        timingPrior.scope === "exact" ? timingPrior.firstMergeSec : Math.max(0, timingPrior.firstMergeSec - 1),
+      )
     : config.mergeShieldSecFromOpen;
   const minCompletedCyclesBeforeFirstMerge = timingPrior
     ? Math.max(config.minCompletedCyclesBeforeFirstMerge, timingPrior.completedCyclesBeforeMerge)
     : config.minCompletedCyclesBeforeFirstMerge;
   const minFirstMatchedAgeBeforeMergeSec = timingPrior
-    ? Math.min(config.minFirstMatchedAgeBeforeMergeSec, timingPrior.firstMergeSec)
+    ? timingPrior.scope === "exact"
+      ? Math.max(config.minFirstMatchedAgeBeforeMergeSec, timingPrior.firstMergeSec)
+      : Math.min(config.minFirstMatchedAgeBeforeMergeSec, timingPrior.firstMergeSec)
     : config.minFirstMatchedAgeBeforeMergeSec;
   const maxMatchedAgeBeforeForcedMergeSec = timingPrior
     ? Math.min(config.maxMatchedAgeBeforeForcedMergeSec, timingPrior.forcedAgeSec)

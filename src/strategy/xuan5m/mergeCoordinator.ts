@@ -1,7 +1,7 @@
 import type { XuanStrategyConfig } from "../../config/strategyPresets.js";
 import { imbalance, mergeableShares } from "./inventoryState.js";
 import type { XuanMarketState } from "./marketState.js";
-import { resolveBundledMergeTimingPrior } from "../../analytics/xuanExactReference.js";
+import { resolveBundledMergeClusterPrior, resolveBundledMergeTimingPrior } from "../../analytics/xuanExactReference.js";
 
 export interface MergePlan {
   mergeable: number;
@@ -31,6 +31,7 @@ export interface MergeGateDecision extends MergeBatchMetrics {
     | "disabled"
     | "not_ready"
     | "entry_shield"
+    | "cluster_window"
     | "cycle_target"
     | "age_target"
     | "forced_age"
@@ -132,6 +133,10 @@ export function evaluateDelayedMergeGate(
   const metrics = mergeBatchMetrics(args.tracker, args.nowTs);
   const timingPrior =
     config.xuanCloneMode === "PUBLIC_FOOTPRINT" ? resolveBundledMergeTimingPrior(state.market.slug) : undefined;
+  const mergeClusterPrior =
+    config.xuanCloneMode === "PUBLIC_FOOTPRINT" && args.secsFromOpen !== undefined
+      ? resolveBundledMergeClusterPrior(state.market.slug, args.secsFromOpen)
+      : undefined;
   const mergeShieldSecFromOpen = timingPrior
     ? Math.max(
         config.mergeShieldSecFromOpen,
@@ -212,6 +217,18 @@ export function evaluateDelayedMergeGate(
       allow: false,
       forced: false,
       reason: "entry_shield",
+      ...metrics,
+    };
+  }
+
+  if (
+    mergeClusterPrior?.scope === "exact" &&
+    (args.secsFromOpen ?? Number.POSITIVE_INFINITY) < mergeClusterPrior.anchorSec
+  ) {
+    return {
+      allow: false,
+      forced: false,
+      reason: "cluster_window",
       ...metrics,
     };
   }

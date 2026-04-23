@@ -3321,7 +3321,14 @@ export async function runStatefulBotSession(
   const closingMergeableUnlocked = config.mergeOnlyConfirmedMatchedUnlockedLots
     ? unlockedMergeableShares(state, closingLockedPendingShares)
     : closingMergePlan.mergeable;
-  const closingMergeAmount = normalizeMergeAmount(closingMergeableUnlocked, config.mergeDustLeaveShares);
+  const closingMergeClusterPrior =
+    config.xuanCloneMode === "PUBLIC_FOOTPRINT"
+      ? resolveBundledMergeClusterPrior(market.slug, endedAt - market.startTs)
+      : undefined;
+  const closingMergeTargetQty = closingMergeClusterPrior
+    ? Math.min(closingMergeableUnlocked, closingMergeClusterPrior.totalQty)
+    : closingMergeableUnlocked;
+  const closingMergeAmount = normalizeMergeAmount(closingMergeTargetQty, config.mergeDustLeaveShares);
   if (
     config.mergeMode === "AUTO" &&
     config.mergeOnMarketClose &&

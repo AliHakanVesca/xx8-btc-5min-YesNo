@@ -33,6 +33,9 @@ export interface ComparatorBreakdown {
   sideSequenceScore: number;
   overlapFamilyScore: number;
   phaseFamilyScore: number;
+  eventQtyScore: number;
+  mergeClusterQtyScore: number;
+  redeemClusterQtyScore: number;
 }
 
 export interface CanonicalComparisonResult {
@@ -56,6 +59,9 @@ export interface CanonicalComparisonResult {
     sideSequenceMismatchCount: number;
     overlapFamilySimilarity: number;
     phaseFamilySimilarity: number;
+    eventQtySimilarity: number;
+    mergeClusterQtySimilarity: number;
+    redeemClusterQtySimilarity: number;
   };
 }
 
@@ -209,6 +215,45 @@ function phaseFamilySimilarity(reference: CanonicalReferenceExtract, candidate: 
   return longestCommonSubsequenceLength(left, right) / Math.max(left.length, right.length);
 }
 
+function sequenceQtySimilarity(
+  left: number[],
+  right: number[],
+): number {
+  const maxLength = Math.max(left.length, right.length);
+  if (maxLength === 0) return 1;
+  let score = 0;
+  for (let index = 0; index < maxLength; index += 1) {
+    score += boundedRatioSimilarity(left[index] ?? 0, right[index] ?? 0);
+  }
+  return score / maxLength;
+}
+
+function buyEventQtySimilarity(reference: CanonicalReferenceExtract, candidate: CanonicalReferenceExtract): number {
+  const left = reference.orderedClipSequence.filter((event) => event.kind === "BUY").map((event) => event.qty);
+  const right = candidate.orderedClipSequence.filter((event) => event.kind === "BUY").map((event) => event.qty);
+  return sequenceQtySimilarity(left, right);
+}
+
+function clusterQtySimilarity(
+  reference: CanonicalReferenceExtract,
+  candidate: CanonicalReferenceExtract,
+  kind: "MERGE" | "REDEEM",
+): number {
+  const group = (extract: CanonicalReferenceExtract) => {
+    const grouped = new Map<number, number>();
+    for (const event of extract.orderedClipSequence) {
+      if (event.kind !== kind) {
+        continue;
+      }
+      grouped.set(event.tOffsetSec, (grouped.get(event.tOffsetSec) ?? 0) + event.qty);
+    }
+    return [...grouped.entries()]
+      .sort((left, right) => left[0] - right[0])
+      .map(([, qty]) => Number(qty.toFixed(6)));
+  };
+  return sequenceQtySimilarity(group(reference), group(candidate));
+}
+
 function numericDeltaScore(reference: number, candidate: number, exactWeight = 1, offByOneWeight = 0.75): number {
   const delta = Math.abs(reference - candidate);
   if (delta === 0) return exactWeight;
@@ -243,6 +288,9 @@ export function compareCanonicalReference(
   const sideSequence = sideSequenceComparison(reference, candidate);
   const overlapFamily = overlapSimilarity(reference, candidate);
   const phaseFamily = phaseFamilySimilarity(reference, candidate);
+  const eventQty = buyEventQtySimilarity(reference, candidate);
+  const mergeClusterQty = clusterQtySimilarity(reference, candidate, "MERGE");
+  const redeemClusterQty = clusterQtySimilarity(reference, candidate, "REDEEM");
 
   const correctnessScore =
     cycleCountScore * 15 +
@@ -253,11 +301,14 @@ export function compareCanonicalReference(
     residualBucketScore * 10;
 
   const familyScore =
-    clipBucketSimilarity * 20 +
-    alternationSimilarity * 5 +
-    sideSequence.similarity * 5 +
-    overlapFamily * 5 +
-    phaseFamily * 5;
+    clipBucketSimilarity * 8 +
+    alternationSimilarity * 4 +
+    sideSequence.similarity * 4 +
+    overlapFamily * 4 +
+    phaseFamily * 4 +
+    eventQty * 8 +
+    mergeClusterQty * 4 +
+    redeemClusterQty * 4;
 
   const score = Math.round((correctnessScore + familyScore) * 100) / 100;
 
@@ -291,6 +342,9 @@ export function compareCanonicalReference(
       sideSequenceScore: sideSequence.similarity,
       overlapFamilyScore: overlapFamily,
       phaseFamilyScore: phaseFamily,
+      eventQtyScore: eventQty,
+      mergeClusterQtyScore: mergeClusterQty,
+      redeemClusterQtyScore: redeemClusterQty,
     },
     details: {
       referenceSlug: reference.slug,
@@ -307,6 +361,9 @@ export function compareCanonicalReference(
       sideSequenceMismatchCount: sideSequence.mismatchCount,
       overlapFamilySimilarity: overlapFamily,
       phaseFamilySimilarity: phaseFamily,
+      eventQtySimilarity: eventQty,
+      mergeClusterQtySimilarity: mergeClusterQty,
+      redeemClusterQtySimilarity: redeemClusterQty,
     },
   };
 }

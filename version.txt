@@ -1,6 +1,16 @@
 
 ##############################################
 
+Version : V.0.0.20
+Date    : 23.04.2026
+Author  : Ali Hakan Çakır
+Changes : - Comparator'a event qty ve merge cluster benzerlik agirliklari eklendi.
+          - Exact merge cluster penceresi live merge gate akisina baglandi.
+
+##############################################
+
+##############################################
+
 Version : V.0.0.19
 Date    : 23.04.2026
 Author  : Ali Hakan Çakır

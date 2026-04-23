@@ -208,4 +208,35 @@ describe("merge coordinator", () => {
     expect(releasedGate.reason).toBe("cycle_target");
     expect(releasedGate.pendingMatchedQty).toBeCloseTo(513.83511, 5);
   });
+
+  it("keeps the exact 1776253500 second merge cluster closed until the canonical late window", () => {
+    const config = buildConfig({
+      BOT_MODE: "XUAN",
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+    });
+    const market = buildOfflineMarket(1776253500);
+    const state = createMarketState(market);
+    let tracker = createMergeBatchTracker();
+    tracker = syncMergeBatchTracker(tracker, 85.27977, market.startTs + 88);
+
+    const earlyGate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 200,
+      secsFromOpen: 200,
+      secsToClose: 100,
+      usdcBalance: 100,
+      tracker,
+    });
+    const canonicalGate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 276,
+      secsFromOpen: 276,
+      secsToClose: 24,
+      usdcBalance: 100,
+      tracker,
+    });
+
+    expect(earlyGate.allow).toBe(false);
+    expect(earlyGate.reason).toBe("cluster_window");
+    expect(canonicalGate.allow).toBe(true);
+    expect(canonicalGate.reason).toBe("final_window");
+  });
 });

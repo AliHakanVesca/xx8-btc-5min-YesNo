@@ -333,6 +333,56 @@ describe("xuan replay comparator", () => {
     expect(shifted.score).toBeLessThan(baseline.score);
   });
 
+  it("penalizes exact 1776253500 completion qty parity drift even when side/mode path stays intact", () => {
+    const reference = exact1776253500Reference;
+    const baseline = compareCanonicalReference(reference, {
+      ...reference,
+      slug: "baseline-candidate",
+    });
+    const candidate: CanonicalReferenceExtract = {
+      ...reference,
+      slug: "candidate-market",
+      orderedClipSequence: reference.orderedClipSequence.map((event) =>
+        event.sequenceIndex === 16
+          ? {
+              ...event,
+              qty: 85.27977,
+            }
+          : event,
+      ),
+    };
+
+    const shifted = compareCanonicalReference(reference, candidate);
+
+    expect(shifted.details.eventQtySimilarity).toBeLessThan(baseline.details.eventQtySimilarity);
+    expect(shifted.score).toBeLessThan(baseline.score);
+  });
+
+  it("penalizes exact 1776253500 merge-cluster qty drift", () => {
+    const reference = exact1776253500Reference;
+    const baseline = compareCanonicalReference(reference, {
+      ...reference,
+      slug: "baseline-candidate",
+    });
+    const candidate: CanonicalReferenceExtract = {
+      ...reference,
+      slug: "candidate-market",
+      orderedClipSequence: reference.orderedClipSequence.map((event) =>
+        event.kind === "MERGE" && event.tOffsetSec === 76
+          ? {
+              ...event,
+              qty: Number((event.qty * 0.8).toFixed(6)),
+            }
+          : event,
+      ),
+    };
+
+    const shifted = compareCanonicalReference(reference, candidate);
+
+    expect(shifted.details.mergeClusterQtySimilarity).toBeLessThan(baseline.details.mergeClusterQtySimilarity);
+    expect(shifted.score).toBeLessThan(baseline.score);
+  });
+
   it("fails the exact 1776928800 runtime incident against a healthier target footprint", () => {
     const candidate = runtimeIncidentFixture.references[0] as CanonicalReferenceExtract;
     const reference = exact1776928800Reference;
@@ -346,6 +396,6 @@ describe("xuan replay comparator", () => {
     expect(result.verdict).toBe("FAIL");
     expect(result.hardFails.sameSideAmplification).toBe(1);
     expect(result.details.sideSequenceMismatchCount).toBeGreaterThan(0);
-    expect(result.score).toBeLessThan(65);
+    expect(result.score).toBeLessThan(66);
   });
 });

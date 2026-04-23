@@ -142,6 +142,7 @@ export interface XuanStrategyConfig {
   temporalRepairEmergencyCap: number;
   temporalRepairUltraFastWindowSec: number;
   temporalRepairUltraFastCap: number;
+  temporalRepairUltraFastMissingFairValueCap: number;
   partialSoftMaxQty: number;
   partialHardMaxQty: number;
   partialEmergencyMaxQty: number;
@@ -168,6 +169,7 @@ export interface XuanStrategyConfig {
   reentryDelayMs: number;
   cloneChildPreferredShares: number;
   cloneChildOrderDelayMs: number;
+  cloneStaleCheapOppositeQuoteMinAgeSec: number;
   partialCompletionFractions: number[];
   maxResidualHoldShares: number;
   residualUnwindSecToClose: number;
@@ -402,6 +404,7 @@ export function buildStrategyConfig(env: AppEnv): XuanStrategyConfig {
     temporalRepairEmergencyCap: env.PARTIAL_EMERGENCY_CAP,
     temporalRepairUltraFastWindowSec: 0,
     temporalRepairUltraFastCap: env.PARTIAL_FAST_CAP,
+    temporalRepairUltraFastMissingFairValueCap: env.PARTIAL_FAST_CAP,
     partialSoftMaxQty: env.PARTIAL_SOFT_MAX_QTY,
     partialHardMaxQty: env.PARTIAL_HARD_MAX_QTY,
     partialEmergencyMaxQty: env.PARTIAL_EMERGENCY_MAX_QTY,
@@ -429,6 +432,7 @@ export function buildStrategyConfig(env: AppEnv): XuanStrategyConfig {
     reentryDelayMs: 1000,
     cloneChildPreferredShares: 25,
     cloneChildOrderDelayMs: 0,
+    cloneStaleCheapOppositeQuoteMinAgeSec: 75,
     partialCompletionFractions: env.PARTIAL_COMPLETION_FRACTIONS,
     maxResidualHoldShares: env.MAX_RESIDUAL_HOLD_SHARES,
     residualUnwindSecToClose: env.RESIDUAL_UNWIND_SEC_TO_CLOSE,
@@ -576,6 +580,10 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     temporalRepairEmergencyCap: Math.max(config.temporalRepairEmergencyCap, elevatedBehaviorCap),
     temporalRepairUltraFastWindowSec: Math.max(config.temporalRepairUltraFastWindowSec, 8),
     temporalRepairUltraFastCap: Math.max(config.temporalRepairUltraFastCap, 1.065),
+    temporalRepairUltraFastMissingFairValueCap: Math.max(
+      config.temporalRepairUltraFastMissingFairValueCap,
+      1.075,
+    ),
     partialSoftMaxQty: Math.max(config.partialSoftMaxQty, maxLadderLot),
     partialHardMaxQty: Math.max(config.partialHardMaxQty, maxLadderLot),
     partialEmergencyMaxQty: Math.max(config.partialEmergencyMaxQty, maxLadderLot),
@@ -595,6 +603,7 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     xuanBehaviorCap: elevatedBehaviorCap,
     cloneChildPreferredShares: Math.min(config.cloneChildPreferredShares, 20),
     cloneChildOrderDelayMs: Math.max(config.cloneChildOrderDelayMs, 120),
+    cloneStaleCheapOppositeQuoteMinAgeSec: Math.min(config.cloneStaleCheapOppositeQuoteMinAgeSec, 75),
     mergeBatchMode: "HYBRID_DELAYED",
     minCompletedCyclesBeforeFirstMerge: Math.max(config.minCompletedCyclesBeforeFirstMerge, 4),
     minFirstMatchedAgeBeforeMergeSec: Math.max(config.minFirstMatchedAgeBeforeMergeSec, 90),

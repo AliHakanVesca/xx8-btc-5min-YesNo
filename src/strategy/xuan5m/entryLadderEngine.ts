@@ -18,7 +18,11 @@ import {
 import { OrderBookState } from "./orderBookState.js";
 import type { StrategyExecutionMode } from "./executionModes.js";
 import { buildTakerBuyOrder } from "./marketOrderBuilder.js";
-import { fairValueGate, type FairValueSnapshot } from "./fairValueEngine.js";
+import {
+  fairValueGate,
+  isCloneRepairFairValueFallbackSnapshot,
+  type FairValueSnapshot,
+} from "./fairValueEngine.js";
 
 export type EntryBuyReason =
   | "balanced_pair_seed"
@@ -185,6 +189,7 @@ export function evaluateEntryBuys(
       state,
       books,
       ctx.lot,
+      ctx.secsFromOpen,
       pairCap,
       ctx.secsToClose,
       dailyNegativeEdgeSpentUsdc,
@@ -277,15 +282,16 @@ export function evaluateEntryBuys(
     config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
     (ctx.protectedResidualShares ?? 0) > 0;
   const overlapInspection = ctx.allowControlledOverlap
-    ? inspectBalancedPairCandidates(
-        config,
-        state,
-        books,
-        ctx.lot,
-        pairCap,
-        ctx.secsToClose,
-        dailyNegativeEdgeSpentUsdc,
-        ctx.fairValueSnapshot,
+      ? inspectBalancedPairCandidates(
+          config,
+          state,
+          books,
+          ctx.lot,
+          ctx.secsFromOpen,
+          pairCap,
+          ctx.secsToClose,
+          dailyNegativeEdgeSpentUsdc,
+          ctx.fairValueSnapshot,
       )
     : undefined;
   const overlapTemporalSeed =
@@ -469,6 +475,7 @@ export function evaluateEntryBuys(
     candidateSize: executableSize,
     oppositeAveragePrice,
     missingSidePrice: execution.averagePrice,
+    partialAgeSec,
   });
   const highLowPhaseCapOverride = Boolean(allowance.highLowMismatch && allowance.allowed);
   if ((repairCost > phaseCap && !highLowPhaseCapOverride) || executableSize > phase.maxQty) {
@@ -490,23 +497,33 @@ export function evaluateEntryBuys(
       },
     });
   }
+  const ultraFastCloneFairValueFallback =
+    config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
+    partialAgeSec <= config.temporalRepairUltraFastWindowSec &&
+    isCloneRepairFairValueFallbackSnapshot(ctx.fairValueSnapshot) &&
+    repairCost <= config.temporalRepairUltraFastMissingFairValueCap &&
+    allowance.allowed;
   const fairValueRequired =
-    allowance.highLowMismatch && allowance.allowed && !allowance.requiresFairValue
+    ultraFastCloneFairValueFallback
       ? false
-      : !(
-          config.allowStrictResidualCompletionWithoutFairValue &&
-          repairCost <= config.strictResidualCompletionCap
-        ) || Boolean(allowance.requiresFairValue);
-  const fairValueDecision = fairValueGate({
-    config,
-    snapshot: ctx.fairValueSnapshot,
-    side: laggingSide,
-    sidePrice: execution.averagePrice,
-    mode: phase.mode === "PARTIAL_EMERGENCY_COMPLETION" ? "emergency" : "completion",
-    secsToClose: ctx.secsToClose,
-    effectiveCost: repairCost,
-    required: fairValueRequired,
-  });
+      : allowance.highLowMismatch && allowance.allowed && !allowance.requiresFairValue
+        ? false
+        : !(
+            config.allowStrictResidualCompletionWithoutFairValue &&
+            repairCost <= config.strictResidualCompletionCap
+          ) || Boolean(allowance.requiresFairValue);
+  const fairValueDecision = ultraFastCloneFairValueFallback
+    ? { allowed: true as const }
+    : fairValueGate({
+        config,
+        snapshot: ctx.fairValueSnapshot,
+        side: laggingSide,
+        sidePrice: execution.averagePrice,
+        mode: phase.mode === "PARTIAL_EMERGENCY_COMPLETION" ? "emergency" : "completion",
+        secsToClose: ctx.secsToClose,
+        effectiveCost: repairCost,
+        required: fairValueRequired,
+      });
   const repairMode: StrategyExecutionMode =
     allowance.highLowMismatch && allowance.allowed ? "HIGH_LOW_COMPLETION_CHASE" : phase.mode;
   const detailedTrace: EntryDecisionTrace = {
@@ -573,6 +590,33 @@ function fairValueForOrphanSide(snapshot: FairValueSnapshot | undefined, side: O
     return undefined;
   }
   return side === "UP" ? snapshot.fairUp : snapshot.fairDown;
+}
+
+function shouldBlockCloneStaleCheapOppositeQuote(args: {
+  config: XuanStrategyConfig;
+  snapshot: FairValueSnapshot | undefined;
+  secsFromOpen: number;
+  upPrice: number;
+  downPrice: number;
+  pairCost: number;
+}): boolean {
+  if (args.config.xuanCloneMode !== "PUBLIC_FOOTPRINT") {
+    return false;
+  }
+  if (!args.snapshot || args.snapshot.status === "valid" || args.snapshot.status === "disabled") {
+    return false;
+  }
+  if (args.secsFromOpen < args.config.cloneStaleCheapOppositeQuoteMinAgeSec) {
+    return false;
+  }
+
+  const lowSidePrice = Math.min(args.upPrice, args.downPrice);
+  const highSidePrice = Math.max(args.upPrice, args.downPrice);
+  return (
+    args.pairCost > args.config.pairSweepStrictCap + 1e-9 &&
+    lowSidePrice <= args.config.lowSideMaxForHighCompletion + 1e-9 &&
+    highSidePrice >= args.config.highSidePriceThreshold - 0.02
+  );
 }
 
 function currentOrphanNotionalUsdc(state: XuanMarketState): number {
@@ -708,6 +752,9 @@ function scoreTemporalSeedCycle(args: {
   const depthRatio = args.candidateSize > 0 ? args.executableSize / args.candidateSize : 0;
   const orphanPenalty = orphanRiskSortValue(args.orphanRisk);
   const sequenceBias = recentTemporalSequenceBias(args.state, args.side);
+  const sequenceBiasBoost =
+    (args.state.upShares + args.state.downShares <= 1e-6 ? 1.25 : 1) *
+    (args.fairValueSnapshot?.status === "valid" || args.fairValueSnapshot?.status === "disabled" ? 1 : 1.15);
 
   return Number(
     (
@@ -716,7 +763,7 @@ function scoreTemporalSeedCycle(args: {
       behaviorRoom * args.config.temporalSeedBehaviorRoomWeight +
       args.oppositeCoverageRatio * args.config.temporalSeedOppositeCoverageWeight +
       depthRatio * args.config.temporalSeedDepthWeight +
-      sequenceBias * args.config.temporalSeedSequenceBiasWeight -
+      sequenceBias * args.config.temporalSeedSequenceBiasWeight * sequenceBiasBoost -
       orphanPenalty * args.config.temporalSeedOrphanPenaltyWeight
     ).toFixed(6),
   );
@@ -919,6 +966,7 @@ function inspectBalancedPairCandidates(
   state: XuanMarketState,
   books: OrderBookState,
   requestedMaxLot: number,
+  secsFromOpen: number,
   cap: number,
   secsToClose: number,
   dailyNegativeEdgeSpentUsdc: number,
@@ -1012,6 +1060,18 @@ function inspectBalancedPairCandidates(
         pairCost,
         [upFairValue.reason, downFairValue.reason].filter((reason): reason is string => Boolean(reason)),
       );
+    const staleCheapOppositeQuote =
+      allowance !== undefined &&
+      allowance.allowed &&
+      allowance.mode !== "STRICT_PAIR_SWEEP" &&
+      shouldBlockCloneStaleCheapOppositeQuote({
+        config,
+        snapshot: fairValueSnapshot,
+        secsFromOpen,
+        upPrice: upExecution.averagePrice,
+        downPrice: downExecution.averagePrice,
+        pairCost,
+      });
     const upOrphanRisk = evaluateOrphanRisk({
       config,
       state,
@@ -1034,14 +1094,16 @@ function inspectBalancedPairCandidates(
         ? "up_depth"
         : !downExecution.fullyFilled
           ? "down_depth"
-          : allowance?.allowed && fairValueAllowed && orphanRiskAllowed
+          : allowance?.allowed && fairValueAllowed && !staleCheapOppositeQuote && orphanRiskAllowed
             ? "ok"
-            : allowance?.allowed && fairValueAllowed && !orphanRiskAllowed
+            : allowance?.allowed && fairValueAllowed && !staleCheapOppositeQuote && !orphanRiskAllowed
               ? "orphan_risk"
               : "pair_cap";
     const gateReason =
       verdict === "pair_cap"
-        ? fairValueAllowed
+        ? staleCheapOppositeQuote
+          ? "pair_stale_cheap_quote"
+          : fairValueAllowed
           ? describePairGate(config, pairCost, requestedSize, allowance, secsToClose, cap)
           : upFairValue.reason ?? downFairValue.reason ?? "pair_fair_value"
         : verdict === "orphan_risk"

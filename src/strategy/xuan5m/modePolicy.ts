@@ -227,6 +227,7 @@ export function completionAllowance(
     candidateSize: number;
     oppositeAveragePrice: number;
     missingSidePrice: number;
+    partialAgeSec?: number;
   },
 ): CompletionAllowance {
   const strictResidualCap = Math.min(config.completionStrictCap, config.strictResidualCompletionCap);
@@ -235,10 +236,19 @@ export function completionAllowance(
   const imbalanceShares = Math.abs(state.upShares - state.downShares);
   const imbalanceRatio = imbalanceShares / Math.max(state.upShares + state.downShares, 1);
   const projectedBudget = state.negativeCompletionEdgeConsumedUsdc + negativeEdgeUsdc;
+  const priceSpikeDelta = args.missingSidePrice - args.oppositeAveragePrice;
+  const priceSpikeRatio = args.missingSidePrice / Math.max(args.oppositeAveragePrice, 0.01);
+  const cloneSpikeMismatch =
+    config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
+    (args.partialAgeSec ?? 0) >= Math.max(10, config.partialFastWindowSec) &&
+    args.missingSidePrice >= config.highSidePriceThreshold - 0.02 &&
+    priceSpikeDelta >= 0.45 &&
+    priceSpikeRatio >= 2.25;
   const highLowMismatch =
     (config.requireStrictCapForHighLowMismatch || config.xuanCloneMode === "PUBLIC_FOOTPRINT") &&
-    args.missingSidePrice >= config.highSidePriceThreshold &&
-    args.oppositeAveragePrice <= config.lowSideMaxForHighCompletion;
+    ((args.missingSidePrice >= config.highSidePriceThreshold &&
+      args.oppositeAveragePrice <= config.lowSideMaxForHighCompletion) ||
+      cloneSpikeMismatch);
 
   if (config.botMode === "STRICT") {
     return {

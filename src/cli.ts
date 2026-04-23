@@ -16,6 +16,7 @@ import {
   loadCanonicalReferenceBundleFile,
   writeCanonicalReferenceBundle,
 } from "./analytics/xuanCanonicalReference.js";
+import { resolveBundledExactReferenceBundle } from "./analytics/xuanExactReference.js";
 import { compareCanonicalReference } from "./analytics/xuanReplayComparator.js";
 import {
   buildRuntimeCanonicalExtractBundle,
@@ -104,6 +105,12 @@ async function resolveCanonicalReferenceBundleForSlug(options: {
   const hasExplicitSource = Boolean(
     (options.jsonPath && options.jsonPath.length > 0) || (options.sqlitePath && options.sqlitePath.length > 0),
   );
+  if (!hasExplicitSource) {
+    const bundledExact = resolveBundledExactReferenceBundle(options.referenceSlug);
+    if (bundledExact) {
+      return bundledExact;
+    }
+  }
   if (!hasExplicitSource && (await fileExists(bundledCanonicalFixturePath))) {
     const bundled = await loadCanonicalReferenceBundleFile(bundledCanonicalFixturePath);
     if (bundled.references.some((item) => item.slug === options.referenceSlug)) {

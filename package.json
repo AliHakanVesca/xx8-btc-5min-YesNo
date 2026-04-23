@@ -25,6 +25,7 @@
     "xuan:compare-paper": "tsx src/cli.ts xuan:compare-paper",
     "xuan:extract-runtime": "tsx src/cli.ts xuan:extract-runtime",
     "xuan:compare-runtime": "tsx src/cli.ts xuan:compare-runtime",
+    "xuan:compare-runtime-1776928800": "tsx src/cli.ts xuan:compare-runtime --reference-slug btc-updown-5m-1776928800 --market-slug btc-updown-5m-1776928800",
     "capture": "tsx src/cli.ts capture",
     "paper": "tsx src/cli.ts paper",
     "paper:multi": "tsx src/cli.ts paper:multi",

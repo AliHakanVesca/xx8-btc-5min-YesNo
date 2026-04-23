@@ -12,7 +12,11 @@ import { completionAllowance, resolvePartialCompletionPhase } from "./modePolicy
 import { completionCost } from "./sumAvgEngine.js";
 import type { StrategyExecutionMode } from "./executionModes.js";
 import { buildTakerBuyOrder, buildTakerSellOrder } from "./marketOrderBuilder.js";
-import { fairValueGate, type FairValueSnapshot } from "./fairValueEngine.js";
+import {
+  fairValueGate,
+  isCloneRepairFairValueFallbackSnapshot,
+  type FairValueSnapshot,
+} from "./fairValueEngine.js";
 
 export interface CompletionDecision {
   sideToBuy: OutcomeSide;
@@ -158,28 +162,39 @@ function chooseCompletion(
       candidateSize,
       oppositeAveragePrice: existingAverage,
       missingSidePrice: execution.averagePrice,
+      partialAgeSec,
     });
     const highLowPhaseCapOverride = Boolean(allowance.highLowMismatch && allowance.allowed);
     if (costWithFees > phase.cap && !highLowPhaseCapOverride) {
       continue;
     }
+    const ultraFastCloneFairValueFallback =
+      config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
+      partialAgeSec <= config.temporalRepairUltraFastWindowSec &&
+      isCloneRepairFairValueFallbackSnapshot(ctx.fairValueSnapshot) &&
+      costWithFees <= config.temporalRepairUltraFastMissingFairValueCap &&
+      allowance.allowed;
     const fairValueRequired =
-      allowance.highLowMismatch && allowance.allowed && !allowance.requiresFairValue
+      ultraFastCloneFairValueFallback
         ? false
-        : !(
-            config.allowStrictResidualCompletionWithoutFairValue &&
-            costWithFees <= config.strictResidualCompletionCap
-          ) || Boolean(allowance.requiresFairValue);
-    const fairValueDecision = fairValueGate({
-      config,
-      snapshot: ctx.fairValueSnapshot,
-      side: sideToBuy,
-      sidePrice: execution.averagePrice,
-      mode: allowance.capMode === "emergency" ? "emergency" : "completion",
-      secsToClose: ctx.secsToClose,
-      effectiveCost: costWithFees,
-      required: fairValueRequired,
-    });
+        : allowance.highLowMismatch && allowance.allowed && !allowance.requiresFairValue
+          ? false
+          : !(
+              config.allowStrictResidualCompletionWithoutFairValue &&
+              costWithFees <= config.strictResidualCompletionCap
+            ) || Boolean(allowance.requiresFairValue);
+    const fairValueDecision = ultraFastCloneFairValueFallback
+      ? { allowed: true as const }
+      : fairValueGate({
+          config,
+          snapshot: ctx.fairValueSnapshot,
+          side: sideToBuy,
+          sidePrice: execution.averagePrice,
+          mode: allowance.capMode === "emergency" ? "emergency" : "completion",
+          secsToClose: ctx.secsToClose,
+          effectiveCost: costWithFees,
+          required: fairValueRequired,
+        });
     if (!allowance.allowed) {
       continue;
     }

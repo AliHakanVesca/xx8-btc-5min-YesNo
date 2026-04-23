@@ -253,6 +253,49 @@ describe("xuan mode and pair order groups", () => {
     );
   });
 
+  it("leans harder on recent side sequencing when fair value is unavailable for the first seed", () => {
+    const market = buildOfflineMarket(1713696000);
+    const state = createMarketState(market);
+    state.fillHistory = Array.from({ length: 4 }, (_, index) => ({
+      outcome: "UP" as const,
+      side: "BUY" as const,
+      price: 0.44,
+      size: 5,
+      timestamp: market.startTs - (4 - index),
+      makerTaker: "taker" as const,
+    }));
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.55, size: 200 }], [{ price: 0.56, size: 200 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.58, size: 200 }], [{ price: 0.59, size: 200 }]),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 20,
+        secsToClose: 240,
+        lot: 80,
+        fairValueSnapshot: {
+          status: "threshold_missing",
+          estimatedThreshold: false,
+        },
+      },
+    );
+
+    expect(evaluation.decisions).toHaveLength(1);
+    expect(evaluation.decisions[0]).toMatchObject({
+      side: "DOWN",
+      mode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+    expect(evaluation.trace.seedCandidates?.[0]?.side).toBe("DOWN");
+  });
+
   it("keeps clone-mode lot sizing large even when strict pair-cap is not currently available", () => {
     const lot = chooseLot(
       buildConfig({
@@ -345,6 +388,51 @@ describe("xuan mode and pair order groups", () => {
     });
     expect(evaluation.trace.repairCost).toBeGreaterThan(1.005);
     expect(evaluation.trace.repairCost).toBeLessThanOrEqual(1.035);
+  });
+
+  it("allows ultra-fast clone repair without fair value when the snapshot is missing but cap guards hold", () => {
+    const market = buildOfflineMarket(1713696000);
+    const state = createMarketState(market);
+    state.downShares = 80;
+    state.downCost = 32.8;
+    state.downLots = [
+      {
+        size: 80,
+        price: 0.41,
+        timestamp: market.startTs,
+      },
+    ];
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.57, size: 200 }], [{ price: 0.58, size: 200 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.4, size: 200 }], [{ price: 0.41, size: 200 }]),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 4,
+        secsToClose: 296,
+        lot: 80,
+        fairValueSnapshot: {
+          status: "threshold_missing",
+          estimatedThreshold: false,
+        },
+      },
+    );
+
+    expect(evaluation.decisions).toHaveLength(1);
+    expect(evaluation.decisions[0]).toMatchObject({
+      side: "UP",
+      mode: "PARTIAL_FAST_COMPLETION",
+    });
+    expect(evaluation.trace.repairCost).toBeGreaterThan(1);
+    expect(evaluation.trace.repairCost).toBeLessThanOrEqual(1.075);
   });
 
   it("allows a protected residual to open a same-side overlap seed instead of blocking on raw exposure", () => {
@@ -1030,6 +1118,65 @@ describe("xuan mode and pair order groups", () => {
     expect(decision.trace.entry.skipReason).toBeUndefined();
     expect(decision.trace.entry.bestEffectivePair).toBeGreaterThan(1);
     expect(decision.trace.entry.bestEffectivePair).toBeLessThanOrEqual(1.02);
+  });
+
+  it("blocks clone pair-sweep on a cheap stale opposite quote and falls back to temporal seed", () => {
+    const market = buildOfflineMarket(1713696000);
+    const state = createMarketState(market);
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.88, size: 200 }], [{ price: 0.89, size: 200 }]),
+      buildBook(
+        market.tokens.DOWN.tokenId,
+        market.conditionId,
+        [{ price: 0.1, size: 200 }],
+        [{ price: 0.11, size: 200 }],
+      ),
+    );
+
+    const bot = new Xuan5mBot();
+    const decision = bot.evaluateTick({
+      config: buildConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        XUAN_BEHAVIOR_CAP: "1.3",
+        SINGLE_LEG_ORPHAN_CAP: "1",
+        SINGLE_LEG_FAIR_VALUE_VETO: "false",
+        MAX_SINGLE_ORPHAN_QTY: "100",
+        ORPHAN_LEG_MAX_NOTIONAL_USDC: "100",
+        MAX_MARKET_ORPHAN_USDC: "200",
+      }),
+      state,
+      books,
+      nowTs: market.startTs + 86,
+      riskContext: {
+        secsToClose: 214,
+        staleBookMs: 100,
+        balanceStaleMs: 100,
+        bookIsCrossed: false,
+        dailyLossUsdc: 0,
+        marketLossUsdc: 0,
+        usdcBalance: 100,
+      },
+      dryRunOrSmallLive: false,
+      fairValueSnapshot: {
+        status: "threshold_missing",
+        estimatedThreshold: false,
+      },
+    });
+
+    expect(decision.entryBuys).toHaveLength(1);
+    expect(decision.entryBuys[0]).toMatchObject({
+      side: "DOWN",
+      mode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+    expect(decision.trace.entry.candidates).toEqual(
+      expect.arrayContaining([
+      expect.objectContaining({
+        verdict: "pair_cap",
+        gateReason: "pair_stale_cheap_quote",
+      }),
+      ]),
+    );
   });
 
   it("downgrades an unsafe parallel pair into safer same-pairgroup covered seed", () => {

@@ -5,6 +5,7 @@ import type {
   CanonicalSequenceEvent,
   NormalizedClipTier,
 } from "../../src/analytics/xuanCanonicalReference.js";
+import { exact1776928800Reference } from "../../src/analytics/xuanExactReference.js";
 import publicSequenceFixture from "../fixtures/xuan_public_sequence_bundle.json" with { type: "json" };
 import runtimeIncidentFixture from "../fixtures/runtime_extract_btc-updown-5m-1776928800.json" with { type: "json" };
 
@@ -293,72 +294,7 @@ describe("xuan replay comparator", () => {
 
   it("fails the exact 1776928800 runtime incident against a healthier target footprint", () => {
     const candidate = runtimeIncidentFixture.references[0] as CanonicalReferenceExtract;
-    const reference = buildReference({
-      slug: "btc-updown-5m-1776928800",
-      startTs: 1776928800,
-      endTs: 1776929100,
-      orderedClipSequence: [
-        buildEvent({
-          sequenceIndex: 0,
-          clipIndex: 1,
-          cycleId: 1,
-          phase: "ENTRY",
-          kind: "BUY",
-          tOffsetSec: 4,
-          tOffsetMs: 4000,
-          outcome: "DOWN",
-          price: 0.49,
-          qty: 5,
-          qtyBucket: "1_5",
-          baseLot: 5,
-          familyLabel: "ENTRY",
-          internalLabel: "TEMPORAL_SINGLE_LEG_SEED",
-        }),
-        buildEvent({
-          sequenceIndex: 1,
-          clipIndex: 2,
-          cycleId: 1,
-          phase: "COMPLETION",
-          kind: "BUY",
-          tOffsetSec: 6,
-          tOffsetMs: 6000,
-          outcome: "UP",
-          price: 0.5,
-          qty: 5,
-          qtyBucket: "1_5",
-          baseLot: 5,
-          familyLabel: "COMPLETION",
-          internalLabel: "HIGH_LOW_COMPLETION",
-        }),
-      ],
-      cycleCount: 1,
-      mergeCount: 0,
-      completionCount: 1,
-      repairLatencyBucket: "0_10",
-      mergeTimingBucket: "none",
-      finalResidualSide: "FLAT",
-      finalResidualBucket: "flat",
-      clipBucketCounts: {
-        "1_5": 2,
-        "6_10": 0,
-        "11_15": 0,
-        "16_30": 0,
-        "31_plus": 0,
-      },
-      normalizedClipTierCounts: normalizedCounts({
-        "1x": 2,
-      }),
-      buySequence: ["DOWN", "UP"],
-      alternatingTransitionCount: 1,
-      authority: {
-        tradeTape: "paper",
-        lifecycle: "paper",
-        verifiedBuyCount: 2,
-        totalBuyCount: 2,
-        mergeEventCount: 0,
-        redeemEventCount: 0,
-      },
-    });
+    const reference = exact1776928800Reference;
 
     const result = compareCanonicalReference(reference, candidate, {
       hardFails: (runtimeIncidentFixture as { hardFailsBySlug: Record<string, Record<string, number>> }).hardFailsBySlug[

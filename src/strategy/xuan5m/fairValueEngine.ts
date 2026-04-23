@@ -40,6 +40,15 @@ export interface FairValueGateDecision {
   reason?: string | undefined;
 }
 
+export function isCloneRepairFairValueFallbackSnapshot(snapshot?: FairValueSnapshot | undefined): boolean {
+  return (
+    snapshot === undefined ||
+    snapshot.status === "threshold_missing" ||
+    snapshot.status === "live_missing" ||
+    snapshot.status === "insufficient_history"
+  );
+}
+
 interface VolatilityWindow {
   stdev: number;
   avgStepSec: number;

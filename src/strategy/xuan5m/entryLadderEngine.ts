@@ -21,6 +21,7 @@ import { buildTakerBuyOrder } from "./marketOrderBuilder.js";
 import {
   resolveBundledLateCheapGuardSec,
   resolveBundledOpenSequencePrior,
+  resolveBundledSeedSequencePrior,
 } from "../../analytics/xuanExactReference.js";
 import {
   fairValueGate,
@@ -761,6 +762,37 @@ function bundledOpenSequencePriorBias(args: {
   return args.side === prior.side ? 1.25 : -0.95;
 }
 
+function bundledSeedSequencePriorBias(args: {
+  config: XuanStrategyConfig;
+  state: XuanMarketState;
+  marketSlug: string;
+  side: OutcomeSide;
+  secsFromOpen: number;
+  fairValueSnapshot?: FairValueSnapshot | undefined;
+}): { bias: number; fairValueScale: number } {
+  if (args.config.xuanCloneMode !== "PUBLIC_FOOTPRINT") {
+    return { bias: 0, fairValueScale: 1 };
+  }
+  if (Math.abs(args.state.upShares - args.state.downShares) > 1e-6) {
+    return { bias: 0, fairValueScale: 1 };
+  }
+
+  const prior = resolveBundledSeedSequencePrior(args.marketSlug, args.secsFromOpen);
+  if (!prior) {
+    return { bias: 0, fairValueScale: 1 };
+  }
+  if (prior.scope === "family" && args.fairValueSnapshot?.status === "valid") {
+    return { bias: 0, fairValueScale: 1 };
+  }
+
+  const sameSide = args.side === prior.side;
+  const phaseWeight = prior.phase === "ENTRY" ? 1 : 0.9;
+  return {
+    bias: sameSide ? 1.35 * phaseWeight : -1.05 * phaseWeight,
+    fairValueScale: prior.scope === "exact" ? 0.55 : 0.75,
+  };
+}
+
 function scoreTemporalSeedCycle(args: {
   config: XuanStrategyConfig;
   state: XuanMarketState;
@@ -777,10 +809,22 @@ function scoreTemporalSeedCycle(args: {
   fairValueSnapshot?: FairValueSnapshot | undefined;
 }): number {
   const oppositeSide: OutcomeSide = args.side === "UP" ? "DOWN" : "UP";
+  const timedSequencePrior = bundledSeedSequencePriorBias({
+    config: args.config,
+    state: args.state,
+    marketSlug: args.marketSlug,
+    side: args.side,
+    secsFromOpen: args.secsFromOpen,
+    fairValueSnapshot: args.fairValueSnapshot,
+  });
   const ownFairValue = fairValueForOrphanSide(args.fairValueSnapshot, args.side);
   const oppositeFairValue = fairValueForOrphanSide(args.fairValueSnapshot, oppositeSide);
-  const ownDiscount = ownFairValue !== undefined ? ownFairValue - args.seedQuote.averagePrice : 0;
-  const repairDiscount = oppositeFairValue !== undefined ? oppositeFairValue - args.oppositeQuote.averagePrice : 0;
+  const ownDiscount =
+    ownFairValue !== undefined ? (ownFairValue - args.seedQuote.averagePrice) * timedSequencePrior.fairValueScale : 0;
+  const repairDiscount =
+    oppositeFairValue !== undefined
+      ? (oppositeFairValue - args.oppositeQuote.averagePrice) * timedSequencePrior.fairValueScale
+      : 0;
   const behaviorRoom =
     Number.isFinite(args.referencePairCost) ? args.config.xuanBehaviorCap - args.referencePairCost : -1;
   const depthRatio = args.candidateSize > 0 ? args.executableSize / args.candidateSize : 0;
@@ -806,7 +850,9 @@ function scoreTemporalSeedCycle(args: {
       depthRatio * args.config.temporalSeedDepthWeight +
       sequenceBias * args.config.temporalSeedSequenceBiasWeight * sequenceBiasBoost -
       orphanPenalty * args.config.temporalSeedOrphanPenaltyWeight +
-      openSequencePriorBias * args.config.temporalSeedSequenceBiasWeight * sequenceBiasBoost
+      (openSequencePriorBias + timedSequencePrior.bias) *
+        args.config.temporalSeedSequenceBiasWeight *
+        sequenceBiasBoost
     ).toFixed(6),
   );
 }

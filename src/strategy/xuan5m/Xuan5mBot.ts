@@ -107,6 +107,7 @@ export class Xuan5mBot {
     const inventoryBalanced = shareGap <= config.completionMinQty;
 
     const lot = chooseLot(config, {
+      marketSlug: state.market.slug,
       dryRunOrSmallLive: input.dryRunOrSmallLive,
       secsFromOpen,
       imbalance: shareGap / Math.max(totalShares, 1),

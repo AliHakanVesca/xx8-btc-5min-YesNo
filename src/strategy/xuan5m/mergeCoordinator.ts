@@ -1,6 +1,7 @@
 import type { XuanStrategyConfig } from "../../config/strategyPresets.js";
 import { imbalance, mergeableShares } from "./inventoryState.js";
 import type { XuanMarketState } from "./marketState.js";
+import { resolveBundledMergeTimingPrior } from "../../analytics/xuanExactReference.js";
 
 export interface MergePlan {
   mergeable: number;
@@ -105,6 +106,7 @@ export function mergeBatchMetrics(tracker: MergeBatchTracker, nowTs: number): Me
 export function evaluateDelayedMergeGate(
   config: Pick<
     XuanStrategyConfig,
+    | "xuanCloneMode"
     | "mergeMode"
     | "mergeBatchMode"
     | "minCompletedCyclesBeforeFirstMerge"
@@ -128,6 +130,20 @@ export function evaluateDelayedMergeGate(
   },
 ): MergeGateDecision {
   const metrics = mergeBatchMetrics(args.tracker, args.nowTs);
+  const timingPrior =
+    config.xuanCloneMode === "PUBLIC_FOOTPRINT" ? resolveBundledMergeTimingPrior(state.market.slug) : undefined;
+  const mergeShieldSecFromOpen = timingPrior
+    ? Math.max(0, Math.min(config.mergeShieldSecFromOpen, timingPrior.firstMergeSec - 1))
+    : config.mergeShieldSecFromOpen;
+  const minCompletedCyclesBeforeFirstMerge = timingPrior
+    ? Math.max(config.minCompletedCyclesBeforeFirstMerge, timingPrior.completedCyclesBeforeMerge)
+    : config.minCompletedCyclesBeforeFirstMerge;
+  const minFirstMatchedAgeBeforeMergeSec = timingPrior
+    ? Math.min(config.minFirstMatchedAgeBeforeMergeSec, timingPrior.firstMergeSec)
+    : config.minFirstMatchedAgeBeforeMergeSec;
+  const maxMatchedAgeBeforeForcedMergeSec = timingPrior
+    ? Math.min(config.maxMatchedAgeBeforeForcedMergeSec, timingPrior.forcedAgeSec)
+    : config.maxMatchedAgeBeforeForcedMergeSec;
 
   if (config.mergeMode !== "AUTO" || metrics.pendingMatchedQty <= 1e-6) {
     return {
@@ -176,7 +192,7 @@ export function evaluateDelayedMergeGate(
 
   if (
     metrics.oldestMatchedAgeSec !== undefined &&
-    metrics.oldestMatchedAgeSec >= config.maxMatchedAgeBeforeForcedMergeSec
+    metrics.oldestMatchedAgeSec >= maxMatchedAgeBeforeForcedMergeSec
   ) {
     return {
       allow: true,
@@ -186,7 +202,7 @@ export function evaluateDelayedMergeGate(
     };
   }
 
-  if ((args.secsFromOpen ?? Number.POSITIVE_INFINITY) < config.mergeShieldSecFromOpen) {
+  if ((args.secsFromOpen ?? Number.POSITIVE_INFINITY) < mergeShieldSecFromOpen) {
     return {
       allow: false,
       forced: false,
@@ -195,7 +211,7 @@ export function evaluateDelayedMergeGate(
     };
   }
 
-  if (metrics.completedCycles >= config.minCompletedCyclesBeforeFirstMerge) {
+  if (metrics.completedCycles >= minCompletedCyclesBeforeFirstMerge) {
     return {
       allow: true,
       forced: false,
@@ -206,7 +222,7 @@ export function evaluateDelayedMergeGate(
 
   if (
     metrics.oldestMatchedAgeSec !== undefined &&
-    metrics.oldestMatchedAgeSec >= config.minFirstMatchedAgeBeforeMergeSec
+    metrics.oldestMatchedAgeSec >= minFirstMatchedAgeBeforeMergeSec
   ) {
     return {
       allow: true,

@@ -1,6 +1,16 @@
 
 ##############################################
 
+Version : V.0.0.17
+Date    : 23.04.2026
+Author  : Ali Hakan Çakır
+Changes : - Reference-driven merge ve lot prior kurallari genisletildi.
+          - Clone-mode entry ve temporal seed kararlari yeni prior'lara gore guncellendi.
+
+##############################################
+
+##############################################
+
 Version : V.0.0.16
 Date    : 23.04.2026
 Author  : Ali Hakan Çakır

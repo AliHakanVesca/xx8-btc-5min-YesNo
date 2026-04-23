@@ -334,6 +334,43 @@ describe("xuan mode and pair order groups", () => {
     );
   });
 
+  it("keeps the exact 1776253500 overlap-side prior even when fair value is valid and leans the other way", () => {
+    const market = buildOfflineMarket(1776253500);
+    const state = createMarketState(market);
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.57, size: 200 }], [{ price: 0.58, size: 200 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.54, size: 200 }], [{ price: 0.55, size: 200 }]),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 44,
+        secsToClose: 256,
+        lot: 80,
+        fairValueSnapshot: {
+          status: "valid",
+          estimatedThreshold: false,
+          fairUp: 0.585,
+          fairDown: 0.63,
+        },
+      },
+    );
+
+    expect(evaluation.decisions).toHaveLength(1);
+    expect(evaluation.decisions[0]).toMatchObject({
+      side: "UP",
+      mode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+    expect(evaluation.trace.seedCandidates?.[0]?.side).toBe("UP");
+  });
+
   it("keeps clone-mode lot sizing large even when strict pair-cap is not currently available", () => {
     const lot = chooseLot(
       buildConfig({
@@ -355,6 +392,30 @@ describe("xuan mode and pair order groups", () => {
     );
 
     expect(lot).toBe(90);
+  });
+
+  it("can escalate the opener clip to the clone maximum when an exact opening prior is active", () => {
+    const lot = chooseLot(
+      buildConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      }),
+      {
+        marketSlug: "btc-updown-5m-1776253500",
+        dryRunOrSmallLive: false,
+        secsFromOpen: 4,
+        imbalance: 0,
+        bookDepthGood: true,
+        pairCostWithinCap: false,
+        pairCostComfortable: false,
+        inventoryBalanced: true,
+        recentBothSidesFilled: false,
+        marketVolumeHigh: true,
+        pnlTodayPositive: true,
+      },
+    );
+
+    expect(lot).toBe(125);
   });
 
   it("does not clamp public footprint clone lots to the smallest clip in dry-run style contexts", () => {

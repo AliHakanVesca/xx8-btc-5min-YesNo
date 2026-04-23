@@ -1,6 +1,8 @@
 import type { XuanStrategyConfig } from "../../config/strategyPresets.js";
+import { resolveBundledSeedSequencePrior } from "../../analytics/xuanExactReference.js";
 
 export interface LotContext {
+  marketSlug?: string;
   dryRunOrSmallLive: boolean;
   secsFromOpen: number;
   imbalance: number;
@@ -23,6 +25,10 @@ export function chooseLot(config: XuanStrategyConfig, ctx: LotContext): number {
   const cloneMid = baseLots[1] ?? cloneBase;
   const cloneHigh = baseLots[2] ?? cloneMid;
   const cloneMax = baseLots[3] ?? cloneHigh;
+  const sequencePrior =
+    ctx.marketSlug && config.xuanCloneMode === "PUBLIC_FOOTPRINT"
+      ? resolveBundledSeedSequencePrior(ctx.marketSlug, ctx.secsFromOpen)
+      : undefined;
   if (ctx.dryRunOrSmallLive && config.xuanCloneMode !== "PUBLIC_FOOTPRINT") {
     return clippedBase;
   }
@@ -32,12 +38,19 @@ export function chooseLot(config: XuanStrategyConfig, ctx: LotContext): number {
       return clippedBase;
     }
     if (config.xuanCloneMode === "PUBLIC_FOOTPRINT") {
-      if (!ctx.inventoryBalanced) {
+    if (!ctx.inventoryBalanced) {
+      return cloneBase;
+    }
+    if (
+      sequencePrior?.phase === "ENTRY" &&
+      ctx.secsFromOpen <= sequencePrior.activeUntilSec + 1e-9 &&
+      ctx.bookDepthGood
+    ) {
+      return cloneMax;
+    }
+    if (ctx.secsFromOpen < 45) {
+      if (!ctx.bookDepthGood) {
         return cloneBase;
-      }
-      if (ctx.secsFromOpen < 45) {
-        if (!ctx.bookDepthGood) {
-          return cloneBase;
         }
         return ctx.pairCostWithinCap ? cloneHigh : cloneMid;
       }

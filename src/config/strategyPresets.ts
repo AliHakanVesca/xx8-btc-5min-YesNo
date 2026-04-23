@@ -4,12 +4,16 @@ export interface XuanStrategyConfig {
   stateStore: "SQLITE" | "JSON";
   stateStorePath: string;
   botMode: "STRICT" | "XUAN";
+  xuanCloneMode: "OFF" | "PUBLIC_FOOTPRINT";
   priceToBeatPolicy: "EXPLICIT_ONLY" | "EXPLICIT_OR_START_CAPTURE";
   priceToBeatStartCaptureWindowMs: number;
   priceToBeatMaxFeedAgeMs: number;
   priceToBeatProvisionalAllowed: boolean;
   priceToBeatExplicitOverrideAllowed: boolean;
   priceToBeatFailClosedAfterSec: number;
+  priceToBeatLateStartFallbackEnabled: boolean;
+  priceToBeatLateStartMaxMarketAgeSec: number;
+  priceToBeatLateStartMaxFeedAgeMs: number;
   startupInventoryPolicy: "IGNORE" | "ADOPT_AND_RECONCILE";
   unknownInventoryPolicy: "WARN" | "BLOCK_NEW_ENTRY";
   resolvedInventoryPolicy: "MANUAL" | "AUTO_REDEEM";
@@ -38,6 +42,7 @@ export interface XuanStrategyConfig {
   xuanMinTimeLeftForHardSweep: number;
   allowInitialNegativePairSweep: boolean;
   allowSingleLegSeed: boolean;
+  allowTemporalSingleLegSeed: boolean;
   allowCheapUnderdogSeed: boolean;
   allowNakedSingleLegSeed: boolean;
   allowXuanCoveredSeed: boolean;
@@ -47,6 +52,16 @@ export interface XuanStrategyConfig {
   coveredSeedMinOppositeCoverageRatio: number;
   coveredSeedMaxQty: number;
   coveredSeedRequiresFairValue: boolean;
+  singleLegOrphanCap: number;
+  singleLegFairValueVeto: boolean;
+  singleLegOrphanMaxFairPremium: number;
+  temporalSingleLegTtlSec: number;
+  temporalSingleLegMinOppositeDepthRatio: number;
+  xuanBehaviorCap: number;
+  orphanLegMaxNotionalUsdc: number;
+  orphanLegMaxAgeSec: number;
+  maxMarketOrphanUsdc: number;
+  maxSingleOrphanQty: number;
   singleLegSeedMaxQty: number;
   maxConsecutiveSingleLegSeedsPerSide: number;
   completionQtyMode: "MISSING_ONLY" | "ALLOW_OVERSHOOT";
@@ -65,6 +80,8 @@ export interface XuanStrategyConfig {
   allowOverlapOnlyAfterPartialClassified: boolean;
   allowOverlapOnlyWhenCompletionEngineActive: boolean;
   allowOverlapInLast30S: boolean;
+  requireMatchedInventoryBeforeSecondGroup: boolean;
+  worstCaseAmplificationToleranceShares: number;
   postMergeNewSeedCooldownMs: number;
   postMergePairReopenCooldownMs: number;
   postMergeOnlyCompletion: boolean;
@@ -194,6 +211,13 @@ export interface XuanStrategyConfig {
   pairgroupRequireReconcileBeforeNoneFilled: boolean;
   mergeMinShares: number;
   mergeDebounceMs: number;
+  mergeBatchMode: "IMMEDIATE" | "HYBRID_DELAYED";
+  minCompletedCyclesBeforeFirstMerge: number;
+  minFirstMatchedAgeBeforeMergeSec: number;
+  maxMatchedAgeBeforeForcedMergeSec: number;
+  forceMergeInLast30S: boolean;
+  forceMergeOnHardImbalance: boolean;
+  forceMergeOnLowCollateral: boolean;
   mergeOnEachReconcile: boolean;
   mergeOnMarketClose: boolean;
   mergeMaxTxPerMarket: number;
@@ -215,16 +239,20 @@ export function buildStrategyConfig(env: AppEnv): XuanStrategyConfig {
   const resolvedStateStorePath = env.STATE_DB_PATH || env.STATE_STORE_PATH;
   const resolvedLotLadder = env.LIVE_SMALL_LOT_LADDER.length > 0 ? env.LIVE_SMALL_LOT_LADDER : env.LOT_LADDER;
   const resolvedBaseLotLadder = env.XUAN_BASE_LOT_LADDER.length > 0 ? env.XUAN_BASE_LOT_LADDER : env.LOT_LADDER;
-  return {
+  const baseConfig: XuanStrategyConfig = {
     stateStore: env.STATE_STORE,
     stateStorePath: resolvedStateStorePath,
     botMode: env.BOT_MODE,
+    xuanCloneMode: env.XUAN_CLONE_MODE,
     priceToBeatPolicy: env.PRICE_TO_BEAT_POLICY,
     priceToBeatStartCaptureWindowMs: env.PRICE_TO_BEAT_START_CAPTURE_WINDOW_MS,
     priceToBeatMaxFeedAgeMs: env.PRICE_TO_BEAT_MAX_FEED_AGE_MS,
     priceToBeatProvisionalAllowed: env.PRICE_TO_BEAT_PROVISIONAL_ALLOWED,
     priceToBeatExplicitOverrideAllowed: env.PRICE_TO_BEAT_EXPLICIT_OVERRIDE_ALLOWED,
     priceToBeatFailClosedAfterSec: env.PRICE_TO_BEAT_FAIL_CLOSED_AFTER_SEC,
+    priceToBeatLateStartFallbackEnabled: env.PRICE_TO_BEAT_LATE_START_FALLBACK_ENABLED,
+    priceToBeatLateStartMaxMarketAgeSec: env.PRICE_TO_BEAT_LATE_START_MAX_MARKET_AGE_SEC,
+    priceToBeatLateStartMaxFeedAgeMs: env.PRICE_TO_BEAT_LATE_START_MAX_FEED_AGE_MS,
     startupInventoryPolicy: env.STARTUP_INVENTORY_POLICY,
     unknownInventoryPolicy: env.UNKNOWN_INVENTORY_POLICY,
     resolvedInventoryPolicy: env.RESOLVED_INVENTORY_POLICY,
@@ -253,16 +281,30 @@ export function buildStrategyConfig(env: AppEnv): XuanStrategyConfig {
     xuanMinTimeLeftForHardSweep: env.XUAN_MIN_TIME_LEFT_FOR_HARD_SWEEP,
     allowInitialNegativePairSweep: env.ALLOW_INITIAL_NEGATIVE_PAIR_SWEEP,
     allowSingleLegSeed: env.ALLOW_SINGLE_LEG_SEED,
+    allowTemporalSingleLegSeed: env.ALLOW_TEMPORAL_SINGLE_LEG_SEED,
     allowCheapUnderdogSeed: env.ALLOW_CHEAP_UNDERDOG_SEED,
     allowNakedSingleLegSeed: env.ALLOW_NAKED_SINGLE_LEG_SEED,
     allowXuanCoveredSeed: env.ALLOW_XUAN_COVERED_SEED,
     coveredSeedAllowSamePairgroupOppositeOrder:
-      env.COVERED_SEED_ALLOW_SAME_PAIRGROUP_OPPOSITE_ORDER || env.COVERED_SEED_REQUIRE_SAME_PAIRGROUP_OPPOSITE_ORDER,
-    coveredSeedAllowOppositeInventoryCover: env.COVERED_SEED_ALLOW_OPPOSITE_INVENTORY_COVER,
+      env.ALLOW_COVERED_SEED_SAME_PAIRGROUP ||
+      env.COVERED_SEED_ALLOW_SAME_PAIRGROUP_OPPOSITE_ORDER ||
+      env.COVERED_SEED_REQUIRE_SAME_PAIRGROUP_OPPOSITE_ORDER,
+    coveredSeedAllowOppositeInventoryCover:
+      env.ALLOW_COVERED_SEED_OPPOSITE_INVENTORY || env.COVERED_SEED_ALLOW_OPPOSITE_INVENTORY_COVER,
     coveredSeedRequireSamePairgroupOppositeOrder: env.COVERED_SEED_REQUIRE_SAME_PAIRGROUP_OPPOSITE_ORDER,
     coveredSeedMinOppositeCoverageRatio: env.COVERED_SEED_MIN_OPPOSITE_COVERAGE_RATIO,
     coveredSeedMaxQty: env.COVERED_SEED_MAX_QTY,
     coveredSeedRequiresFairValue: env.COVERED_SEED_REQUIRES_FAIR_VALUE,
+    singleLegOrphanCap: env.SINGLE_LEG_ORPHAN_CAP,
+    singleLegFairValueVeto: env.SINGLE_LEG_FAIR_VALUE_VETO,
+    singleLegOrphanMaxFairPremium: env.SINGLE_LEG_ORPHAN_MAX_FAIR_PREMIUM,
+    temporalSingleLegTtlSec: env.TEMPORAL_SINGLE_LEG_TTL_SEC,
+    temporalSingleLegMinOppositeDepthRatio: env.TEMPORAL_SINGLE_LEG_MIN_OPPOSITE_DEPTH_RATIO,
+    xuanBehaviorCap: env.XUAN_BEHAVIOR_CAP,
+    orphanLegMaxNotionalUsdc: env.ORPHAN_LEG_MAX_NOTIONAL_USDC,
+    orphanLegMaxAgeSec: env.ORPHAN_LEG_MAX_AGE_SEC,
+    maxMarketOrphanUsdc: env.MAX_MARKET_ORPHAN_USDC,
+    maxSingleOrphanQty: env.MAX_SINGLE_ORPHAN_QTY,
     singleLegSeedMaxQty: env.SINGLE_LEG_SEED_MAX_QTY,
     maxConsecutiveSingleLegSeedsPerSide: env.MAX_CONSECUTIVE_SINGLE_LEG_SEEDS_PER_SIDE,
     completionQtyMode: env.COMPLETION_QTY_MODE,
@@ -281,6 +323,8 @@ export function buildStrategyConfig(env: AppEnv): XuanStrategyConfig {
     allowOverlapOnlyAfterPartialClassified: env.ALLOW_OVERLAP_ONLY_AFTER_PARTIAL_CLASSIFIED,
     allowOverlapOnlyWhenCompletionEngineActive: env.ALLOW_OVERLAP_ONLY_WHEN_COMPLETION_ENGINE_ACTIVE,
     allowOverlapInLast30S: env.ALLOW_OVERLAP_IN_LAST_30S,
+    requireMatchedInventoryBeforeSecondGroup: env.REQUIRE_MATCHED_INVENTORY_BEFORE_SECOND_GROUP,
+    worstCaseAmplificationToleranceShares: env.WORST_CASE_AMPLIFICATION_TOLERANCE_SHARES,
     postMergeNewSeedCooldownMs: env.POST_MERGE_NEW_SEED_COOLDOWN_MS,
     postMergePairReopenCooldownMs: env.POST_MERGE_PAIR_REOPEN_COOLDOWN_MS,
     postMergeOnlyCompletion: env.POST_MERGE_ONLY_COMPLETION,
@@ -413,6 +457,13 @@ export function buildStrategyConfig(env: AppEnv): XuanStrategyConfig {
     pairgroupFinalizeTimeoutMs: env.PAIRGROUP_FINALIZE_TIMEOUT_MS,
     pairgroupRequireReconcileBeforeNoneFilled: env.PAIRGROUP_REQUIRE_RECONCILE_BEFORE_NONE_FILLED,
     mergeDebounceMs: env.MERGE_DEBOUNCE_MS,
+    mergeBatchMode: env.MERGE_BATCH_MODE,
+    minCompletedCyclesBeforeFirstMerge: env.MIN_COMPLETED_CYCLES_BEFORE_FIRST_MERGE,
+    minFirstMatchedAgeBeforeMergeSec: env.MIN_FIRST_MATCHED_AGE_BEFORE_MERGE_SEC,
+    maxMatchedAgeBeforeForcedMergeSec: env.MAX_MATCHED_AGE_BEFORE_FORCED_MERGE_SEC,
+    forceMergeInLast30S: env.FORCE_MERGE_IN_LAST_30S,
+    forceMergeOnHardImbalance: env.FORCE_MERGE_ON_HARD_IMBALANCE,
+    forceMergeOnLowCollateral: env.FORCE_MERGE_ON_LOW_COLLATERAL,
     mergeOnEachReconcile: env.MERGE_ON_EACH_RECONCILE,
     mergeOnMarketClose: env.MERGE_ON_MARKET_CLOSE,
     mergeMaxTxPerMarket: env.MERGE_MAX_TX_PER_MARKET,
@@ -428,5 +479,67 @@ export function buildStrategyConfig(env: AppEnv): XuanStrategyConfig {
     dustSharesThreshold: env.DUST_SHARES_THRESHOLD,
     inventoryPositionLimit: env.INVENTORY_POSITION_LIMIT,
     inventorySizeThreshold: env.INVENTORY_SIZE_THRESHOLD,
+  };
+  return baseConfig.xuanCloneMode === "PUBLIC_FOOTPRINT" ? applyPublicFootprintClone(baseConfig) : baseConfig;
+}
+
+function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConfig {
+  const ladder = [80, 90, 100, 125];
+  const elevatedBehaviorCap = Math.max(config.xuanBehaviorCap, 1.25);
+
+  return {
+    ...config,
+    allowSingleLegSeed: true,
+    allowTemporalSingleLegSeed: true,
+    allowNakedSingleLegSeed: false,
+    allowXuanCoveredSeed: true,
+    allowCheapUnderdogSeed: true,
+    coveredSeedRequiresFairValue: false,
+    singleLegFairValueVeto: false,
+    xuanBaseLotLadder: ladder,
+    liveSmallLotLadder: ladder,
+    liveSmallLots: ladder,
+    lotLadder: ladder,
+    defaultLot: ladder[0] ?? config.defaultLot,
+    xuanSoftSweepMaxQty: Math.max(config.xuanSoftSweepMaxQty, ladder[ladder.length - 1] ?? 125),
+    xuanHardSweepMaxQty: Math.max(config.xuanHardSweepMaxQty, ladder[ladder.length - 1] ?? 125),
+    coveredSeedMaxQty: Math.max(config.coveredSeedMaxQty, ladder[ladder.length - 1] ?? 125),
+    singleLegSeedMaxQty: Math.max(config.singleLegSeedMaxQty, ladder[ladder.length - 1] ?? 125),
+    maxSingleOrphanQty: Math.max(config.maxSingleOrphanQty, ladder[ladder.length - 1] ?? 125),
+    orphanLegMaxNotionalUsdc: Math.max(config.orphanLegMaxNotionalUsdc, 80),
+    maxMarketOrphanUsdc: Math.max(config.maxMarketOrphanUsdc, 160),
+    maxNegativePairEdgePerCycleUsdc: Math.max(config.maxNegativePairEdgePerCycleUsdc, 20),
+    maxNegativePairEdgePerMarketUsdc: Math.max(config.maxNegativePairEdgePerMarketUsdc, 20),
+    maxNegativeDailyBudgetUsdc: Math.max(config.maxNegativeDailyBudgetUsdc, 25),
+    maxNegativeEdgePerMarketUsdc: Math.max(config.maxNegativeEdgePerMarketUsdc, 25),
+    blockNewPairWhilePartialOpen: false,
+    maxOpenGroupsPerMarket: Math.max(config.maxOpenGroupsPerMarket, 4),
+    maxOpenPartialGroups: Math.max(config.maxOpenPartialGroups, 3),
+    partialOpenAction: "ALLOW_OVERLAP",
+    allowOverlapOnlyAfterPartialClassified: false,
+    allowOverlapOnlyWhenCompletionEngineActive: false,
+    requireMatchedInventoryBeforeSecondGroup: false,
+    worstCaseAmplificationToleranceShares: Math.max(config.worstCaseAmplificationToleranceShares, 125),
+    postMergeNewSeedCooldownMs: 0,
+    postMergePairReopenCooldownMs: 0,
+    postMergeOnlyCompletion: false,
+    postMergeOnlyCompletionWhileResidual: false,
+    allowHighSideEmergencyChase: true,
+    highSideEmergencyMaxQty: Math.max(config.highSideEmergencyMaxQty, ladder[ladder.length - 1] ?? 125),
+    highSideEmergencyRequiresFairValue: false,
+    highSideEmergencyRequiresHardImbalance: false,
+    highSideEmergencyCap: Math.max(config.highSideEmergencyCap, elevatedBehaviorCap),
+    emergencyCompletionMaxQty: Math.max(config.emergencyCompletionMaxQty, ladder[ladder.length - 1] ?? 125),
+    emergencyCompletionHardCap: Math.max(config.emergencyCompletionHardCap, elevatedBehaviorCap),
+    partialSoftMaxQty: Math.max(config.partialSoftMaxQty, ladder[ladder.length - 1] ?? 125),
+    partialHardMaxQty: Math.max(config.partialHardMaxQty, ladder[ladder.length - 1] ?? 125),
+    partialEmergencyMaxQty: Math.max(config.partialEmergencyMaxQty, ladder[ladder.length - 1] ?? 125),
+    partialEmergencyRequiresFairValue: false,
+    finalHardCompletionMaxQty: Math.max(config.finalHardCompletionMaxQty, ladder[ladder.length - 1] ?? 125),
+    fairValueFailClosedForSeed: false,
+    fairValueFailClosedForNegativePair: false,
+    fairValueFailClosedForHighSideChase: false,
+    requireStrictCapForHighLowMismatch: false,
+    xuanBehaviorCap: elevatedBehaviorCap,
   };
 }

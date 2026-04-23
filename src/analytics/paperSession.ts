@@ -29,6 +29,7 @@ interface PaperSessionStepSpec {
   entryFillPolicy?: "all" | "up-only" | "down-only" | "none";
   completionFill?: boolean;
   unwindFill?: boolean;
+  mergePolicy?: "auto" | "skip";
 }
 
 export interface PaperSessionFillEvent {
@@ -124,36 +125,176 @@ interface EffectiveCostState {
 const sessionVariants: Record<PaperSessionVariant, PaperSessionStepSpec[]> = {
   "xuan-flow": [
     {
-      name: "open-balanced-entry",
-      note: "Opening pair seed fills on both legs and immediately merges.",
-      offsetSec: 15,
-      books: { upBid: 0.47, upAsk: 0.48, downBid: 0.47, downAsk: 0.48 },
-      entryFillPolicy: "all",
+      name: "open-down-seed",
+      note: "First cycle opens with only the DOWN leg filled; UP completion follows a few seconds later.",
+      offsetSec: 10,
+      books: { upBid: 0.49, upAsk: 0.5, downBid: 0.43, downAsk: 0.44 },
+      entryFillPolicy: "down-only",
+      mergePolicy: "skip",
     },
     {
-      name: "mid-balanced-entry",
-      note: "Mid-window another balanced rung fills and merges.",
-      offsetSec: 120,
-      books: { upBid: 0.46, upAsk: 0.47, downBid: 0.47, downAsk: 0.48 },
-      entryFillPolicy: "all",
-    },
-    {
-      name: "partial-up-fill",
-      note: "Balanced pair attempt loses the DOWN leg; only UP fills and leaves inventory imbalanced.",
-      offsetSec: 230,
-      books: { upBid: 0.47, upAsk: 0.48, downBid: 0.47, downAsk: 0.48 },
-      entryFillPolicy: "up-only",
-    },
-    {
-      name: "completion-rebalance",
-      note: "Completion-only window buys the missing DOWN leg and merges the matched set.",
-      offsetSec: 245,
-      books: { upBid: 0.45, upAsk: 0.46, downBid: 0.48, downAsk: 0.49 },
+      name: "open-up-completion",
+      note: "Fast UP completion closes the opening imbalance but leaves the matched set waiting for a batched merge.",
+      offsetSec: 20,
+      books: { upBid: 0.49, upAsk: 0.5, downBid: 0.43, downAsk: 0.44 },
       completionFill: true,
+      mergePolicy: "skip",
+    },
+    {
+      name: "overlap-up-seed-1",
+      note: "A second cycle starts before the first matched inventory is merged, creating the first overlap rung.",
+      offsetSec: 26,
+      books: { upBid: 0.55, upAsk: 0.56, downBid: 0.31, downAsk: 0.32 },
+      entryFillPolicy: "up-only",
+      mergePolicy: "skip",
+    },
+    {
+      name: "overlap-down-completion-1",
+      note: "The missing DOWN leg completes quickly and keeps the overlap chain alive.",
+      offsetSec: 32,
+      books: { upBid: 0.54, upAsk: 0.55, downBid: 0.31, downAsk: 0.32 },
+      completionFill: true,
+      mergePolicy: "skip",
+    },
+    {
+      name: "overlap-up-seed-2",
+      note: "A third cycle repeats the UP-first pattern at a slightly cheaper DOWN completion setup.",
+      offsetSec: 56,
+      books: { upBid: 0.54, upAsk: 0.55, downBid: 0.33, downAsk: 0.34 },
+      entryFillPolicy: "up-only",
+      mergePolicy: "skip",
+    },
+    {
+      name: "overlap-down-completion-2",
+      note: "DOWN completion lands later in the minute and adds another matched pair to the merge queue.",
+      offsetSec: 82,
+      books: { upBid: 0.53, upAsk: 0.54, downBid: 0.31, downAsk: 0.32 },
+      completionFill: true,
+      mergePolicy: "skip",
+    },
+    {
+      name: "overlap-up-seed-3",
+      note: "A fourth cycle opens with an UP-first clip right before the first batched merge flush.",
+      offsetSec: 84,
+      books: { upBid: 0.6, upAsk: 0.61, downBid: 0.28, downAsk: 0.29 },
+      entryFillPolicy: "up-only",
+      mergePolicy: "skip",
+    },
+    {
+      name: "merge-flush-1",
+      note: "Entry prices are intentionally unattractive so the bot only flushes the earlier matched inventory into merge.",
+      offsetSec: 86,
+      books: { upBid: 0.62, upAsk: 0.63, downBid: 0.58, downAsk: 0.59 },
+    },
+    {
+      name: "overlap-down-completion-3",
+      note: "The fourth cycle completes right after the first merge flush, keeping one fresh matched set open.",
+      offsetSec: 90,
+      books: { upBid: 0.6, upAsk: 0.61, downBid: 0.28, downAsk: 0.29 },
+      completionFill: true,
+      mergePolicy: "skip",
+    },
+    {
+      name: "overlap-down-seed-4",
+      note: "A same-second new cycle opens on the DOWN leg, mirroring xuan-like clipped overlap behavior.",
+      offsetSec: 90,
+      books: { upBid: 0.43, upAsk: 0.44, downBid: 0.49, downAsk: 0.5 },
+      entryFillPolicy: "down-only",
+      mergePolicy: "skip",
+    },
+    {
+      name: "patient-up-completion",
+      note: "This residual waits into the patient window before the missing UP leg finally fills.",
+      offsetSec: 160,
+      books: { upBid: 0.43, upAsk: 0.44, downBid: 0.49, downAsk: 0.5 },
+      completionFill: true,
+      mergePolicy: "skip",
+    },
+    {
+      name: "merge-flush-2",
+      note: "A second unattractive-book pause clears the patient residual block so the later high/low cycles start from a flatter inventory base.",
+      offsetSec: 161,
+      books: { upBid: 0.66, upAsk: 0.67, downBid: 0.66, downAsk: 0.67 },
+    },
+    {
+      name: "high-low-down-seed-1",
+      note: "A low-priced DOWN seed opens early enough to satisfy the underdog fair-value gate and set up a clean high/low completion pair.",
+      offsetSec: 162,
+      books: { upBid: 0.79, upAsk: 0.8, downBid: 0.16, downAsk: 0.17 },
+      entryFillPolicy: "down-only",
+      mergePolicy: "skip",
+    },
+    {
+      name: "high-low-up-completion-1",
+      note: "The matching UP completion prints the first explicit high/low completion pattern.",
+      offsetSec: 166,
+      books: { upBid: 0.79, upAsk: 0.8, downBid: 0.16, downAsk: 0.17 },
+      completionFill: true,
+      mergePolicy: "skip",
+    },
+    {
+      name: "high-low-up-seed-2",
+      note: "Another late high-side seed opens while the first high/low cycle is still only matched, not merged.",
+      offsetSec: 168,
+      books: { upBid: 0.82, upAsk: 0.83, downBid: 0.11, downAsk: 0.12 },
+      entryFillPolicy: "up-only",
+      mergePolicy: "skip",
+    },
+    {
+      name: "high-low-down-completion-2",
+      note: "The opposite low-side completion closes the second explicit high/low cycle.",
+      offsetSec: 176,
+      books: { upBid: 0.82, upAsk: 0.83, downBid: 0.11, downAsk: 0.12 },
+      completionFill: true,
+      mergePolicy: "skip",
+    },
+    {
+      name: "high-low-down-seed-3",
+      note: "A mirror-image low-side seed creates one more overlap cycle before the final late mid-price repair.",
+      offsetSec: 178,
+      books: { upBid: 0.78, upAsk: 0.79, downBid: 0.13, downAsk: 0.14 },
+      entryFillPolicy: "down-only",
+      mergePolicy: "skip",
+    },
+    {
+      name: "high-low-up-completion-3",
+      note: "UP completion finalizes that mirrored high/low pair.",
+      offsetSec: 188,
+      books: { upBid: 0.78, upAsk: 0.79, downBid: 0.13, downAsk: 0.14 },
+      completionFill: true,
+      mergePolicy: "skip",
+    },
+    {
+      name: "merge-flush-2b",
+      note: "A short post-high-low merge flush resets the book so the last mid-price cycle starts from flat inventory instead of inherited high-side basis.",
+      offsetSec: 190,
+      books: { upBid: 0.66, upAsk: 0.67, downBid: 0.66, downAsk: 0.67 },
+    },
+    {
+      name: "late-up-seed",
+      note: "One final late-cycle entry opens with UP first while there is still enough time for a strict completion.",
+      offsetSec: 194,
+      books: { upBid: 0.59, upAsk: 0.6, downBid: 0.35, downAsk: 0.36 },
+      entryFillPolicy: "up-only",
+      mergePolicy: "skip",
+    },
+    {
+      name: "late-down-completion",
+      note: "A final strict completion closes the late cycle before the last merge window.",
+      offsetSec: 206,
+      books: { upBid: 0.58, upAsk: 0.59, downBid: 0.34, downAsk: 0.35 },
+      completionFill: true,
+      mergePolicy: "skip",
+    },
+    {
+      name: "merge-flush-3",
+      note: "The last merge window converts the late matched inventory before the market enters the final idle stretch.",
+      offsetSec: 280,
+      books: { upBid: 0.67, upAsk: 0.68, downBid: 0.67, downAsk: 0.68 },
     },
     {
       name: "late-hold",
-      note: "Late window with balanced inventory does nothing.",
+      note: "Late window remains flat and does not create a new pair.",
       offsetSec: 286,
       books: { upBid: 0.44, upAsk: 0.45, downBid: 0.55, downAsk: 0.56 },
     },
@@ -429,7 +570,7 @@ export function runPaperSession(env: AppEnv, variant: PaperSessionVariant = "xua
     }
 
     const mergePlan = planMerge(config, state);
-    const mergeShares = mergePlan.shouldMerge ? mergePlan.mergeable : 0;
+    const mergeShares = step.mergePolicy === "skip" ? 0 : mergePlan.shouldMerge ? mergePlan.mergeable : 0;
     const { nextCostState, pairCost: mergePairCost } = applyEffectiveMerge(effectiveCostState, state, mergeShares);
     const mergeProceeds = mergeShares;
     const realizedMergeProfit =

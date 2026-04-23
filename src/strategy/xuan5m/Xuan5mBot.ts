@@ -51,6 +51,7 @@ export interface TickInput {
   dryRunOrSmallLive: boolean;
   dailyNegativeEdgeSpentUsdc?: number;
   fairValueSnapshot?: FairValueSnapshot | undefined;
+  allowControlledOverlap?: boolean | undefined;
 }
 
 function overrideRiskForPhase(
@@ -97,6 +98,10 @@ export class Xuan5mBot {
       config.cryptoTakerFeeRate,
     );
     const pairCap = pairEntryCap(config);
+    const pairDecisionCap =
+      config.botMode === "XUAN" && config.allowInitialNegativePairSweep
+        ? Math.max(pairCap, config.xuanPairSweepSoftCap)
+        : pairCap;
     const inventoryBalanced = shareGap <= config.completionMinQty;
 
     const lot = chooseLot(config, {
@@ -108,8 +113,8 @@ export class Xuan5mBot {
           books.depthAtOrBetter("UP", bestAskUp, "ask"),
           books.depthAtOrBetter("DOWN", bestAskDown, "ask"),
         ) >= config.defaultLot,
-      pairCostWithinCap: pairTakerCost <= pairCap,
-      pairCostComfortable: pairTakerCost <= pairCap - config.minEdgePerShare,
+      pairCostWithinCap: pairTakerCost <= pairDecisionCap,
+      pairCostComfortable: pairTakerCost <= pairDecisionCap - config.minEdgePerShare,
       inventoryBalanced,
       recentBothSidesFilled: state.fillHistory.some((fill) => fill.outcome === "UP") && state.fillHistory.some((fill) => fill.outcome === "DOWN"),
       marketVolumeHigh: true,
@@ -122,6 +127,7 @@ export class Xuan5mBot {
       lot,
       dailyNegativeEdgeSpentUsdc: input.dailyNegativeEdgeSpentUsdc ?? state.negativeEdgeConsumedUsdc,
       fairValueSnapshot: input.fairValueSnapshot,
+      allowControlledOverlap: input.allowControlledOverlap,
     });
 
     const entryBuys =

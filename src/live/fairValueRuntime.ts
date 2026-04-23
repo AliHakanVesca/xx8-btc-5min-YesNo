@@ -2,11 +2,11 @@ import type { MarketInfo } from "../infra/clob/types.js";
 import type { BtcPriceFeed } from "../infra/ws/btcPriceFeed.js";
 import { evaluateFairValue, type FairValueSnapshot } from "../strategy/xuan5m/fairValueEngine.js";
 import type { XuanStrategyConfig } from "../config/strategyPresets.js";
-import type { PersistentStateStore } from "./persistentStateStore.js";
+import type { PersistentPriceSnapshotSource, PersistentStateStore } from "./persistentStateStore.js";
 
 export class MarketFairValueRuntime {
   private priceToBeat: number | undefined;
-  private priceToBeatSource: string | undefined;
+  private priceToBeatSource: PersistentPriceSnapshotSource | undefined;
   private priceToBeatTimestampMs: number | undefined;
   private estimatedThreshold = false;
   private lastLiveSnapshotSecond = 0;
@@ -23,6 +23,9 @@ export class MarketFairValueRuntime {
       | "priceToBeatProvisionalAllowed"
       | "priceToBeatExplicitOverrideAllowed"
       | "priceToBeatFailClosedAfterSec"
+      | "priceToBeatLateStartFallbackEnabled"
+      | "priceToBeatLateStartMaxMarketAgeSec"
+      | "priceToBeatLateStartMaxFeedAgeMs"
     >,
     private readonly market: MarketInfo,
     private readonly stateStore: PersistentStateStore,
@@ -85,26 +88,34 @@ export class MarketFairValueRuntime {
       return;
     }
     const driftMs = (nowTs - this.market.startTs) * 1000;
-    if (driftMs > this.config.priceToBeatStartCaptureWindowMs) {
+    const marketAgeSec = nowTs - this.market.startTs;
+    const withinStartCaptureWindow = driftMs <= this.config.priceToBeatStartCaptureWindowMs;
+    const withinLateFallbackWindow =
+      this.config.priceToBeatLateStartFallbackEnabled &&
+      marketAgeSec <= this.config.priceToBeatLateStartMaxMarketAgeSec;
+    if (!withinStartCaptureWindow && !withinLateFallbackWindow) {
       return;
     }
-    if (Date.now() - feedSnapshot.primary.timestampMs > this.config.priceToBeatMaxFeedAgeMs) {
+    const maxFeedAgeMs = withinStartCaptureWindow
+      ? this.config.priceToBeatMaxFeedAgeMs
+      : this.config.priceToBeatLateStartMaxFeedAgeMs;
+    if (Date.now() - feedSnapshot.primary.timestampMs > maxFeedAgeMs) {
       return;
     }
 
     this.priceToBeat = feedSnapshot.primary.price;
-    this.priceToBeatSource = "estimated";
+    this.priceToBeatSource = withinStartCaptureWindow ? "estimated" : "late_estimated";
     this.priceToBeatTimestampMs = feedSnapshot.primary.timestampMs;
     this.estimatedThreshold = true;
     this.stateStore.recordPriceSnapshot({
       marketSlug: this.market.slug,
       conditionId: this.market.conditionId,
       kind: "threshold",
-      source: "estimated",
+      source: this.priceToBeatSource,
       price: this.priceToBeat,
       timestampMs: this.priceToBeatTimestampMs,
       estimatedThreshold: this.estimatedThreshold,
-      note: `captured_${Math.floor(driftMs)}ms_after_start`,
+      note: `${withinStartCaptureWindow ? "captured" : "late_captured"}_${Math.floor(driftMs)}ms_after_start`,
     });
   }
 

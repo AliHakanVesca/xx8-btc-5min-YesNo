@@ -16,11 +16,37 @@ export interface LotContext {
 export function chooseLot(config: XuanStrategyConfig, ctx: LotContext): number {
   const smallLots = config.liveSmallLotLadder.length > 0 ? config.liveSmallLotLadder : config.liveSmallLots;
   const baseLots = config.xuanBaseLotLadder.length > 0 ? config.xuanBaseLotLadder : config.lotLadder;
+  const clippedBase = smallLots[0] ?? config.defaultLot;
+  const clippedMid = smallLots[1] ?? clippedBase;
+  const clippedHigh = smallLots[2] ?? clippedMid;
   if (ctx.dryRunOrSmallLive) {
-    return smallLots[0] ?? config.defaultLot;
+    return clippedBase;
   }
+
+  if (config.lotScalingMode === "BANKROLL_ADJUSTED") {
+    if (ctx.imbalance >= config.forceRebalanceImbalanceFrac) {
+      return clippedBase;
+    }
+    if (!ctx.pairCostWithinCap) {
+      return clippedBase;
+    }
+    if (!ctx.inventoryBalanced) {
+      return clippedBase;
+    }
+    if (ctx.secsFromOpen < 45) {
+      return clippedMid;
+    }
+    if (ctx.secsFromOpen < 150 && ctx.recentBothSidesFilled && ctx.bookDepthGood) {
+      return clippedHigh;
+    }
+    if (ctx.marketVolumeHigh && ctx.pairCostComfortable && ctx.pnlTodayPositive) {
+      return clippedMid;
+    }
+    return clippedBase;
+  }
+
   if (ctx.imbalance >= config.forceRebalanceImbalanceFrac) {
-    return smallLots[0] ?? config.defaultLot;
+    return clippedBase;
   }
   if (ctx.secsFromOpen < 45 && ctx.bookDepthGood && ctx.pairCostWithinCap) {
     return baseLots[1] ?? config.defaultLot;

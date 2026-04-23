@@ -20,7 +20,11 @@ import type { StrategyExecutionMode } from "./executionModes.js";
 import { buildTakerBuyOrder } from "./marketOrderBuilder.js";
 import { fairValueGate, type FairValueSnapshot } from "./fairValueEngine.js";
 
-export type EntryBuyReason = "balanced_pair_seed" | "balanced_pair_reentry" | "lagging_rebalance";
+export type EntryBuyReason =
+  | "balanced_pair_seed"
+  | "balanced_pair_reentry"
+  | "lagging_rebalance"
+  | "temporal_single_leg_seed";
 
 export interface EntryBuyDecision {
   side: OutcomeSide;
@@ -47,27 +51,42 @@ export interface BalancedPairCandidateTrace {
   pairCost: number;
   pairEdge: number;
   negativeEdgeUsdc: number;
-  verdict: "ok" | "up_depth" | "down_depth" | "pair_cap";
+  verdict: "ok" | "up_depth" | "down_depth" | "pair_cap" | "orphan_risk";
   selectedMode?: StrategyExecutionMode | undefined;
   gateReason?: string | undefined;
+  upOrphanRisk?: OrphanRiskTrace | undefined;
+  downOrphanRisk?: OrphanRiskTrace | undefined;
+}
+
+export interface OrphanRiskTrace {
+  allowed: boolean;
+  effectivePrice: number;
+  notionalUsdc: number;
+  marketOrphanNotionalUsdc: number;
+  fairValue?: number | undefined;
+  fairPremium?: number | undefined;
+  reason?: string | undefined;
 }
 
 export interface SingleLegSeedCandidateTrace {
   side: OutcomeSide;
   requestedSize: number;
   filledSize: number;
+  oppositeFilledSize?: number | undefined;
+  oppositeCoverageRatio?: number | undefined;
   averagePrice: number;
   limitPrice: number;
   effectivePricePerShare: number;
   referencePairCost: number;
   negativeEdgeUsdc: number;
+  orphanRisk?: OrphanRiskTrace | undefined;
   allowed: boolean;
   selectedMode?: StrategyExecutionMode | undefined;
   skipReason?: string | undefined;
 }
 
 export interface EntryDecisionTrace {
-  mode: "disabled" | "balanced_pair" | "lagging_rebalance";
+  mode: "disabled" | "balanced_pair" | "lagging_rebalance" | "temporal_pair_cycle";
   requestedLot: number;
   totalShares: number;
   shareGap: number;
@@ -106,6 +125,7 @@ export interface EntryLadderContext {
   lot: number;
   dailyNegativeEdgeSpentUsdc?: number;
   fairValueSnapshot?: FairValueSnapshot | undefined;
+  allowControlledOverlap?: boolean | undefined;
 }
 
 interface BalancedPairCandidate {
@@ -193,6 +213,27 @@ export function evaluateEntryBuys(
       };
     }
 
+    const temporalSeedEvaluation = evaluateTemporalSingleLegSeed(
+      config,
+      state,
+      books,
+      ctx,
+      dailyNegativeEdgeSpentUsdc,
+    );
+
+    if (temporalSeedEvaluation.decision) {
+      return {
+        decisions: [temporalSeedEvaluation.decision],
+        trace: {
+          ...trace,
+          mode: "temporal_pair_cycle",
+          selectedMode: temporalSeedEvaluation.decision.mode,
+          seedCandidates: temporalSeedEvaluation.trace,
+          skipReason: determineBalancedPairSkipReason(inspected.maxCandidateSize, inspected.traces),
+        },
+      };
+    }
+
     const seedEvaluation = evaluateSingleLegSeed(
       config,
       state,
@@ -201,13 +242,13 @@ export function evaluateEntryBuys(
       dailyNegativeEdgeSpentUsdc,
     );
 
-    if (seedEvaluation.decision) {
+    if (seedEvaluation.decisions && seedEvaluation.decisions.length > 0) {
       return {
-        decisions: [seedEvaluation.decision],
+        decisions: seedEvaluation.decisions,
         trace: {
           ...trace,
-          selectedMode: seedEvaluation.decision.mode,
-          seedCandidates: seedEvaluation.trace,
+          selectedMode: seedEvaluation.decisions[0]!.mode,
+          seedCandidates: [...temporalSeedEvaluation.trace, ...seedEvaluation.trace],
           skipReason: determineBalancedPairSkipReason(inspected.maxCandidateSize, inspected.traces),
         },
       };
@@ -217,13 +258,49 @@ export function evaluateEntryBuys(
       decisions: [],
       trace: {
         ...trace,
-        seedCandidates: seedEvaluation.trace,
+        seedCandidates: [...temporalSeedEvaluation.trace, ...seedEvaluation.trace],
         skipReason:
-          seedEvaluation.trace.length > 0
+          temporalSeedEvaluation.trace.length > 0 || seedEvaluation.trace.length > 0
             ? `${determineBalancedPairSkipReason(inspected.maxCandidateSize, inspected.traces)}+single_leg_seed`
             : determineBalancedPairSkipReason(inspected.maxCandidateSize, inspected.traces),
       },
     };
+  }
+
+  if (ctx.allowControlledOverlap) {
+    const inspected = inspectBalancedPairCandidates(
+      config,
+      state,
+      books,
+      ctx.lot,
+      pairCap,
+      ctx.secsToClose,
+      dailyNegativeEdgeSpentUsdc,
+      ctx.fairValueSnapshot,
+    );
+    if (inspected.bestCandidate) {
+      return {
+        decisions: buildBalancedPairEntryBuys(
+          state,
+          inspected.bestCandidate,
+          config.cryptoTakerFeeRate,
+          "balanced_pair_reentry",
+        ),
+        trace: {
+          mode: "balanced_pair",
+          requestedLot: ctx.lot,
+          totalShares,
+          shareGap,
+          pairCap,
+          selectedMode: inspected.bestCandidate.mode,
+          laggingSide: state.upShares > state.downShares ? "DOWN" : "UP",
+          ...(inspected.bestRawPair !== undefined ? { bestRawPair: inspected.bestRawPair } : {}),
+          ...(inspected.bestEffectivePair !== undefined ? { bestEffectivePair: inspected.bestEffectivePair } : {}),
+          candidates: inspected.traces,
+          skipReason: "controlled_overlap_pair",
+        },
+      };
+    }
   }
 
   const laggingSide: OutcomeSide = state.upShares > state.downShares ? "DOWN" : "UP";
@@ -334,7 +411,8 @@ export function evaluateEntryBuys(
     oppositeAveragePrice,
     missingSidePrice: execution.averagePrice,
   });
-  if (repairCost > phase.cap || executableSize > phase.maxQty) {
+  const highLowPhaseCapOverride = Boolean(allowance.highLowMismatch && allowance.allowed);
+  if ((repairCost > phase.cap && !highLowPhaseCapOverride) || executableSize > phase.maxQty) {
     return {
       decisions: [],
       trace: {
@@ -353,6 +431,13 @@ export function evaluateEntryBuys(
       },
     };
   }
+  const fairValueRequired =
+    allowance.highLowMismatch && allowance.allowed && !allowance.requiresFairValue
+      ? false
+      : !(
+          config.allowStrictResidualCompletionWithoutFairValue &&
+          repairCost <= config.strictResidualCompletionCap
+        ) || Boolean(allowance.requiresFairValue);
   const fairValueDecision = fairValueGate({
     config,
     snapshot: ctx.fairValueSnapshot,
@@ -361,14 +446,13 @@ export function evaluateEntryBuys(
     mode: phase.mode === "PARTIAL_EMERGENCY_COMPLETION" ? "emergency" : "completion",
     secsToClose: ctx.secsToClose,
     effectiveCost: repairCost,
-    required: !(
-      config.allowStrictResidualCompletionWithoutFairValue &&
-      repairCost <= config.strictResidualCompletionCap
-    ) || Boolean(allowance.requiresFairValue),
+    required: fairValueRequired,
   });
+  const repairMode: StrategyExecutionMode =
+    allowance.highLowMismatch && allowance.allowed ? "HIGH_LOW_COMPLETION_CHASE" : phase.mode;
   const detailedTrace: EntryDecisionTrace = {
     ...trace,
-    selectedMode: phase.mode,
+    selectedMode: repairMode,
     repairFilledSize: executableSize,
     repairFinalQty: executableSize,
     repairCost,
@@ -415,13 +499,256 @@ export function evaluateEntryBuys(
           fullyFilled: execution.filledSize + 1e-9 >= executableSize,
         },
         "lagging_rebalance",
-        phase.mode,
+        repairMode,
         config.cryptoTakerFeeRate,
         repairCost,
         allowance.negativeEdgeUsdc,
       ),
     ],
     trace: detailedTrace,
+  };
+}
+
+function fairValueForOrphanSide(snapshot: FairValueSnapshot | undefined, side: OutcomeSide): number | undefined {
+  if (!snapshot || snapshot.status !== "valid") {
+    return undefined;
+  }
+  return side === "UP" ? snapshot.fairUp : snapshot.fairDown;
+}
+
+function currentOrphanNotionalUsdc(state: XuanMarketState): number {
+  const gap = absoluteShareGap(state);
+  if (gap <= 1e-6) {
+    return 0;
+  }
+  const orphanSide: OutcomeSide = state.upShares > state.downShares ? "UP" : "DOWN";
+  return Number((gap * averageCost(state, orphanSide)).toFixed(6));
+}
+
+function evaluateOrphanRisk(args: {
+  config: XuanStrategyConfig;
+  state: XuanMarketState;
+  side: OutcomeSide;
+  execution: ExecutionQuote;
+  candidateSize: number;
+  fairValueSnapshot?: FairValueSnapshot | undefined;
+}): OrphanRiskTrace {
+  const effectivePrice = args.execution.averagePrice + takerFeePerShare(
+    args.execution.averagePrice,
+    args.config.cryptoTakerFeeRate,
+  );
+  const notionalUsdc = Number((effectivePrice * args.candidateSize).toFixed(6));
+  const marketOrphanNotionalUsdc = Number((currentOrphanNotionalUsdc(args.state) + notionalUsdc).toFixed(6));
+  const fairValue = fairValueForOrphanSide(args.fairValueSnapshot, args.side);
+  const fairPremium = fairValue !== undefined ? Number((effectivePrice - fairValue).toFixed(6)) : undefined;
+  let reason: string | undefined;
+
+  if (args.candidateSize > args.config.maxSingleOrphanQty + 1e-6) {
+    reason = "orphan_qty";
+  } else if (notionalUsdc > args.config.orphanLegMaxNotionalUsdc + 1e-6) {
+    reason = "orphan_notional";
+  } else if (marketOrphanNotionalUsdc > args.config.maxMarketOrphanUsdc + 1e-6) {
+    reason = "market_orphan_budget";
+  } else if (effectivePrice > args.config.singleLegOrphanCap + 1e-9) {
+    reason = "single_leg_orphan_cap";
+  } else if (
+    args.config.singleLegFairValueVeto &&
+    fairPremium !== undefined &&
+    fairPremium > args.config.singleLegOrphanMaxFairPremium + 1e-9
+  ) {
+    reason = "orphan_fair_value";
+  }
+
+  return {
+    allowed: reason === undefined,
+    effectivePrice: Number(effectivePrice.toFixed(6)),
+    notionalUsdc,
+    marketOrphanNotionalUsdc,
+    ...(fairValue !== undefined ? { fairValue } : {}),
+    ...(fairPremium !== undefined ? { fairPremium } : {}),
+    ...(reason ? { reason } : {}),
+  };
+}
+
+function orphanGateReason(side: OutcomeSide, risk: OrphanRiskTrace): string | undefined {
+  return risk.reason ? `${side.toLowerCase()}_${risk.reason}` : undefined;
+}
+
+function orphanRiskSortValue(risk: OrphanRiskTrace): number {
+  const premiumPenalty = Math.max(0, risk.fairPremium ?? 0) * 10;
+  const disallowedPenalty = risk.allowed ? 0 : 1_000;
+  return disallowedPenalty + premiumPenalty + risk.effectivePrice + risk.notionalUsdc / 100;
+}
+
+function evaluateTemporalSingleLegSeed(
+  config: XuanStrategyConfig,
+  state: XuanMarketState,
+  books: OrderBookState,
+  ctx: EntryLadderContext,
+  dailyNegativeEdgeSpentUsdc: number,
+): {
+  decision?: EntryBuyDecision;
+  trace: SingleLegSeedCandidateTrace[];
+} {
+  if (
+    config.botMode !== "XUAN" ||
+    !config.allowTemporalSingleLegSeed ||
+    ctx.secsToClose <= Math.max(config.finalWindowNoChaseSec, config.temporalSingleLegTtlSec) ||
+    (ctx.secsToClose <= config.finalWindowSoftStartSec && !config.allowSingleLegSeedInLast60S)
+  ) {
+    return { trace: [] };
+  }
+
+  const candidateSize = normalizeOrderSize(
+    Math.min(
+      ctx.lot,
+      config.singleLegSeedMaxQty,
+      Math.max(0, config.maxMarketSharesPerSide - state.upShares),
+      Math.max(0, config.maxMarketSharesPerSide - state.downShares),
+      Math.max(0, config.maxOneSidedExposureShares),
+    ),
+    state.market.minOrderSize,
+  );
+  if (candidateSize <= 0) {
+    return { trace: [] };
+  }
+
+  const sideOrder = (["UP", "DOWN"] as OutcomeSide[]).sort((left, right) => {
+    const leftQuote = books.quoteForSize(left, "ask", candidateSize);
+    const rightQuote = books.quoteForSize(right, "ask", candidateSize);
+    const leftRisk = evaluateOrphanRisk({
+      config,
+      state,
+      side: left,
+      execution: leftQuote,
+      candidateSize: candidateSize,
+      fairValueSnapshot: ctx.fairValueSnapshot,
+    });
+    const rightRisk = evaluateOrphanRisk({
+      config,
+      state,
+      side: right,
+      execution: rightQuote,
+      candidateSize: candidateSize,
+      fairValueSnapshot: ctx.fairValueSnapshot,
+    });
+    return orphanRiskSortValue(leftRisk) - orphanRiskSortValue(rightRisk);
+  });
+  const selectedMode: StrategyExecutionMode = "TEMPORAL_SINGLE_LEG_SEED";
+  const traces: SingleLegSeedCandidateTrace[] = [];
+  let decision: EntryBuyDecision | undefined;
+
+  for (const side of sideOrder) {
+    const oppositeSide: OutcomeSide = side === "UP" ? "DOWN" : "UP";
+    const currentSideShares = side === "UP" ? state.upShares : state.downShares;
+    const oppositeShares = oppositeSide === "UP" ? state.upShares : state.downShares;
+    const initialSeedQuote = books.quoteForSize(side, "ask", candidateSize);
+    const initialSeedFilledSize = normalizeOrderSize(initialSeedQuote.filledSize, state.market.minOrderSize);
+    const initialOppositeQuote = books.quoteForSize(oppositeSide, "ask", candidateSize);
+    const initialOppositeFilledSize = normalizeOrderSize(initialOppositeQuote.filledSize, state.market.minOrderSize);
+    const maxSeedByOppositeDepth = initialOppositeFilledSize / Math.max(config.temporalSingleLegMinOppositeDepthRatio, 1e-6);
+    const executableSize = normalizeOrderSize(
+      Math.min(candidateSize, initialSeedFilledSize, maxSeedByOppositeDepth),
+      state.market.minOrderSize,
+    );
+    const seedQuote =
+      executableSize > 0 ? books.quoteForSize(side, "ask", executableSize) : initialSeedQuote;
+    const oppositeQuote =
+      executableSize > 0 ? books.quoteForSize(oppositeSide, "ask", executableSize) : initialOppositeQuote;
+    const oppositeFilledSize = normalizeOrderSize(oppositeQuote.filledSize, state.market.minOrderSize);
+    const oppositeCoverageRatio =
+      executableSize > 0 ? Number((oppositeFilledSize / executableSize).toFixed(6)) : 0;
+    const effectivePricePerShare =
+      seedQuote.averagePrice + takerFeePerShare(seedQuote.averagePrice, config.cryptoTakerFeeRate);
+    const referencePairCost =
+      executableSize > 0
+        ? pairCostWithBothTaker(
+            side === "UP" ? seedQuote.averagePrice : oppositeQuote.averagePrice,
+            side === "DOWN" ? seedQuote.averagePrice : oppositeQuote.averagePrice,
+            config.cryptoTakerFeeRate,
+          )
+        : Number.POSITIVE_INFINITY;
+    const negativeEdgeUsdc = executableSize > 0 ? Math.max(0, referencePairCost - 1) * executableSize : 0;
+    const projectedGap = Math.abs(currentSideShares + executableSize - oppositeShares);
+    let skipReason: string | undefined;
+
+    if (state.consecutiveSeedSide === side && state.consecutiveSeedCount >= config.maxConsecutiveSingleLegSeedsPerSide) {
+      skipReason = "temporal_seed_side_limit";
+    } else if (initialSeedFilledSize <= 0 || executableSize <= 0) {
+      skipReason = "temporal_seed_depth";
+    } else if (oppositeCoverageRatio + 1e-6 < config.temporalSingleLegMinOppositeDepthRatio) {
+      skipReason = "temporal_seed_opposite_depth";
+    } else if (projectedGap > config.maxOneSidedExposureShares + 1e-6) {
+      skipReason = "temporal_seed_one_sided_exposure";
+    } else if (referencePairCost > config.xuanBehaviorCap + 1e-9) {
+      skipReason = "temporal_behavior_cap";
+    } else if (negativeEdgeUsdc > config.maxNegativePairEdgePerCycleUsdc + 1e-9) {
+      skipReason = "temporal_cycle_budget";
+    } else if (state.negativePairEdgeConsumedUsdc + negativeEdgeUsdc > config.maxNegativePairEdgePerMarketUsdc + 1e-9) {
+      skipReason = "temporal_market_budget";
+    } else if (dailyNegativeEdgeSpentUsdc + negativeEdgeUsdc > config.maxNegativeDailyBudgetUsdc + 1e-9) {
+      skipReason = "temporal_daily_budget";
+    }
+
+    const fairValueDecision = fairValueGate({
+      config,
+      snapshot: ctx.fairValueSnapshot,
+      side,
+      sidePrice: seedQuote.averagePrice,
+      mode: "seed",
+      secsToClose: ctx.secsToClose,
+      effectiveCost: referencePairCost,
+      required: config.fairValueFailClosedForSeed,
+    });
+    const orphanRisk = evaluateOrphanRisk({
+      config,
+      state,
+      side,
+      execution: seedQuote,
+      candidateSize: executableSize > 0 ? executableSize : candidateSize,
+      fairValueSnapshot: ctx.fairValueSnapshot,
+    });
+    const traceSkipReason = skipReason ?? fairValueDecision.reason ?? orphanRisk.reason;
+    traces.push({
+      side,
+      requestedSize: candidateSize,
+      filledSize: executableSize,
+      oppositeFilledSize,
+      oppositeCoverageRatio,
+      averagePrice: seedQuote.averagePrice,
+      limitPrice: seedQuote.limitPrice,
+      effectivePricePerShare,
+      referencePairCost,
+      negativeEdgeUsdc,
+      orphanRisk,
+      allowed: skipReason === undefined && fairValueDecision.allowed && orphanRisk.allowed,
+      ...(skipReason === undefined && fairValueDecision.allowed && orphanRisk.allowed ? { selectedMode } : {}),
+      ...(traceSkipReason ? { skipReason: traceSkipReason } : {}),
+    });
+
+    if (!decision && skipReason === undefined && fairValueDecision.allowed && orphanRisk.allowed) {
+      decision = buildEntryBuy(
+        state,
+        side,
+        {
+          ...seedQuote,
+          requestedSize: executableSize,
+          filledSize: executableSize,
+          fullyFilled: seedQuote.filledSize + 1e-9 >= executableSize,
+        },
+        "temporal_single_leg_seed",
+        selectedMode,
+        config.cryptoTakerFeeRate,
+        referencePairCost,
+        negativeEdgeUsdc,
+        seedQuote.averagePrice + oppositeQuote.averagePrice,
+      );
+    }
+  }
+
+  return {
+    ...(decision ? { decision } : {}),
+    trace: traces,
   };
 }
 
@@ -513,20 +840,50 @@ function inspectBalancedPairCandidates(
         allowance.mode !== "STRICT_PAIR_SWEEP" &&
         config.fairValueFailClosedForNegativePair,
     });
-    const fairValueAllowed = upFairValue.allowed && downFairValue.allowed;
+    const fairValueAllowed =
+      (upFairValue.allowed && downFairValue.allowed) ||
+      shouldAllowPairedHighLowFairValueOverride(
+        config,
+        allowance,
+        upExecution.averagePrice,
+        downExecution.averagePrice,
+        pairCost,
+        [upFairValue.reason, downFairValue.reason].filter((reason): reason is string => Boolean(reason)),
+      );
+    const upOrphanRisk = evaluateOrphanRisk({
+      config,
+      state,
+      side: "UP",
+      execution: upExecution,
+      candidateSize: requestedSize,
+      fairValueSnapshot,
+    });
+    const downOrphanRisk = evaluateOrphanRisk({
+      config,
+      state,
+      side: "DOWN",
+      execution: downExecution,
+      candidateSize: requestedSize,
+      fairValueSnapshot,
+    });
+    const orphanRiskAllowed = upOrphanRisk.allowed && downOrphanRisk.allowed;
     const verdict =
       !upExecution.fullyFilled
         ? "up_depth"
         : !downExecution.fullyFilled
           ? "down_depth"
-          : allowance?.allowed && fairValueAllowed
+          : allowance?.allowed && fairValueAllowed && orphanRiskAllowed
             ? "ok"
-            : "pair_cap";
+            : allowance?.allowed && fairValueAllowed && !orphanRiskAllowed
+              ? "orphan_risk"
+              : "pair_cap";
     const gateReason =
       verdict === "pair_cap"
         ? fairValueAllowed
           ? describePairGate(config, pairCost, requestedSize, allowance, secsToClose, cap)
           : upFairValue.reason ?? downFairValue.reason ?? "pair_fair_value"
+        : verdict === "orphan_risk"
+          ? orphanGateReason("UP", upOrphanRisk) ?? orphanGateReason("DOWN", downOrphanRisk)
         : undefined;
 
     traces.push({
@@ -544,6 +901,8 @@ function inspectBalancedPairCandidates(
       verdict,
       ...(allowance?.mode ? { selectedMode: allowance.mode } : {}),
       ...(gateReason ? { gateReason } : {}),
+      upOrphanRisk,
+      downOrphanRisk,
     });
 
     if (verdict === "ok") {
@@ -575,14 +934,12 @@ function evaluateSingleLegSeed(
   ctx: EntryLadderContext,
   dailyNegativeEdgeSpentUsdc: number,
 ): {
-  decision?: EntryBuyDecision;
+  decisions?: EntryBuyDecision[];
   trace: SingleLegSeedCandidateTrace[];
 } {
   if (
     config.botMode !== "XUAN" ||
-    !config.allowSingleLegSeed ||
     !config.allowXuanCoveredSeed ||
-    !config.allowCheapUnderdogSeed ||
     ctx.secsToClose <= config.finalWindowNoChaseSec ||
     (ctx.secsToClose <= config.finalWindowSoftStartSec && !config.allowSingleLegSeedInLast60S)
   ) {
@@ -603,52 +960,86 @@ function evaluateSingleLegSeed(
     return { trace: [] };
   }
 
-  const sideOrder: OutcomeSide[] = books.bestAsk("UP") <= books.bestAsk("DOWN") ? ["UP", "DOWN"] : ["DOWN", "UP"];
+  const sideOrder = (["UP", "DOWN"] as OutcomeSide[]).sort((left, right) => {
+    const leftQuote = books.quoteForSize(left, "ask", candidateSize);
+    const rightQuote = books.quoteForSize(right, "ask", candidateSize);
+    const leftSize = normalizeOrderSize(leftQuote.filledSize || candidateSize, state.market.minOrderSize);
+    const rightSize = normalizeOrderSize(rightQuote.filledSize || candidateSize, state.market.minOrderSize);
+    const leftRisk = evaluateOrphanRisk({
+      config,
+      state,
+      side: left,
+      execution: leftQuote,
+      candidateSize: leftSize > 0 ? leftSize : candidateSize,
+      fairValueSnapshot: ctx.fairValueSnapshot,
+    });
+    const rightRisk = evaluateOrphanRisk({
+      config,
+      state,
+      side: right,
+      execution: rightQuote,
+      candidateSize: rightSize > 0 ? rightSize : candidateSize,
+      fairValueSnapshot: ctx.fairValueSnapshot,
+    });
+    return orphanRiskSortValue(leftRisk) - orphanRiskSortValue(rightRisk);
+  });
   const traces: SingleLegSeedCandidateTrace[] = [];
-  let decision: EntryBuyDecision | undefined;
+  let decisions: EntryBuyDecision[] | undefined;
 
   for (const side of sideOrder) {
     const oppositeSide: OutcomeSide = side === "UP" ? "DOWN" : "UP";
     const currentSideShares = side === "UP" ? state.upShares : state.downShares;
     const oppositeShares = oppositeSide === "UP" ? state.upShares : state.downShares;
     const oldGap = absoluteShareGap(state);
-    const projectedGap = Math.abs(currentSideShares + candidateSize - oppositeShares);
-    const execution = books.quoteForSize(side, "ask", candidateSize);
-    const executableSize = normalizeOrderSize(execution.filledSize, state.market.minOrderSize);
-    const effectivePricePerShare = execution.averagePrice + takerFeePerShare(execution.averagePrice, config.cryptoTakerFeeRate);
-    const oppositeQuote = books.quoteForSize(oppositeSide, "ask", executableSize > 0 ? executableSize : candidateSize);
-    const referencePairCost = pairCostWithBothTaker(
-      side === "UP" ? execution.averagePrice : oppositeQuote.averagePrice,
-      side === "DOWN" ? execution.averagePrice : oppositeQuote.averagePrice,
-      config.cryptoTakerFeeRate,
+    const seedQuote = books.quoteForSize(side, "ask", candidateSize);
+    const seedExecutableSize = normalizeOrderSize(seedQuote.filledSize, state.market.minOrderSize);
+    const oppositeQuote = books.quoteForSize(oppositeSide, "ask", seedExecutableSize > 0 ? seedExecutableSize : candidateSize);
+    const oppositeExecutableSize = normalizeOrderSize(oppositeQuote.filledSize, state.market.minOrderSize);
+    const pairExecutableSize = normalizeOrderSize(
+      Math.min(seedExecutableSize, oppositeExecutableSize),
+      state.market.minOrderSize,
     );
-    const negativeEdgeUsdc = Math.max(0, referencePairCost - 1) * Math.max(executableSize, candidateSize);
+    const projectedGap = Math.abs(currentSideShares + (pairExecutableSize > 0 ? pairExecutableSize : candidateSize) - oppositeShares);
+    const effectivePricePerShare =
+      seedQuote.averagePrice + takerFeePerShare(seedQuote.averagePrice, config.cryptoTakerFeeRate);
+    const referencePairCost = pairExecutableSize > 0
+      ? pairCostWithBothTaker(
+          side === "UP" ? seedQuote.averagePrice : oppositeQuote.averagePrice,
+          side === "DOWN" ? seedQuote.averagePrice : oppositeQuote.averagePrice,
+          config.cryptoTakerFeeRate,
+        )
+      : Number.POSITIVE_INFINITY;
+    const negativeEdgeUsdc =
+      pairExecutableSize > 0
+        ? Math.max(0, referencePairCost - 1) * Math.max(pairExecutableSize, candidateSize)
+        : 0;
     let skipReason: string | undefined;
 
     const hasOppositeInventoryCover =
-      executableSize > 0 &&
-      oppositeShares + 1e-6 >= executableSize * config.coveredSeedMinOppositeCoverageRatio;
+      pairExecutableSize > 0 &&
+      oppositeShares + 1e-6 >= pairExecutableSize * config.coveredSeedMinOppositeCoverageRatio;
     const canUseInventoryCover =
       config.coveredSeedAllowOppositeInventoryCover && hasOppositeInventoryCover;
     const requiresSamePairgroupOppositeOrder =
       config.coveredSeedRequireSamePairgroupOppositeOrder &&
       !canUseInventoryCover &&
       config.coveredSeedAllowSamePairgroupOppositeOrder;
+    const effectiveProjectedGap = requiresSamePairgroupOppositeOrder ? oldGap : projectedGap;
 
-    if (!config.allowNakedSingleLegSeed && !canUseInventoryCover && requiresSamePairgroupOppositeOrder) {
+    if (!config.coveredSeedAllowSamePairgroupOppositeOrder && !canUseInventoryCover && !config.allowNakedSingleLegSeed) {
       skipReason = "seed_requires_same_pairgroup_opposite_order";
-    } else if (!config.allowNakedSingleLegSeed && !canUseInventoryCover) {
+    } else if (!config.allowNakedSingleLegSeed && !canUseInventoryCover && !requiresSamePairgroupOppositeOrder) {
       skipReason = "seed_missing_opposite_inventory";
     } else if (state.consecutiveSeedSide === side && state.consecutiveSeedCount >= config.maxConsecutiveSingleLegSeedsPerSide) {
       skipReason = "seed_side_limit";
     } else if (
       config.forbidBuyThatIncreasesImbalance &&
-      projectedGap > oldGap + config.maxCompletionOvershootShares
+      effectiveProjectedGap > oldGap + config.maxCompletionOvershootShares
     ) {
       skipReason = "seed_increases_imbalance";
-    } else if (projectedGap > config.maxOneSidedExposureShares) {
+    } else if (effectiveProjectedGap > config.maxOneSidedExposureShares) {
       skipReason = "seed_one_sided_exposure";
-    } else if (executableSize <= 0) {
+    } else if (pairExecutableSize <= 0) {
       skipReason = "seed_depth";
     } else if (referencePairCost > config.xuanPairSweepHardCap) {
       skipReason = "seed_reference_pair_cap";
@@ -665,48 +1056,78 @@ function evaluateSingleLegSeed(
       config,
       snapshot: ctx.fairValueSnapshot,
       side,
-      sidePrice: execution.averagePrice,
+      sidePrice: seedQuote.averagePrice,
       mode: "seed",
       secsToClose: ctx.secsToClose,
       effectiveCost: referencePairCost,
       required: config.coveredSeedRequiresFairValue || config.fairValueFailClosedForSeed,
     });
+    const orphanRisk = evaluateOrphanRisk({
+      config,
+      state,
+      side,
+      execution: seedQuote,
+      candidateSize: pairExecutableSize > 0 ? pairExecutableSize : candidateSize,
+      fairValueSnapshot: ctx.fairValueSnapshot,
+    });
+    const traceSkipReason = skipReason ?? fairValueDecision.reason ?? orphanRisk.reason;
     traces.push({
       side,
       requestedSize: candidateSize,
-      filledSize: executableSize,
-      averagePrice: execution.averagePrice,
-      limitPrice: execution.limitPrice,
+      filledSize: pairExecutableSize,
+      averagePrice: seedQuote.averagePrice,
+      limitPrice: seedQuote.limitPrice,
       effectivePricePerShare,
       referencePairCost,
       negativeEdgeUsdc,
-      allowed: skipReason === undefined && fairValueDecision.allowed,
-      ...(skipReason === undefined ? { selectedMode } : {}),
-      ...(skipReason ?? fairValueDecision.reason ? { skipReason: skipReason ?? fairValueDecision.reason } : {}),
+      orphanRisk,
+      allowed: skipReason === undefined && fairValueDecision.allowed && orphanRisk.allowed,
+      ...(skipReason === undefined && fairValueDecision.allowed && orphanRisk.allowed ? { selectedMode } : {}),
+      ...(traceSkipReason ? { skipReason: traceSkipReason } : {}),
     });
 
-    if (!decision && skipReason === undefined && fairValueDecision.allowed) {
-      decision = buildEntryBuy(
-        state,
-        side,
-        {
-          ...execution,
-          requestedSize: executableSize,
-          filledSize: executableSize,
-          fullyFilled: execution.filledSize + 1e-9 >= executableSize,
-        },
-        "balanced_pair_seed",
-        selectedMode,
-        config.cryptoTakerFeeRate,
-        referencePairCost,
-        negativeEdgeUsdc,
-        execution.averagePrice + oppositeQuote.averagePrice,
-      );
+    if (!decisions && skipReason === undefined && fairValueDecision.allowed && orphanRisk.allowed) {
+      const seedExecution: ExecutionQuote = {
+        ...seedQuote,
+        requestedSize: pairExecutableSize,
+        filledSize: pairExecutableSize,
+        fullyFilled: seedQuote.filledSize + 1e-9 >= pairExecutableSize,
+      };
+      const coveredExecution: ExecutionQuote = {
+        ...oppositeQuote,
+        requestedSize: pairExecutableSize,
+        filledSize: pairExecutableSize,
+        fullyFilled: oppositeQuote.filledSize + 1e-9 >= pairExecutableSize,
+      };
+      decisions = [
+        buildEntryBuy(
+          state,
+          side,
+          seedExecution,
+          "balanced_pair_seed",
+          selectedMode,
+          config.cryptoTakerFeeRate,
+          referencePairCost,
+          negativeEdgeUsdc,
+          seedQuote.averagePrice + oppositeQuote.averagePrice,
+        ),
+        buildEntryBuy(
+          state,
+          oppositeSide,
+          coveredExecution,
+          "balanced_pair_seed",
+          selectedMode,
+          config.cryptoTakerFeeRate,
+          referencePairCost,
+          negativeEdgeUsdc,
+          seedQuote.averagePrice + oppositeQuote.averagePrice,
+        ),
+      ];
     }
   }
 
   return {
-    ...(decision ? { decision } : {}),
+    ...(decisions ? { decisions } : {}),
     trace: traces,
   };
 }
@@ -749,12 +1170,17 @@ function determineBalancedPairSkipReason(
   if (gateReasons.has("pair_daily_budget")) return "pair_daily_budget";
   if (gateReasons.has("pair_qty_limit")) return "pair_qty_limit";
   if (gateReasons.has("pair_time_gate")) return "pair_time_gate";
+  if ([...gateReasons].some((reason) => reason.includes("orphan"))) return "orphan_risk";
 
   const hasPairCap = traces.some((trace) => trace.verdict === "pair_cap");
+  const hasOrphanRisk = traces.some((trace) => trace.verdict === "orphan_risk");
   const hasDepthIssue = traces.some((trace) => trace.verdict === "up_depth" || trace.verdict === "down_depth");
 
   if (hasPairCap && hasDepthIssue) {
     return "pair_cap_and_depth";
+  }
+  if (hasOrphanRisk) {
+    return "orphan_risk";
   }
   if (hasPairCap) {
     return "pair_cap";
@@ -874,6 +1300,31 @@ function describePairGate(
     return "pair_time_gate";
   }
   return "pair_cap";
+}
+
+function shouldAllowPairedHighLowFairValueOverride(
+  config: XuanStrategyConfig,
+  allowance: ReturnType<typeof pairSweepAllowance> | undefined,
+  upPrice: number,
+  downPrice: number,
+  pairCost: number,
+  reasons: string[],
+): boolean {
+  if (!allowance?.allowed || allowance.mode === "STRICT_PAIR_SWEEP" || reasons.length === 0) {
+    return false;
+  }
+  if (reasons.some((reason) => reason !== "fair_value_high_side_price")) {
+    return false;
+  }
+
+  const highSide = Math.max(upPrice, downPrice);
+  const lowSide = Math.min(upPrice, downPrice);
+  if (highSide < config.highSidePriceThreshold || lowSide > config.lowSideMaxForHighCompletion) {
+    return false;
+  }
+
+  const cap = allowance.mode === "XUAN_HARD_PAIR_SWEEP" ? config.xuanPairSweepHardCap : config.xuanPairSweepSoftCap;
+  return pairCost <= cap;
 }
 
 function normalizeOrderSize(size: number, minOrderSize: number): number {

@@ -16,10 +16,12 @@ export interface ContinuousBotDaemonReport {
     mode: "live-daemon";
     maxMarkets: number;
     requestedDurationSec: number;
+    postCloseReconcileSec: number;
     tickMs: number;
     initialBookWaitMs: number;
     balanceSyncMs: number;
     interSessionPauseMs: number;
+    marketSelection: NonNullable<BotSessionOptions["marketSelection"]>;
     stateDbPath: string;
   };
   summary: {
@@ -44,13 +46,19 @@ export async function runContinuousBotDaemon(
   env: AppEnv,
   options: ContinuousBotDaemonOptions = {},
 ): Promise<ContinuousBotDaemonReport> {
+  const maxMarkets = Math.max(0, Math.floor(options.maxMarkets ?? 0));
   const resolvedOptions = {
     durationSec: Math.max(10, Math.floor(options.durationSec ?? 600)),
+    postCloseReconcileSec: Math.max(
+      0,
+      Math.floor(options.postCloseReconcileSec ?? (maxMarkets === 1 ? 60 : 0)),
+    ),
     tickMs: Math.max(250, Math.floor(options.tickMs ?? 1000)),
     initialBookWaitMs: Math.max(1000, Math.floor(options.initialBookWaitMs ?? 8000)),
     balanceSyncMs: Math.max(1000, Math.floor(options.balanceSyncMs ?? 5000)),
     interSessionPauseMs: Math.max(250, Math.floor(options.interSessionPauseMs ?? 1500)),
-    maxMarkets: Math.max(0, Math.floor(options.maxMarkets ?? 0)),
+    marketSelection: options.marketSelection ?? "auto",
+    maxMarkets,
     dailyBudgetStorePath: options.dailyBudgetStorePath ?? "",
   };
 
@@ -96,10 +104,11 @@ export async function runContinuousBotDaemon(
   while (resolvedOptions.maxMarkets === 0 || sessions.length < resolvedOptions.maxMarkets) {
     const report = await runStatefulBotSession(env, {
       durationSec: resolvedOptions.durationSec,
+      postCloseReconcileSec: resolvedOptions.postCloseReconcileSec,
       tickMs: resolvedOptions.tickMs,
       initialBookWaitMs: resolvedOptions.initialBookWaitMs,
       balanceSyncMs: resolvedOptions.balanceSyncMs,
-      marketSelection: "auto",
+      marketSelection: resolvedOptions.marketSelection,
       initialDailyNegativeEdgeSpentUsdc: dailyNegativeEdgeSpentUsdc,
     });
 
@@ -146,10 +155,12 @@ export async function runContinuousBotDaemon(
       mode: "live-daemon",
       maxMarkets: resolvedOptions.maxMarkets,
       requestedDurationSec: resolvedOptions.durationSec,
+      postCloseReconcileSec: resolvedOptions.postCloseReconcileSec,
       tickMs: resolvedOptions.tickMs,
       initialBookWaitMs: resolvedOptions.initialBookWaitMs,
       balanceSyncMs: resolvedOptions.balanceSyncMs,
       interSessionPauseMs: resolvedOptions.interSessionPauseMs,
+      marketSelection: resolvedOptions.marketSelection,
       stateDbPath: config.stateStorePath,
     },
     summary: {

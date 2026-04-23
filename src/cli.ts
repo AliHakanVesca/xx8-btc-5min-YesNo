@@ -311,7 +311,7 @@ async function runPaper(): Promise<void> {
   const replay = runSyntheticReplay(env);
   const stateStore = new PersistentStateStore(config.stateStorePath);
   stateStore.recordValidationRun({
-    kind: "replay",
+    kind: "paper",
     status: "ok",
     timestamp: Math.floor(Date.now() / 1000),
     payload: {
@@ -342,7 +342,7 @@ async function runPaperMulti(options: { windows: number }): Promise<void> {
   const replay = runMultiSyntheticReplay(env, options.windows);
   const stateStore = new PersistentStateStore(config.stateStorePath);
   stateStore.recordValidationRun({
-    kind: "replay",
+    kind: "paper",
     status: "ok",
     timestamp: Math.floor(Date.now() / 1000),
     payload: {
@@ -374,7 +374,7 @@ async function runPaperSessionCommand(options: { variant: PaperSessionVariant })
   const replay = runPaperSession(env, options.variant);
   const stateStore = new PersistentStateStore(config.stateStorePath);
   stateStore.recordValidationRun({
-    kind: "replay",
+    kind: "paper",
     status: "ok",
     timestamp: Math.floor(Date.now() / 1000),
     payload: {
@@ -662,24 +662,32 @@ async function runBotDry(): Promise<void> {
 
 async function runBotLive(options: {
   durationSec: number;
+  postCloseReconcileSec?: number;
   tickMs: number;
   initialBookWaitMs: number;
   balanceSyncMs: number;
   maxMarkets: number;
   interSessionPauseMs: number;
+  marketSelection: "auto" | "current" | "next";
 }): Promise<void> {
   const env = loadEnv();
   if (env.DRY_RUN) {
     throw new Error("bot:live icin once DRY_RUN=false yap.");
   }
 
+  const postCloseOptions =
+    options.postCloseReconcileSec === undefined
+      ? {}
+      : { postCloseReconcileSec: options.postCloseReconcileSec };
   const report = await runContinuousBotDaemon(env, {
     durationSec: options.durationSec,
+    ...postCloseOptions,
     tickMs: options.tickMs,
     initialBookWaitMs: options.initialBookWaitMs,
     balanceSyncMs: options.balanceSyncMs,
     maxMarkets: options.maxMarkets,
     interSessionPauseMs: options.interSessionPauseMs,
+    marketSelection: options.marketSelection,
   });
   console.log(JSON.stringify(report, null, 2));
 }
@@ -965,27 +973,36 @@ export async function runCli(argv = process.argv): Promise<void> {
   program
     .command("bot:live")
     .option("--duration-sec <n>", "Run each live market session for at most N seconds", "600")
+    .option("--post-close-reconcile-sec <n>", "Wait after market close for balance reconcile/finalize; omitted auto-enables 60s for --max-markets 1")
     .option("--tick-ms <n>", "Decision loop interval in milliseconds", "1000")
     .option("--initial-book-wait-ms <n>", "How long to wait for initial orderbooks", "8000")
     .option("--balance-sync-ms <n>", "How often to reconcile ERC1155 balances", "5000")
     .option("--max-markets <n>", "Stop after N markets; 0 keeps the daemon running", "0")
     .option("--inter-session-pause-ms <n>", "Pause between finished markets before rollover", "1500")
+    .option("--market-selection <mode>", "Market selection: auto | current | next", "auto")
     .action(
       async (options: {
         durationSec: string;
+        postCloseReconcileSec?: string;
         tickMs: string;
         initialBookWaitMs: string;
         balanceSyncMs: string;
         maxMarkets: string;
         interSessionPauseMs: string;
+        marketSelection: string;
       }) =>
         runBotLive({
           durationSec: Number(options.durationSec),
+          ...(options.postCloseReconcileSec === undefined
+            ? {}
+            : { postCloseReconcileSec: Number(options.postCloseReconcileSec) }),
           tickMs: Number(options.tickMs),
           initialBookWaitMs: Number(options.initialBookWaitMs),
           balanceSyncMs: Number(options.balanceSyncMs),
           maxMarkets: Number(options.maxMarkets),
           interSessionPauseMs: Number(options.interSessionPauseMs),
+          marketSelection:
+            options.marketSelection === "current" || options.marketSelection === "next" ? options.marketSelection : "auto",
         }),
     );
 

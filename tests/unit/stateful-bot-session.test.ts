@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { buildOfflineMarket } from "../../src/infra/gamma/marketDiscovery.js";
+import { applyFill } from "../../src/strategy/xuan5m/inventoryState.js";
 import { createMarketState } from "../../src/strategy/xuan5m/marketState.js";
-import { inferUserTradeFill, reconcileStateWithBalances } from "../../src/live/statefulBotSession.js";
+import {
+  inferImmediateOrderResultFill,
+  inferUserTradeFill,
+  reconcileStateWithBalances,
+} from "../../src/live/statefulBotSession.js";
 
 describe("stateful bot session helpers", () => {
   it("infers taker fills from user trade websocket events", () => {
@@ -63,6 +68,43 @@ describe("stateful bot session helpers", () => {
     });
   });
 
+  it("infers immediate taker fills from matched order results", () => {
+    const market = buildOfflineMarket(1713696000);
+    const fill = inferImmediateOrderResultFill({
+      outcome: "UP",
+      nowTs: 1713696015,
+      mode: "XUAN_HARD_PAIR_SWEEP",
+      order: {
+        tokenId: market.tokens.UP.tokenId,
+        side: "BUY",
+        price: 0.42,
+        amount: 2.1,
+        shareTarget: 5,
+        orderType: "FAK",
+      },
+      result: {
+        success: true,
+        simulated: false,
+        orderId: "order-1",
+        status: "matched",
+        requestedAt: 1713696015,
+        raw: {
+          takingAmount: "5",
+          makingAmount: "2.1",
+        },
+      },
+    });
+
+    expect(fill).toMatchObject({
+      outcome: "UP",
+      side: "BUY",
+      price: 0.42,
+      size: 5,
+      makerTaker: "taker",
+      executionMode: "XUAN_HARD_PAIR_SWEEP",
+    });
+  });
+
   it("reconciles state from observed balances by inferring missing buys and scaling down reductions", () => {
     const market = buildOfflineMarket(1713696000);
     let state = createMarketState(market);
@@ -95,5 +137,74 @@ describe("stateful bot session helpers", () => {
     expect(reconciled.state.upShares).toBe(45);
     expect(reconciled.state.downShares).toBe(6);
     expect(reconciled.state.downCost).toBeCloseTo(2.94, 8);
+  });
+
+  it("can ignore a transient zero balance shortfall for a recent bot-owned fill", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      price: 0.41,
+      size: 5.125,
+      timestamp: 1713696012,
+      makerTaker: "taker",
+      executionMode: "XUAN_HARD_PAIR_SWEEP",
+    });
+
+    const reconciled = reconcileStateWithBalances({
+      state,
+      observed: { up: 0, down: 0 },
+      nowTs: 1713696013,
+      fallbackPrices: { UP: 0.41, DOWN: 0.6 },
+      shouldIgnoreShortfall: (candidate) =>
+        candidate.outcome === "UP" &&
+        candidate.fromShares === 5.125 &&
+        candidate.toShares === 0 &&
+        candidate.nowTs === 1713696013,
+    });
+
+    expect(reconciled.corrections).toEqual([]);
+    expect(reconciled.inferredFills).toEqual([]);
+    expect(reconciled.state.upShares).toBe(5.125);
+    expect(reconciled.state.upCost).toBeCloseTo(2.10125, 8);
+  });
+
+  it("shrinks a bot-owned order-result fill to the settled on-chain share quantity without adding a duplicate buy", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      price: 0.41,
+      size: 5.125,
+      timestamp: 1713696012,
+      makerTaker: "taker",
+      executionMode: "XUAN_HARD_PAIR_SWEEP",
+    });
+
+    const reconciled = reconcileStateWithBalances({
+      state,
+      observed: { up: 4.9036, down: 0 },
+      nowTs: 1713696017,
+      fallbackPrices: { UP: 0.41, DOWN: 0.6 },
+    });
+
+    expect(reconciled.inferredFills).toEqual([]);
+    expect(reconciled.corrections).toEqual([
+      {
+        outcome: "UP",
+        fromShares: 5.125,
+        toShares: 4.9036,
+      },
+    ]);
+    expect(reconciled.state.upShares).toBe(4.9036);
+    expect(reconciled.state.upLots).toEqual([
+      expect.objectContaining({
+        size: 4.9036,
+        price: 0.41,
+      }),
+    ]);
+    expect(reconciled.state.upCost).toBeCloseTo(2.010476, 8);
   });
 });

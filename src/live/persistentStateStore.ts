@@ -10,9 +10,9 @@ import type { StrategyExecutionMode } from "../strategy/xuan5m/executionModes.js
 export const DEFAULT_PERSISTENT_STATE_PATH = "data/runtime/xuan-state.sqlite";
 export const RISK_BUDGET_TIME_ZONE = "Europe/Istanbul";
 
-export type PersistentLotSource = "USER_WS" | "BALANCE_RECONCILE" | "REST_RESTORE";
+export type PersistentLotSource = "USER_WS" | "BALANCE_RECONCILE" | "REST_RESTORE" | "ORDER_RESULT";
 export type PersistentPriceSnapshotKind = "threshold" | "live";
-export type PersistentPriceSnapshotSource = "metadata" | "rtds" | "binance" | "chainlink" | "estimated";
+export type PersistentPriceSnapshotSource = "metadata" | "rtds" | "binance" | "chainlink" | "estimated" | "late_estimated";
 
 export interface StoredPriceSnapshot {
   marketSlug: string;
@@ -89,8 +89,23 @@ interface LotConsumption {
   effectivePrice: number;
 }
 
+type LotCloseReason = "merge" | "sell" | "balance_correction";
+
 function normalize(value: number): number {
   return Number(value.toFixed(6));
+}
+
+function normalizeFeeRate(rawFeeRate: number): number {
+  if (!Number.isFinite(rawFeeRate) || rawFeeRate < 0) {
+    return 0.072;
+  }
+  if (rawFeeRate > 100) {
+    return rawFeeRate / 10_000;
+  }
+  if (rawFeeRate > 1) {
+    return rawFeeRate / 100;
+  }
+  return rawFeeRate;
 }
 
 function ensureSqliteDir(path: string): void {
@@ -404,7 +419,7 @@ export class PersistentStateStore {
 
   recordFill(state: XuanMarketState, fill: FillRecord, context: PersistentFillContext): void {
     if (fill.side === "BUY") {
-      const feePerShare = takerFeePerShare(fill.price, state.market.feeRate);
+      const feePerShare = takerFeePerShare(fill.price, normalizeFeeRate(state.market.feeRate));
       this.db
         .prepare(`
           INSERT INTO inventory_lots (
@@ -440,6 +455,26 @@ export class PersistentStateStore {
     if (consumed.consumedQty <= 1e-6) {
       return;
     }
+  }
+
+  shrinkOpenLotsToObservedShares(
+    marketSlug: string,
+    outcome: OutcomeSide,
+    observedShares: number,
+    closedAt: number,
+  ): { fromShares: number; toShares: number; consumedQty: number } {
+    const fromShares = computeShares(this.loadOpenLotRows(marketSlug, outcome));
+    const toShares = normalize(Math.max(0, observedShares));
+    const shrinkQty = normalize(Math.max(0, fromShares - toShares));
+    if (shrinkQty <= 1e-6) {
+      return { fromShares, toShares: fromShares, consumedQty: 0 };
+    }
+    const consumed = this.consumeLots(marketSlug, outcome, shrinkQty, closedAt, "balance_correction");
+    return {
+      fromShares,
+      toShares: normalize(Math.max(0, fromShares - consumed.consumedQty)),
+      consumedQty: consumed.consumedQty,
+    };
   }
 
   recordMerge(state: XuanMarketState, merge: MergeRecord): void {
@@ -1147,7 +1182,7 @@ export class PersistentStateStore {
     outcome: OutcomeSide,
     requestedQty: number,
     closedAt: number,
-    closeReason: "merge" | "sell",
+    closeReason: LotCloseReason,
   ): { consumedQty: number; parts: LotConsumption[] } {
     const rows = this.loadOpenLotRows(marketSlug, outcome);
     let remaining = normalize(requestedQty);

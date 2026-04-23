@@ -67,4 +67,25 @@ describe("fair value engine", () => {
       reason: "fair_value_underdog_price",
     });
   });
+
+  it("allows high-side strict pair entries under the pair sweep cap", () => {
+    const config = buildConfig();
+    const decision = fairValueGate({
+      config,
+      snapshot: {
+        status: "valid",
+        estimatedThreshold: false,
+        fairUp: 0.03,
+        fairDown: 0.97,
+      },
+      side: "DOWN",
+      sidePrice: 0.96,
+      mode: "pair",
+      secsToClose: 240,
+      effectiveCost: 1.0055,
+      required: true,
+    });
+
+    expect(decision).toEqual({ allowed: true });
+  });
 });

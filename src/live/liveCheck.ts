@@ -130,6 +130,10 @@ function hasApiCreds(env: AppEnv): boolean {
   return Boolean(env.POLY_API_KEY && env.POLY_API_SECRET && env.POLY_API_PASSPHRASE);
 }
 
+function isReplayComparatorStatus(status: string | undefined): status is "pass" | "warn" | "fail" {
+  return status === "pass" || status === "warn" || status === "fail";
+}
+
 function recommendedCanaryEnv(): Record<string, string> {
   const report = {
     DRY_RUN: "false",
@@ -143,9 +147,24 @@ function recommendedCanaryEnv(): Record<string, string> {
     MAX_ONE_SIDED_EXPOSURE_SHARES: "30",
     MAX_CYCLES_PER_MARKET: "2",
     MAX_BUYS_PER_SIDE: "2",
-    ENABLE_XUAN_HARD_PAIR_SWEEP: "false",
+    STRICT_PAIR_EFFECTIVE_CAP: "1.006",
+    NORMAL_PAIR_EFFECTIVE_CAP: "1.020",
+    PAIR_SWEEP_STRICT_CAP: "1.006",
+    XUAN_PAIR_SWEEP_SOFT_CAP: "1.020",
+    XUAN_PAIR_SWEEP_HARD_CAP: "1.045",
+    ENABLE_XUAN_HARD_PAIR_SWEEP: "true",
+    XUAN_HARD_SWEEP_MAX_QTY: "5",
     ALLOW_SINGLE_LEG_SEED: "false",
     ALLOW_CHEAP_UNDERDOG_SEED: "false",
+    ALLOW_XUAN_COVERED_SEED: "true",
+    SINGLE_LEG_ORPHAN_CAP: "0.62",
+    SINGLE_LEG_FAIR_VALUE_VETO: "true",
+    SINGLE_LEG_ORPHAN_MAX_FAIR_PREMIUM: "0.035",
+    ORPHAN_LEG_MAX_NOTIONAL_USDC: "5",
+    ORPHAN_LEG_MAX_AGE_SEC: "90",
+    MAX_MARKET_ORPHAN_USDC: "5",
+    MAX_SINGLE_ORPHAN_QTY: "5",
+    PRICE_TO_BEAT_LATE_START_FALLBACK_ENABLED: "false",
     DAILY_MAX_LOSS_USDC: "10",
     MARKET_MAX_LOSS_USDC: "4",
     MIN_USDC_BALANCE_FOR_NEW_ENTRY: "25",
@@ -363,7 +382,9 @@ export async function runLiveCheck(env: AppEnv): Promise<LiveCheckReport> {
   }
   if (config.validationSequence === "REPLAY_THEN_LIVE" && config.replayRequiredBeforeLive) {
     if (!latestReplayValidation) {
-      blockers.push("Replay validation kaydi bulunmadi. Live oncesi once npm run paper veya npm run paper:session calistir.");
+      blockers.push("Replay comparator kaydi bulunmadi. Live oncesi once npm run xuan:compare-paper veya npm run xuan:compare-runtime calistir.");
+    } else if (!isReplayComparatorStatus(latestReplayValidation.status)) {
+      blockers.push("En son replay kaydi comparator verdict degil. Plain paper/session kaydi live gate icin yeterli degil.");
     } else if (latestReplayValidation.status === "fail") {
       blockers.push("Replay validation FAIL durumda. Live oncesi comparator FAIL duzeltilmeli.");
     } else if (latestReplayValidation.status === "warn") {

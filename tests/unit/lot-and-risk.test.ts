@@ -31,6 +31,23 @@ describe("lot ladder and risk windows", () => {
     ).toBe(5);
   });
 
+  it("uses the clipped mid lot early in live bankroll-adjusted mode", () => {
+    expect(
+      chooseLot(config, {
+        dryRunOrSmallLive: false,
+        secsFromOpen: 20,
+        imbalance: 0,
+        bookDepthGood: true,
+        pairCostWithinCap: true,
+        pairCostComfortable: true,
+        inventoryBalanced: true,
+        recentBothSidesFilled: false,
+        marketVolumeHigh: true,
+        pnlTodayPositive: false,
+      }),
+    ).toBe(10);
+  });
+
   it("moves to completion-only late in the window", () => {
     const state = createMarketState(buildOfflineMarket(1713696000));
     const risk = evaluateRisk(config, state, {

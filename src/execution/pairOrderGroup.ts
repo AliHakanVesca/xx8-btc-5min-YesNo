@@ -25,7 +25,9 @@ export interface PairOrderGroup {
   selectedMode:
     | "STRICT_PAIR_SWEEP"
     | "XUAN_SOFT_PAIR_SWEEP"
-    | "XUAN_HARD_PAIR_SWEEP";
+    | "XUAN_HARD_PAIR_SWEEP"
+    | "TEMPORAL_SINGLE_LEG_SEED"
+    | "PAIRGROUP_COVERED_SEED";
   createdAt: number;
   status: PairOrderGroupStatus;
   baselineUpShares: number;
@@ -66,7 +68,11 @@ export function createPairOrderGroup(args: {
   mode: "STRICT" | "XUAN";
   selectedMode: Extract<
     StrategyExecutionMode,
-    "STRICT_PAIR_SWEEP" | "XUAN_SOFT_PAIR_SWEEP" | "XUAN_HARD_PAIR_SWEEP"
+    | "STRICT_PAIR_SWEEP"
+    | "XUAN_SOFT_PAIR_SWEEP"
+    | "XUAN_HARD_PAIR_SWEEP"
+    | "TEMPORAL_SINGLE_LEG_SEED"
+    | "PAIRGROUP_COVERED_SEED"
   >;
   createdAt: number;
   state: XuanMarketState;
@@ -120,7 +126,7 @@ function asObject(value: unknown): Record<string, unknown> | undefined {
   return value as Record<string, unknown>;
 }
 
-function extractMatchedShares(result: OrderResult | undefined): number {
+export function extractMatchedShares(result: OrderResult | undefined): number {
   const raw = asObject(result?.raw);
   const direct = Number(raw?.takingAmount ?? 0);
   if (Number.isFinite(direct) && direct > 0) {

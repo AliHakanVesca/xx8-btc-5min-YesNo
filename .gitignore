@@ -6,4 +6,10 @@ coverage/
 logs/
 reports/
 data/recorder/
+data/*.sqlite-shm
+data/*.sqlite-wal
+data/*.sqlite.bak-*
+data/runtime/*.sqlite-shm
+data/runtime/*.sqlite-wal
+data/runtime/*.sqlite.bak-*
 .DS_Store

@@ -264,6 +264,7 @@ export function fairValueGate(args: {
     | "fairValueUnderdogPriceThreshold"
     | "highSidePriceThreshold"
     | "completionStrictCap"
+    | "pairSweepStrictCap"
     | "fairValueFailClosedForHighSideChase"
   >;
   snapshot?: FairValueSnapshot | undefined;
@@ -318,7 +319,8 @@ export function fairValueGate(args: {
   }
 
   if (isHighSide) {
-    if (args.effectiveCost !== undefined && args.effectiveCost <= args.config.completionStrictCap) {
+    const highSideStrictCap = args.mode === "pair" ? args.config.pairSweepStrictCap : args.config.completionStrictCap;
+    if (args.effectiveCost !== undefined && args.effectiveCost <= highSideStrictCap) {
       return { allowed: true };
     }
 
@@ -330,6 +332,9 @@ export function fairValueGate(args: {
     }
 
     if (fair + premium < args.sidePrice) {
+      if (!args.config.fairValueFailClosedForHighSideChase && !fairValueRequired) {
+        return { allowed: true };
+      }
       return {
         allowed: false,
         reason: "fair_value_high_side_price",

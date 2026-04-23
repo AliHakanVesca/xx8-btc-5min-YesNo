@@ -107,6 +107,49 @@ describe("entry and inventory adjustment", () => {
     expect(decision.entryBuys[0]?.reason).toBe("lagging_rebalance");
   });
 
+  it("can reopen a balanced pair while partial inventory exists when controlled overlap is allowed", () => {
+    const market = buildOfflineMarket(1713696000);
+    const state = createMarketState(market);
+    const bot = new Xuan5mBot();
+    const overlapConfig = buildStrategyConfig(
+      parseEnv({
+        DRY_RUN: "true",
+        POLY_STACK_MODE: "current-prod-v1",
+        ORPHAN_LEG_MAX_NOTIONAL_USDC: "10",
+        MAX_MARKET_ORPHAN_USDC: "10",
+      }),
+    );
+    state.downShares = 10;
+    state.downCost = 4.8;
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.47, size: 200 }], [{ price: 0.48, size: 200 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.47, size: 200 }], [{ price: 0.48, size: 200 }]),
+    );
+
+    const decision = bot.evaluateTick({
+      config: overlapConfig,
+      state,
+      books,
+      nowTs: market.startTs + 40,
+      riskContext: {
+        secsToClose: 260,
+        staleBookMs: 200,
+        balanceStaleMs: 200,
+        bookIsCrossed: false,
+        dailyLossUsdc: 0,
+        marketLossUsdc: 0,
+        usdcBalance: 100,
+      },
+      dryRunOrSmallLive: false,
+      allowControlledOverlap: true,
+    });
+
+    expect(decision.entryBuys).toHaveLength(2);
+    expect(decision.entryBuys.every((entry) => entry.reason === "balanced_pair_reentry")).toBe(true);
+    expect(decision.entryBuys.map((entry) => entry.side)).toEqual(["UP", "DOWN"]);
+  });
+
   it("opens with both-side taker buys by default when pair cost is within the entry cap", () => {
     const market = buildOfflineMarket(1713696000);
     const state = createMarketState(market);
@@ -151,6 +194,9 @@ describe("entry and inventory adjustment", () => {
         LIVE_SMALL_LOT_LADDER: "20,40",
         DEFAULT_LOT: "40",
         NORMAL_PAIR_EFFECTIVE_CAP: "1.01",
+        MAX_SINGLE_ORPHAN_QTY: "40",
+        ORPHAN_LEG_MAX_NOTIONAL_USDC: "40",
+        MAX_MARKET_ORPHAN_USDC: "40",
       }),
     );
     const books = new OrderBookState(

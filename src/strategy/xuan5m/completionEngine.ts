@@ -153,15 +153,23 @@ function chooseCompletion(
     }
 
     const costWithFees = completionCost(existingAverage, execution.averagePrice, config.cryptoTakerFeeRate);
-    if (costWithFees > phase.cap) {
-      continue;
-    }
     const allowance = completionAllowance(config, state, {
       costWithFees,
       candidateSize,
       oppositeAveragePrice: existingAverage,
       missingSidePrice: execution.averagePrice,
     });
+    const highLowPhaseCapOverride = Boolean(allowance.highLowMismatch && allowance.allowed);
+    if (costWithFees > phase.cap && !highLowPhaseCapOverride) {
+      continue;
+    }
+    const fairValueRequired =
+      allowance.highLowMismatch && allowance.allowed && !allowance.requiresFairValue
+        ? false
+        : !(
+            config.allowStrictResidualCompletionWithoutFairValue &&
+            costWithFees <= config.strictResidualCompletionCap
+          ) || Boolean(allowance.requiresFairValue);
     const fairValueDecision = fairValueGate({
       config,
       snapshot: ctx.fairValueSnapshot,
@@ -170,10 +178,7 @@ function chooseCompletion(
       mode: allowance.capMode === "emergency" ? "emergency" : "completion",
       secsToClose: ctx.secsToClose,
       effectiveCost: costWithFees,
-      required: !(
-        config.allowStrictResidualCompletionWithoutFairValue &&
-        costWithFees <= config.strictResidualCompletionCap
-      ) || Boolean(allowance.requiresFairValue),
+      required: fairValueRequired,
     });
     if (!allowance.allowed) {
       continue;
@@ -228,11 +233,14 @@ function chooseCompletion(
       }
     }
 
+    const selectedMode: StrategyExecutionMode =
+      allowance.highLowMismatch && allowance.allowed ? "HIGH_LOW_COMPLETION_CHASE" : phase.mode;
+
     return {
       sideToBuy,
       missingShares: candidateSize,
       residualAfter: normalizeSize(Math.max(0, missingShares - candidateSize)),
-      mode: phase.mode,
+      mode: selectedMode,
       costWithFees,
       capMode: allowance.capMode,
       negativeEdgeUsdc: allowance.negativeEdgeUsdc,

@@ -224,9 +224,9 @@ export function completionAllowance(
   const imbalanceRatio = imbalanceShares / Math.max(state.upShares + state.downShares, 1);
   const projectedBudget = state.negativeCompletionEdgeConsumedUsdc + negativeEdgeUsdc;
   const highLowMismatch =
-    config.requireStrictCapForHighLowMismatch &&
+    (config.requireStrictCapForHighLowMismatch || config.xuanCloneMode === "PUBLIC_FOOTPRINT") &&
     args.missingSidePrice >= config.highSidePriceThreshold &&
-    args.oppositeAveragePrice >= config.lowSideMaxForHighCompletion;
+    args.oppositeAveragePrice <= config.lowSideMaxForHighCompletion;
 
   if (config.botMode === "STRICT") {
     return {

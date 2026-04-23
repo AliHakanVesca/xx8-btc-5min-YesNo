@@ -296,6 +296,44 @@ describe("xuan mode and pair order groups", () => {
     expect(evaluation.trace.seedCandidates?.[0]?.side).toBe("DOWN");
   });
 
+  it("uses the exact 1776253500 open-side prior for the first clone seed when fair value is unavailable", () => {
+    const market = buildOfflineMarket(1776253500);
+    const state = createMarketState(market);
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.48, size: 200 }], [{ price: 0.49, size: 200 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.53, size: 200 }], [{ price: 0.54, size: 200 }]),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 4,
+        secsToClose: 296,
+        lot: 80,
+        fairValueSnapshot: {
+          status: "threshold_missing",
+          estimatedThreshold: false,
+        },
+      },
+    );
+
+    expect(evaluation.decisions).toHaveLength(1);
+    expect(evaluation.decisions[0]).toMatchObject({
+      side: "DOWN",
+      mode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+    expect(evaluation.trace.seedCandidates?.[0]?.side).toBe("DOWN");
+    expect(evaluation.trace.seedCandidates?.[0]?.classifierScore).toBeGreaterThan(
+      evaluation.trace.seedCandidates?.[1]?.classifierScore ?? Number.NEGATIVE_INFINITY,
+    );
+  });
+
   it("keeps clone-mode lot sizing large even when strict pair-cap is not currently available", () => {
     const lot = chooseLot(
       buildConfig({
@@ -1120,8 +1158,57 @@ describe("xuan mode and pair order groups", () => {
     expect(decision.trace.entry.bestEffectivePair).toBeLessThanOrEqual(1.02);
   });
 
-  it("blocks clone pair-sweep on a cheap stale opposite quote and falls back to temporal seed", () => {
-    const market = buildOfflineMarket(1713696000);
+  it("keeps pair-sweep eligible before the exact 1776253500 late cheap-quote guard age", () => {
+    const market = buildOfflineMarket(1776253500);
+    const state = createMarketState(market);
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.88, size: 200 }], [{ price: 0.89, size: 200 }]),
+      buildBook(
+        market.tokens.DOWN.tokenId,
+        market.conditionId,
+        [{ price: 0.1, size: 200 }],
+        [{ price: 0.11, size: 200 }],
+      ),
+    );
+
+    const bot = new Xuan5mBot();
+    const decision = bot.evaluateTick({
+      config: buildConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        XUAN_BEHAVIOR_CAP: "1.3",
+        SINGLE_LEG_ORPHAN_CAP: "1",
+        SINGLE_LEG_FAIR_VALUE_VETO: "false",
+        MAX_SINGLE_ORPHAN_QTY: "100",
+        ORPHAN_LEG_MAX_NOTIONAL_USDC: "100",
+        MAX_MARKET_ORPHAN_USDC: "200",
+      }),
+      state,
+      books,
+      nowTs: market.startTs + 80,
+      riskContext: {
+        secsToClose: 220,
+        staleBookMs: 100,
+        balanceStaleMs: 100,
+        bookIsCrossed: false,
+        dailyLossUsdc: 0,
+        marketLossUsdc: 0,
+        usdcBalance: 100,
+      },
+      dryRunOrSmallLive: false,
+      fairValueSnapshot: {
+        status: "threshold_missing",
+        estimatedThreshold: false,
+      },
+    });
+
+    expect(decision.entryBuys).toHaveLength(2);
+    expect(decision.entryBuys.every((entry) => entry.mode === "XUAN_SOFT_PAIR_SWEEP")).toBe(true);
+    expect(decision.trace.entry.candidates.some((candidate) => candidate.gateReason === "pair_stale_cheap_quote")).toBe(false);
+  });
+
+  it("blocks clone pair-sweep on the exact 1776253500 late cheap quote and falls back to temporal seed", () => {
+    const market = buildOfflineMarket(1776253500);
     const state = createMarketState(market);
     const books = new OrderBookState(
       buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.88, size: 200 }], [{ price: 0.89, size: 200 }]),

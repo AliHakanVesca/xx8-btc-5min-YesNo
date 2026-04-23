@@ -5,7 +5,7 @@ import type {
   CanonicalSequenceEvent,
   NormalizedClipTier,
 } from "../../src/analytics/xuanCanonicalReference.js";
-import { exact1776928800Reference } from "../../src/analytics/xuanExactReference.js";
+import { exact1776253500Reference, exact1776928800Reference } from "../../src/analytics/xuanExactReference.js";
 import publicSequenceFixture from "../fixtures/xuan_public_sequence_bundle.json" with { type: "json" };
 import runtimeIncidentFixture from "../fixtures/runtime_extract_btc-updown-5m-1776928800.json" with { type: "json" };
 
@@ -289,6 +289,47 @@ describe("xuan replay comparator", () => {
 
     expect(shifted.details.sideSequenceMismatchCount).toBeGreaterThan(0);
     expect(shifted.details.sideSequenceSimilarity).toBeLessThan(1);
+    expect(shifted.score).toBeLessThan(baseline.score);
+  });
+
+  it("penalizes deviations from the exact 1776253500 late cheap-seed to high-low chase path", () => {
+    const reference = exact1776253500Reference;
+    const baseline = compareCanonicalReference(reference, {
+      ...reference,
+      slug: "baseline-candidate",
+    });
+    const candidate: CanonicalReferenceExtract = {
+      ...reference,
+      slug: "candidate-market",
+      buySequence: reference.buySequence.map((side, index) =>
+        index === reference.buySequence.length - 2 ? "UP" : index === reference.buySequence.length - 1 ? "DOWN" : side,
+      ),
+      orderedClipSequence: reference.orderedClipSequence.map((event) => {
+        if (event.sequenceIndex === 15) {
+          return {
+            ...event,
+            outcome: "UP",
+            price: 0.84,
+          };
+        }
+        if (event.sequenceIndex === 16) {
+          return {
+            ...event,
+            phase: "COMPLETION",
+            familyLabel: "COMPLETION",
+            internalLabel: "COMPLETION",
+            outcome: "DOWN",
+            price: 0.18,
+          };
+        }
+        return event;
+      }),
+    };
+
+    const shifted = compareCanonicalReference(reference, candidate);
+
+    expect(shifted.details.sideSequenceMismatchCount).toBeGreaterThan(0);
+    expect(shifted.details.phaseFamilySimilarity).toBeLessThan(baseline.details.phaseFamilySimilarity);
     expect(shifted.score).toBeLessThan(baseline.score);
   });
 

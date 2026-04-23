@@ -122,16 +122,16 @@ describe("merge coordinator", () => {
     tracker = syncMergeBatchTracker(tracker, 5, market.startTs);
 
     const shieldedGate = evaluateDelayedMergeGate(config, state, {
-      nowTs: market.startTs + 80,
-      secsFromOpen: 80,
-      secsToClose: 220,
+      nowTs: market.startTs + 74,
+      secsFromOpen: 74,
+      secsToClose: 226,
       usdcBalance: 100,
       tracker,
     });
     const releasedGate = evaluateDelayedMergeGate(config, state, {
-      nowTs: market.startTs + 121,
-      secsFromOpen: 121,
-      secsToClose: 179,
+      nowTs: market.startTs + 76,
+      secsFromOpen: 76,
+      secsToClose: 224,
       usdcBalance: 100,
       tracker,
     });
@@ -140,5 +140,33 @@ describe("merge coordinator", () => {
     expect(shieldedGate.reason).toBe("entry_shield");
     expect(releasedGate.allow).toBe(true);
     expect(releasedGate.reason).toBe("age_target");
+  });
+
+  it("waits for five completed windows before clone-mode cycle-target merge opens", () => {
+    const config = buildConfig({
+      BOT_MODE: "XUAN",
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+    });
+    const market = buildOfflineMarket(1713696000);
+    const state = createMarketState(market);
+    let tracker = createMergeBatchTracker();
+    tracker = syncMergeBatchTracker(tracker, 5, market.startTs);
+    tracker = syncMergeBatchTracker(tracker, 10, market.startTs + 10);
+    tracker = syncMergeBatchTracker(tracker, 15, market.startTs + 20);
+    tracker = syncMergeBatchTracker(tracker, 20, market.startTs + 30);
+    tracker = syncMergeBatchTracker(tracker, 25, market.startTs + 40);
+
+    const gate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 76,
+      secsFromOpen: 76,
+      secsToClose: 224,
+      usdcBalance: 100,
+      tracker,
+    });
+
+    expect(gate.allow).toBe(true);
+    expect(gate.forced).toBe(false);
+    expect(gate.reason).toBe("cycle_target");
+    expect(gate.completedCycles).toBe(5);
   });
 });

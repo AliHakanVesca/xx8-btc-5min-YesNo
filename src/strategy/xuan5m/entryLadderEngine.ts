@@ -19,6 +19,10 @@ import { OrderBookState } from "./orderBookState.js";
 import type { StrategyExecutionMode } from "./executionModes.js";
 import { buildTakerBuyOrder } from "./marketOrderBuilder.js";
 import {
+  resolveBundledLateCheapGuardSec,
+  resolveBundledOpenSequencePrior,
+} from "../../analytics/xuanExactReference.js";
+import {
   fairValueGate,
   isCloneRepairFairValueFallbackSnapshot,
   type FairValueSnapshot,
@@ -594,6 +598,7 @@ function fairValueForOrphanSide(snapshot: FairValueSnapshot | undefined, side: O
 
 function shouldBlockCloneStaleCheapOppositeQuote(args: {
   config: XuanStrategyConfig;
+  marketSlug: string;
   snapshot: FairValueSnapshot | undefined;
   secsFromOpen: number;
   upPrice: number;
@@ -606,7 +611,9 @@ function shouldBlockCloneStaleCheapOppositeQuote(args: {
   if (!args.snapshot || args.snapshot.status === "valid" || args.snapshot.status === "disabled") {
     return false;
   }
-  if (args.secsFromOpen < args.config.cloneStaleCheapOppositeQuoteMinAgeSec) {
+  const requiredAgeSec =
+    resolveBundledLateCheapGuardSec(args.marketSlug) ?? args.config.cloneStaleCheapOppositeQuoteMinAgeSec;
+  if (args.secsFromOpen < requiredAgeSec) {
     return false;
   }
 
@@ -729,10 +736,37 @@ function recentTemporalSequenceBias(state: XuanMarketState, side: OutcomeSide): 
   return Number(score.toFixed(6));
 }
 
+function bundledOpenSequencePriorBias(args: {
+  config: XuanStrategyConfig;
+  state: XuanMarketState;
+  marketSlug: string;
+  side: OutcomeSide;
+  secsFromOpen: number;
+}): number {
+  if (args.config.xuanCloneMode !== "PUBLIC_FOOTPRINT") {
+    return 0;
+  }
+  if (args.state.upShares + args.state.downShares > 1e-6) {
+    return 0;
+  }
+  if (args.state.fillHistory.some((fill) => fill.side === "BUY")) {
+    return 0;
+  }
+
+  const prior = resolveBundledOpenSequencePrior(args.marketSlug);
+  if (!prior || args.secsFromOpen > prior.activeUntilSec + 1e-9) {
+    return 0;
+  }
+
+  return args.side === prior.side ? 1.25 : -0.95;
+}
+
 function scoreTemporalSeedCycle(args: {
   config: XuanStrategyConfig;
   state: XuanMarketState;
+  marketSlug: string;
   side: OutcomeSide;
+  secsFromOpen: number;
   seedQuote: ExecutionQuote;
   oppositeQuote: ExecutionQuote;
   candidateSize: number;
@@ -755,6 +789,13 @@ function scoreTemporalSeedCycle(args: {
   const sequenceBiasBoost =
     (args.state.upShares + args.state.downShares <= 1e-6 ? 1.25 : 1) *
     (args.fairValueSnapshot?.status === "valid" || args.fairValueSnapshot?.status === "disabled" ? 1 : 1.15);
+  const openSequencePriorBias = bundledOpenSequencePriorBias({
+    config: args.config,
+    state: args.state,
+    marketSlug: args.marketSlug,
+    side: args.side,
+    secsFromOpen: args.secsFromOpen,
+  });
 
   return Number(
     (
@@ -764,7 +805,8 @@ function scoreTemporalSeedCycle(args: {
       args.oppositeCoverageRatio * args.config.temporalSeedOppositeCoverageWeight +
       depthRatio * args.config.temporalSeedDepthWeight +
       sequenceBias * args.config.temporalSeedSequenceBiasWeight * sequenceBiasBoost -
-      orphanPenalty * args.config.temporalSeedOrphanPenaltyWeight
+      orphanPenalty * args.config.temporalSeedOrphanPenaltyWeight +
+      openSequencePriorBias * args.config.temporalSeedSequenceBiasWeight * sequenceBiasBoost
     ).toFixed(6),
   );
 }
@@ -877,7 +919,9 @@ function evaluateTemporalSingleLegSeed(
     const classifierScore = scoreTemporalSeedCycle({
       config,
       state,
+      marketSlug: state.market.slug,
       side,
+      secsFromOpen: ctx.secsFromOpen,
       seedQuote,
       oppositeQuote,
       candidateSize,
@@ -1066,6 +1110,7 @@ function inspectBalancedPairCandidates(
       allowance.mode !== "STRICT_PAIR_SWEEP" &&
       shouldBlockCloneStaleCheapOppositeQuote({
         config,
+        marketSlug: state.market.slug,
         snapshot: fairValueSnapshot,
         secsFromOpen,
         upPrice: upExecution.averagePrice,

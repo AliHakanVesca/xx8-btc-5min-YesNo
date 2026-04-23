@@ -136,11 +136,22 @@ export interface XuanStrategyConfig {
   partialSoftCap: number;
   partialHardCap: number;
   partialEmergencyCap: number;
+  temporalRepairFastCap: number;
+  temporalRepairSoftCap: number;
+  temporalRepairPatientCap: number;
+  temporalRepairEmergencyCap: number;
   partialSoftMaxQty: number;
   partialHardMaxQty: number;
   partialEmergencyMaxQty: number;
   partialEmergencyRequiresFairValue: boolean;
   partialNoChaseLastSec: number;
+  temporalSeedOwnDiscountWeight: number;
+  temporalSeedRepairDiscountWeight: number;
+  temporalSeedBehaviorRoomWeight: number;
+  temporalSeedOppositeCoverageWeight: number;
+  temporalSeedDepthWeight: number;
+  temporalSeedSequenceBiasWeight: number;
+  temporalSeedOrphanPenaltyWeight: number;
   maxMarketSharesPerSide: number;
   maxOneSidedExposureShares: number;
   maxImbalanceFrac: number;
@@ -153,6 +164,8 @@ export interface XuanStrategyConfig {
   maxCyclesPerMarket: number;
   maxBuysPerSide: number;
   reentryDelayMs: number;
+  cloneChildPreferredShares: number;
+  cloneChildOrderDelayMs: number;
   partialCompletionFractions: number[];
   maxResidualHoldShares: number;
   residualUnwindSecToClose: number;
@@ -215,6 +228,7 @@ export interface XuanStrategyConfig {
   minCompletedCyclesBeforeFirstMerge: number;
   minFirstMatchedAgeBeforeMergeSec: number;
   maxMatchedAgeBeforeForcedMergeSec: number;
+  mergeShieldSecFromOpen: number;
   forceMergeInLast30S: boolean;
   forceMergeOnHardImbalance: boolean;
   forceMergeOnLowCollateral: boolean;
@@ -380,11 +394,22 @@ export function buildStrategyConfig(env: AppEnv): XuanStrategyConfig {
     partialSoftCap: env.PARTIAL_SOFT_CAP,
     partialHardCap: env.PARTIAL_HARD_CAP,
     partialEmergencyCap: env.PARTIAL_EMERGENCY_CAP,
+    temporalRepairFastCap: env.PARTIAL_FAST_CAP,
+    temporalRepairSoftCap: env.PARTIAL_SOFT_CAP,
+    temporalRepairPatientCap: env.PARTIAL_HARD_CAP,
+    temporalRepairEmergencyCap: env.PARTIAL_EMERGENCY_CAP,
     partialSoftMaxQty: env.PARTIAL_SOFT_MAX_QTY,
     partialHardMaxQty: env.PARTIAL_HARD_MAX_QTY,
     partialEmergencyMaxQty: env.PARTIAL_EMERGENCY_MAX_QTY,
     partialEmergencyRequiresFairValue: env.PARTIAL_EMERGENCY_REQUIRES_FAIR_VALUE,
     partialNoChaseLastSec: env.PARTIAL_NO_CHASE_LAST_SEC,
+    temporalSeedOwnDiscountWeight: 12,
+    temporalSeedRepairDiscountWeight: 4,
+    temporalSeedBehaviorRoomWeight: 4,
+    temporalSeedOppositeCoverageWeight: 2,
+    temporalSeedDepthWeight: 1,
+    temporalSeedSequenceBiasWeight: 1.5,
+    temporalSeedOrphanPenaltyWeight: 0.05,
     maxMarketSharesPerSide: env.MAX_MARKET_SHARES_PER_SIDE,
     maxOneSidedExposureShares: env.MAX_ONE_SIDED_EXPOSURE_SHARES,
     maxImbalanceFrac: env.MAX_IMBALANCE_FRAC,
@@ -398,6 +423,8 @@ export function buildStrategyConfig(env: AppEnv): XuanStrategyConfig {
     maxCyclesPerMarket: env.MAX_CYCLES_PER_MARKET,
     maxBuysPerSide: env.MAX_BUYS_PER_SIDE,
     reentryDelayMs: 1000,
+    cloneChildPreferredShares: 25,
+    cloneChildOrderDelayMs: 0,
     partialCompletionFractions: env.PARTIAL_COMPLETION_FRACTIONS,
     maxResidualHoldShares: env.MAX_RESIDUAL_HOLD_SHARES,
     residualUnwindSecToClose: env.RESIDUAL_UNWIND_SEC_TO_CLOSE,
@@ -461,6 +488,7 @@ export function buildStrategyConfig(env: AppEnv): XuanStrategyConfig {
     minCompletedCyclesBeforeFirstMerge: env.MIN_COMPLETED_CYCLES_BEFORE_FIRST_MERGE,
     minFirstMatchedAgeBeforeMergeSec: env.MIN_FIRST_MATCHED_AGE_BEFORE_MERGE_SEC,
     maxMatchedAgeBeforeForcedMergeSec: env.MAX_MATCHED_AGE_BEFORE_FORCED_MERGE_SEC,
+    mergeShieldSecFromOpen: 0,
     forceMergeInLast30S: env.FORCE_MERGE_IN_LAST_30S,
     forceMergeOnHardImbalance: env.FORCE_MERGE_ON_HARD_IMBALANCE,
     forceMergeOnLowCollateral: env.FORCE_MERGE_ON_LOW_COLLATERAL,
@@ -538,15 +566,34 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     highSideEmergencyCap: Math.max(config.highSideEmergencyCap, elevatedBehaviorCap),
     emergencyCompletionMaxQty: Math.max(config.emergencyCompletionMaxQty, maxLadderLot),
     emergencyCompletionHardCap: Math.max(config.emergencyCompletionHardCap, elevatedBehaviorCap),
+    temporalRepairFastCap: Math.max(config.temporalRepairFastCap, 1.035),
+    temporalRepairSoftCap: Math.max(config.temporalRepairSoftCap, 1.075),
+    temporalRepairPatientCap: Math.max(config.temporalRepairPatientCap, 1.13),
+    temporalRepairEmergencyCap: Math.max(config.temporalRepairEmergencyCap, elevatedBehaviorCap),
     partialSoftMaxQty: Math.max(config.partialSoftMaxQty, maxLadderLot),
     partialHardMaxQty: Math.max(config.partialHardMaxQty, maxLadderLot),
     partialEmergencyMaxQty: Math.max(config.partialEmergencyMaxQty, maxLadderLot),
     partialEmergencyRequiresFairValue: false,
+    temporalSeedOwnDiscountWeight: 11,
+    temporalSeedRepairDiscountWeight: 6,
+    temporalSeedBehaviorRoomWeight: 5,
+    temporalSeedOppositeCoverageWeight: 3,
+    temporalSeedDepthWeight: 1,
+    temporalSeedSequenceBiasWeight: 2.75,
+    temporalSeedOrphanPenaltyWeight: 0.03,
     finalHardCompletionMaxQty: Math.max(config.finalHardCompletionMaxQty, maxLadderLot),
     fairValueFailClosedForSeed: false,
     fairValueFailClosedForNegativePair: false,
     fairValueFailClosedForHighSideChase: false,
     requireStrictCapForHighLowMismatch: false,
     xuanBehaviorCap: elevatedBehaviorCap,
+    cloneChildPreferredShares: Math.min(config.cloneChildPreferredShares, 20),
+    cloneChildOrderDelayMs: Math.max(config.cloneChildOrderDelayMs, 120),
+    mergeBatchMode: "HYBRID_DELAYED",
+    minCompletedCyclesBeforeFirstMerge: Math.max(config.minCompletedCyclesBeforeFirstMerge, 3),
+    minFirstMatchedAgeBeforeMergeSec: Math.max(config.minFirstMatchedAgeBeforeMergeSec, 75),
+    maxMatchedAgeBeforeForcedMergeSec: Math.max(config.maxMatchedAgeBeforeForcedMergeSec, 120),
+    mergeShieldSecFromOpen: Math.max(config.mergeShieldSecFromOpen, 90),
+    reentryDelayMs: Math.min(config.reentryDelayMs, 350),
   };
 }

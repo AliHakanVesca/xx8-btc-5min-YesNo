@@ -52,6 +52,8 @@ export interface TickInput {
   dailyNegativeEdgeSpentUsdc?: number;
   fairValueSnapshot?: FairValueSnapshot | undefined;
   allowControlledOverlap?: boolean | undefined;
+  protectedResidualShares?: number | undefined;
+  protectedResidualSide?: "UP" | "DOWN" | undefined;
 }
 
 function overrideRiskForPhase(
@@ -128,6 +130,8 @@ export class Xuan5mBot {
       dailyNegativeEdgeSpentUsdc: input.dailyNegativeEdgeSpentUsdc ?? state.negativeEdgeConsumedUsdc,
       fairValueSnapshot: input.fairValueSnapshot,
       allowControlledOverlap: input.allowControlledOverlap,
+      protectedResidualShares: input.protectedResidualShares,
+      protectedResidualSide: input.protectedResidualSide,
     });
 
     const entryBuys =

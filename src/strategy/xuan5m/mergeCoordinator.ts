@@ -29,6 +29,7 @@ export interface MergeGateDecision extends MergeBatchMetrics {
   reason:
     | "disabled"
     | "not_ready"
+    | "entry_shield"
     | "cycle_target"
     | "age_target"
     | "forced_age"
@@ -109,6 +110,7 @@ export function evaluateDelayedMergeGate(
     | "minCompletedCyclesBeforeFirstMerge"
     | "minFirstMatchedAgeBeforeMergeSec"
     | "maxMatchedAgeBeforeForcedMergeSec"
+    | "mergeShieldSecFromOpen"
     | "forceMergeInLast30S"
     | "forceMergeOnHardImbalance"
     | "forceMergeOnLowCollateral"
@@ -119,6 +121,7 @@ export function evaluateDelayedMergeGate(
   state: XuanMarketState,
   args: {
     nowTs: number;
+    secsFromOpen?: number | undefined;
     secsToClose: number;
     usdcBalance: number;
     tracker: MergeBatchTracker;
@@ -179,6 +182,15 @@ export function evaluateDelayedMergeGate(
       allow: true,
       forced: true,
       reason: "forced_age",
+      ...metrics,
+    };
+  }
+
+  if ((args.secsFromOpen ?? Number.POSITIVE_INFINITY) < config.mergeShieldSecFromOpen) {
+    return {
+      allow: false,
+      forced: false,
+      reason: "entry_shield",
       ...metrics,
     };
   }

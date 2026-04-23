@@ -127,6 +127,8 @@ export interface EntryLadderContext {
   dailyNegativeEdgeSpentUsdc?: number;
   fairValueSnapshot?: FairValueSnapshot | undefined;
   allowControlledOverlap?: boolean | undefined;
+  protectedResidualShares?: number | undefined;
+  protectedResidualSide?: OutcomeSide | undefined;
 }
 
 interface BalancedPairCandidate {
@@ -302,6 +304,36 @@ export function evaluateEntryBuys(
         },
       };
     }
+
+    if ((ctx.protectedResidualShares ?? 0) > 0) {
+      const overlapTemporalSeed = evaluateTemporalSingleLegSeed(
+        config,
+        state,
+        books,
+        ctx,
+        dailyNegativeEdgeSpentUsdc,
+      );
+      if (
+        overlapTemporalSeed.decision &&
+        overlapTemporalSeed.decision.side === ctx.protectedResidualSide
+      ) {
+        return {
+          decisions: [overlapTemporalSeed.decision],
+          trace: {
+            mode: "temporal_pair_cycle",
+            requestedLot: ctx.lot,
+            totalShares,
+            shareGap,
+            pairCap,
+            selectedMode: overlapTemporalSeed.decision.mode,
+            laggingSide: state.upShares > state.downShares ? "DOWN" : "UP",
+            candidates: inspected.traces,
+            seedCandidates: overlapTemporalSeed.trace,
+            skipReason: "protected_residual_overlap_seed",
+          },
+        };
+      }
+    }
   }
 
   const laggingSide: OutcomeSide = state.upShares > state.downShares ? "DOWN" : "UP";
@@ -351,6 +383,7 @@ export function evaluateEntryBuys(
     config,
     partialAgeSec,
     secsToClose: ctx.secsToClose,
+    capFamily: "temporal_repair",
     postMergeCompletionOnly:
       config.postMergeOnlyCompletion &&
       (state.reentryDisabled ||
@@ -581,8 +614,55 @@ function orphanRiskSortValue(risk: OrphanRiskTrace): number {
   return disallowedPenalty + premiumPenalty + risk.effectivePrice + risk.notionalUsdc / 100;
 }
 
+function protectedResidualAllowance(
+  ctx: Pick<EntryLadderContext, "protectedResidualShares" | "protectedResidualSide">,
+  side: OutcomeSide,
+): number {
+  if (ctx.protectedResidualSide !== side) {
+    return 0;
+  }
+  return Number(Math.max(0, ctx.protectedResidualShares ?? 0).toFixed(6));
+}
+
+function recentTemporalSequenceBias(state: XuanMarketState, side: OutcomeSide): number {
+  const recentBuys = state.fillHistory.filter((fill) => fill.side === "BUY").slice(-4);
+  if (recentBuys.length === 0) {
+    return 0;
+  }
+
+  const lastBuy = recentBuys[recentBuys.length - 1]!;
+  const sameCount = recentBuys.filter((fill) => fill.outcome === side).length;
+  const oppositeCount = recentBuys.length - sameCount;
+  let score = lastBuy.outcome !== side ? 1 : -0.4;
+  score += (oppositeCount - sameCount) / Math.max(1, recentBuys.length);
+
+  if (
+    state.lastFilledSide === side &&
+    state.lastExecutionMode !== undefined &&
+    [
+      "PARTIAL_FAST_COMPLETION",
+      "PARTIAL_SOFT_COMPLETION",
+      "PARTIAL_EMERGENCY_COMPLETION",
+      "POST_MERGE_RESIDUAL_COMPLETION",
+      "HIGH_LOW_COMPLETION_CHASE",
+    ].includes(state.lastExecutionMode)
+  ) {
+    score += 0.75;
+  }
+
+  if (
+    state.lastFilledSide === side &&
+    (state.lastExecutionMode === "TEMPORAL_SINGLE_LEG_SEED" || state.lastExecutionMode === "PAIRGROUP_COVERED_SEED")
+  ) {
+    score -= 0.5;
+  }
+
+  return Number(score.toFixed(6));
+}
+
 function scoreTemporalSeedCycle(args: {
   config: XuanStrategyConfig;
+  state: XuanMarketState;
   side: OutcomeSide;
   seedQuote: ExecutionQuote;
   oppositeQuote: ExecutionQuote;
@@ -602,15 +682,17 @@ function scoreTemporalSeedCycle(args: {
     Number.isFinite(args.referencePairCost) ? args.config.xuanBehaviorCap - args.referencePairCost : -1;
   const depthRatio = args.candidateSize > 0 ? args.executableSize / args.candidateSize : 0;
   const orphanPenalty = orphanRiskSortValue(args.orphanRisk);
+  const sequenceBias = recentTemporalSequenceBias(args.state, args.side);
 
   return Number(
     (
-      ownDiscount * 12 +
-      repairDiscount * 4 +
-      behaviorRoom * 4 +
-      args.oppositeCoverageRatio * 2 +
-      depthRatio -
-      orphanPenalty * 0.05
+      ownDiscount * args.config.temporalSeedOwnDiscountWeight +
+      repairDiscount * args.config.temporalSeedRepairDiscountWeight +
+      behaviorRoom * args.config.temporalSeedBehaviorRoomWeight +
+      args.oppositeCoverageRatio * args.config.temporalSeedOppositeCoverageWeight +
+      depthRatio * args.config.temporalSeedDepthWeight +
+      sequenceBias * args.config.temporalSeedSequenceBiasWeight -
+      orphanPenalty * args.config.temporalSeedOrphanPenaltyWeight
     ).toFixed(6),
   );
 }
@@ -681,6 +763,7 @@ function evaluateTemporalSingleLegSeed(
         : Number.POSITIVE_INFINITY;
     const negativeEdgeUsdc = executableSize > 0 ? Math.max(0, referencePairCost - 1) * executableSize : 0;
     const projectedGap = Math.abs(currentSideShares + executableSize - oppositeShares);
+    const effectiveProjectedGap = Math.max(0, projectedGap - protectedResidualAllowance(ctx, side));
     let skipReason: string | undefined;
 
     if (state.consecutiveSeedSide === side && state.consecutiveSeedCount >= config.maxConsecutiveSingleLegSeedsPerSide) {
@@ -689,7 +772,7 @@ function evaluateTemporalSingleLegSeed(
       skipReason = "temporal_seed_depth";
     } else if (oppositeCoverageRatio + 1e-6 < config.temporalSingleLegMinOppositeDepthRatio) {
       skipReason = "temporal_seed_opposite_depth";
-    } else if (projectedGap > config.maxOneSidedExposureShares + 1e-6) {
+    } else if (effectiveProjectedGap > config.maxOneSidedExposureShares + 1e-6) {
       skipReason = "temporal_seed_one_sided_exposure";
     } else if (referencePairCost > config.xuanBehaviorCap + 1e-9) {
       skipReason = "temporal_behavior_cap";
@@ -721,6 +804,7 @@ function evaluateTemporalSingleLegSeed(
     });
     const classifierScore = scoreTemporalSeedCycle({
       config,
+      state,
       side,
       seedQuote,
       oppositeQuote,
@@ -1078,6 +1162,10 @@ function evaluateSingleLegSeed(
       !canUseInventoryCover &&
       config.coveredSeedAllowSamePairgroupOppositeOrder;
     const effectiveProjectedGap = requiresSamePairgroupOppositeOrder ? oldGap : projectedGap;
+    const protectedProjectedGap = Math.max(
+      0,
+      effectiveProjectedGap - protectedResidualAllowance(ctx, side),
+    );
 
     if (!config.coveredSeedAllowSamePairgroupOppositeOrder && !canUseInventoryCover && !config.allowNakedSingleLegSeed) {
       skipReason = "seed_requires_same_pairgroup_opposite_order";
@@ -1090,7 +1178,7 @@ function evaluateSingleLegSeed(
       effectiveProjectedGap > oldGap + config.maxCompletionOvershootShares
     ) {
       skipReason = "seed_increases_imbalance";
-    } else if (effectiveProjectedGap > config.maxOneSidedExposureShares) {
+    } else if (protectedProjectedGap > config.maxOneSidedExposureShares) {
       skipReason = "seed_one_sided_exposure";
     } else if (pairExecutableSize <= 0) {
       skipReason = "seed_depth";

@@ -177,6 +177,8 @@ interface PartialOpenGroupLock {
   groupId: string;
   status: Extract<PairOrderGroupStatus, "UP_ONLY" | "DOWN_ONLY">;
   openedAt: number;
+  protectedSide: OutcomeSide;
+  protectedShares: number;
 }
 
 interface ActivePairSubmission {
@@ -923,13 +925,22 @@ function assignSequentialUsdcBalances(
 async function executeMarketOrdersInSequence(
   completionManager: TakerCompletionManager,
   orders: MarketOrderArgs[],
+  interOrderDelayMs = 0,
 ): Promise<ExecutedMarketOrder[]> {
   const executed: ExecutedMarketOrder[] = [];
-  for (const order of orders) {
+  for (let index = 0; index < orders.length; index += 1) {
+    const order = orders[index]!;
     executed.push({
       order,
       result: await completionManager.execute(order),
     });
+    if (
+      interOrderDelayMs > 0 &&
+      index < orders.length - 1 &&
+      isOrderResultAccepted(executed[executed.length - 1]!.result)
+    ) {
+      await sleep(interOrderDelayMs);
+    }
   }
   return executed;
 }
@@ -967,6 +978,7 @@ function buildPairOrderPlan(args: {
             outcome: side,
             books: args.books,
             minOrderSize: args.minOrderSize,
+            preferredChildShares: args.config.cloneChildPreferredShares,
           })
         : [baseOrder];
     return assignSequentialUsdcBalances(plannedOrders, args.cachedUsdcBalance);
@@ -983,6 +995,7 @@ async function executePairOrderPlan(args: {
   orderPlanBySide: PairOrderPlan;
   orderedEntries: EntryBuyDecision[];
   sequentialPairExecutionActive: boolean;
+  interChildDelayMs: number;
 }): Promise<Record<OutcomeSide, ExecutedMarketOrder[]>> {
   const executedBySide: Record<OutcomeSide, ExecutedMarketOrder[]> = {
     UP: [],
@@ -1008,6 +1021,9 @@ async function executePairOrderPlan(args: {
             abortRemainingSides = true;
           }
           break;
+        }
+        if (args.interChildDelayMs > 0 && index < sideOrders.length - 1) {
+          await sleep(args.interChildDelayMs);
         }
       }
     }
@@ -1040,6 +1056,9 @@ async function executePairOrderPlan(args: {
     }
     if (!batchAccepted) {
       break;
+    }
+    if (args.interChildDelayMs > 0 && batchIndex < maxBatchCount - 1) {
+      await sleep(args.interChildDelayMs);
     }
   }
 
@@ -1532,10 +1551,18 @@ export async function runStatefulBotSession(
     }
     if (finalized.status === "UP_ONLY" || finalized.status === "DOWN_ONLY") {
       partialLegCount += 1;
+      const protectedSide: OutcomeSide = finalized.status === "UP_ONLY" ? "UP" : "DOWN";
       partialOpenGroupLock = {
         groupId: finalized.group.groupId,
         status: finalized.status,
         openedAt: finalizedAtTs,
+        protectedSide,
+        protectedShares: normalizeShares(
+          Math.max(
+            Math.abs(finalized.filledUpQty - finalized.filledDownQty),
+            Math.abs(state.upShares - state.downShares),
+          ),
+        ),
       };
     } else if (partialOpenGroupLock?.groupId === finalized.group.groupId) {
       partialOpenGroupLock = undefined;
@@ -1631,6 +1658,8 @@ export async function runStatefulBotSession(
         groupId: restoredPartialGroup.groupId,
         status: restoredPartialGroup.status,
         openedAt: restoredPartialGroup.createdAt,
+        protectedSide: restoredPartialGroup.status === "UP_ONLY" ? "UP" : "DOWN",
+        protectedShares: normalizeShares(restoredGap),
       };
       startupCompletionOnly = true;
       if (config.blockNewPairWhenRestoredPartialExists) {
@@ -2199,6 +2228,7 @@ export async function runStatefulBotSession(
         mergeBatchTracker = syncMergeBatchTracker(mergeBatchTracker, mergeableUnlocked, nowTs);
         const mergeGate = evaluateDelayedMergeGate(config, state, {
           nowTs,
+          secsFromOpen: nowTs - market.startTs,
           secsToClose: market.endTs - nowTs,
           usdcBalance: cachedUsdcBalance,
           tracker: mergeBatchTracker,
@@ -2387,6 +2417,9 @@ export async function runStatefulBotSession(
         partialOpenGroupLock !== undefined &&
         config.maxOpenPartialGroups <= 1 &&
         !previewControlledOverlapAllowed;
+      const protectedResidualShares = partialOpenGroupLock
+        ? Math.min(partialOpenGroupLock.protectedShares, Math.abs(state.upShares - state.downShares))
+        : 0;
       const decision = bot.evaluateTick({
         config,
         state,
@@ -2416,6 +2449,8 @@ export async function runStatefulBotSession(
           resolvedOptions.initialDailyNegativeEdgeSpentUsdc + state.negativeEdgeConsumedUsdc,
         fairValueSnapshot: latestFairValueSnapshot,
         allowControlledOverlap: previewControlledOverlapAllowed,
+        protectedResidualShares,
+        protectedResidualSide: partialOpenGroupLock?.protectedSide,
       });
       const decisionTraceContext: DecisionTraceContext = {
         eventSeq: marketEventSeq,
@@ -2585,6 +2620,7 @@ export async function runStatefulBotSession(
             orderPlanBySide,
             orderedEntries,
             sequentialPairExecutionActive,
+            interChildDelayMs: config.cloneChildOrderDelayMs,
           });
           const upResult = selectRepresentativeResult(executedBySide.UP);
           const downResult = selectRepresentativeResult(executedBySide.DOWN);
@@ -2822,6 +2858,7 @@ export async function runStatefulBotSession(
                   outcome: entryBuy.side,
                   books,
                   minOrderSize: state.market.minOrderSize,
+                  preferredChildShares: config.cloneChildPreferredShares,
                 })
               : [groupedSingleOrder];
           const liveOrders = assignSequentialUsdcBalances(plannedOrders, cachedUsdcBalance);
@@ -2840,7 +2877,11 @@ export async function runStatefulBotSession(
               ],
             };
           }
-          const executions = await executeMarketOrdersInSequence(completionManager, liveOrders);
+          const executions = await executeMarketOrdersInSequence(
+            completionManager,
+            liveOrders,
+            config.cloneChildOrderDelayMs,
+          );
           const representativeExecution = selectRepresentativeExecution(executions);
           const result = representativeExecution.result;
           const accepted = executions.some((execution) => isOrderResultAccepted(execution.result));

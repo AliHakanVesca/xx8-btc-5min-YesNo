@@ -13,7 +13,7 @@ function buildChildOrder(baseOrder: MarketOrderArgs, shareTarget: number, limitP
   return {
     ...baseOrder,
     shareTarget: normalizeShares(shareTarget),
-    price: limitPrice,
+    price: Number(limitPrice.toFixed(6)),
     amount: normalizeAmount(shareTarget * limitPrice),
   };
 }
@@ -87,7 +87,7 @@ export function planCloneChildBuyOrders(args: {
       if (chunkShares <= 1e-6) {
         break;
       }
-      children.push(buildChildOrder(order, chunkShares, order.price));
+      children.push(buildChildOrder(order, chunkShares, Math.min(order.price, level.price)));
       remainingShares = normalizeShares(remainingShares - chunkShares);
       allocatableAtLevel = normalizeShares(allocatableAtLevel - chunkShares);
     }

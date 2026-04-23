@@ -48,7 +48,19 @@ export function resolvePartialCompletionPhase(args: {
   partialAgeSec: number;
   secsToClose: number;
   postMergeCompletionOnly: boolean;
+  capFamily?: "partial" | "temporal_repair";
 }): PartialCompletionPhase {
+  const fastCap =
+    args.capFamily === "temporal_repair" ? args.config.temporalRepairFastCap : args.config.partialFastCap;
+  const softCap =
+    args.capFamily === "temporal_repair" ? args.config.temporalRepairSoftCap : args.config.partialSoftCap;
+  const patientCap =
+    args.capFamily === "temporal_repair" ? args.config.temporalRepairPatientCap : args.config.partialHardCap;
+  const emergencyCap =
+    args.capFamily === "temporal_repair"
+      ? args.config.temporalRepairEmergencyCap
+      : args.config.partialEmergencyCap;
+
   if (args.postMergeCompletionOnly) {
     return {
       phase: "post_merge",
@@ -63,7 +75,7 @@ export function resolvePartialCompletionPhase(args: {
     return {
       phase: "fast",
       mode: "PARTIAL_FAST_COMPLETION",
-      cap: args.config.partialFastCap,
+      cap: fastCap,
       maxQty: Number.POSITIVE_INFINITY,
       requiresFairValue: false,
     };
@@ -73,7 +85,7 @@ export function resolvePartialCompletionPhase(args: {
     return {
       phase: "soft",
       mode: "PARTIAL_SOFT_COMPLETION",
-      cap: args.config.partialSoftCap,
+      cap: softCap,
       maxQty: args.config.partialSoftMaxQty,
       requiresFairValue: false,
     };
@@ -83,7 +95,7 @@ export function resolvePartialCompletionPhase(args: {
     return {
       phase: "patient",
       mode: "PARTIAL_SOFT_COMPLETION",
-      cap: args.config.partialHardCap,
+      cap: patientCap,
       maxQty: args.config.partialHardMaxQty,
       requiresFairValue: false,
     };
@@ -92,7 +104,7 @@ export function resolvePartialCompletionPhase(args: {
   return {
     phase: "emergency",
     mode: "PARTIAL_EMERGENCY_COMPLETION",
-    cap: args.config.partialEmergencyCap,
+    cap: emergencyCap,
     maxQty: args.config.partialEmergencyMaxQty,
     requiresFairValue: args.config.partialEmergencyRequiresFairValue,
   };

@@ -23,7 +23,7 @@ export function chooseLot(config: XuanStrategyConfig, ctx: LotContext): number {
   const cloneMid = baseLots[1] ?? cloneBase;
   const cloneHigh = baseLots[2] ?? cloneMid;
   const cloneMax = baseLots[3] ?? cloneHigh;
-  if (ctx.dryRunOrSmallLive) {
+  if (ctx.dryRunOrSmallLive && config.xuanCloneMode !== "PUBLIC_FOOTPRINT") {
     return clippedBase;
   }
 

@@ -56,7 +56,7 @@ describe("child order planner", () => {
 
     expect(children).toHaveLength(4);
     expect(children.map((child) => child.shareTarget)).toEqual([20, 30, 25, 25]);
-    expect(children.every((child) => child.price === 0.43)).toBe(true);
+    expect(children.map((child) => child.price)).toEqual([0.41, 0.42, 0.43, 0.43]);
     expect(children.reduce((total, child) => total + (child.shareTarget ?? 0), 0)).toBe(100);
   });
 

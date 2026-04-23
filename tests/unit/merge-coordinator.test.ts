@@ -110,4 +110,35 @@ describe("merge coordinator", () => {
     expect(lowCollateralGate.forced).toBe(true);
     expect(lowCollateralGate.reason).toBe("low_collateral");
   });
+
+  it("keeps clone-mode merges out of the early entry shield unless a forced condition appears", () => {
+    const config = buildConfig({
+      BOT_MODE: "XUAN",
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+    });
+    const market = buildOfflineMarket(1713696000);
+    const state = createMarketState(market);
+    let tracker = createMergeBatchTracker();
+    tracker = syncMergeBatchTracker(tracker, 5, market.startTs);
+
+    const shieldedGate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 80,
+      secsFromOpen: 80,
+      secsToClose: 220,
+      usdcBalance: 100,
+      tracker,
+    });
+    const releasedGate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 96,
+      secsFromOpen: 96,
+      secsToClose: 204,
+      usdcBalance: 100,
+      tracker,
+    });
+
+    expect(shieldedGate.allow).toBe(false);
+    expect(shieldedGate.reason).toBe("entry_shield");
+    expect(releasedGate.allow).toBe(true);
+    expect(releasedGate.reason).toBe("age_target");
+  });
 });

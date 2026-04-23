@@ -129,9 +129,9 @@ describe("merge coordinator", () => {
       tracker,
     });
     const releasedGate = evaluateDelayedMergeGate(config, state, {
-      nowTs: market.startTs + 96,
-      secsFromOpen: 96,
-      secsToClose: 204,
+      nowTs: market.startTs + 121,
+      secsFromOpen: 121,
+      secsToClose: 179,
       usdcBalance: 100,
       tracker,
     });

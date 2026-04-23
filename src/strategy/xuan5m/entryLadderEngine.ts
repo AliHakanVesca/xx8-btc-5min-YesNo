@@ -270,54 +270,63 @@ export function evaluateEntryBuys(
     };
   }
 
-  if (ctx.allowControlledOverlap) {
-    const inspected = inspectBalancedPairCandidates(
-      config,
-      state,
-      books,
-      ctx.lot,
-      pairCap,
-      ctx.secsToClose,
-      dailyNegativeEdgeSpentUsdc,
-      ctx.fairValueSnapshot,
-    );
-    if (inspected.bestCandidate) {
-      return {
-        decisions: buildBalancedPairEntryBuys(
-          state,
-          inspected.bestCandidate,
-          config.cryptoTakerFeeRate,
-          "balanced_pair_reentry",
-        ),
-        trace: {
-          mode: "balanced_pair",
-          requestedLot: ctx.lot,
-          totalShares,
-          shareGap,
-          pairCap,
-          selectedMode: inspected.bestCandidate.mode,
-          laggingSide: state.upShares > state.downShares ? "DOWN" : "UP",
-          ...(inspected.bestRawPair !== undefined ? { bestRawPair: inspected.bestRawPair } : {}),
-          ...(inspected.bestEffectivePair !== undefined ? { bestEffectivePair: inspected.bestEffectivePair } : {}),
-          candidates: inspected.traces,
-          skipReason: "controlled_overlap_pair",
-        },
-      };
-    }
-
-    if ((ctx.protectedResidualShares ?? 0) > 0) {
-      const overlapTemporalSeed = evaluateTemporalSingleLegSeed(
+  const laggingSide: OutcomeSide = state.upShares > state.downShares ? "DOWN" : "UP";
+  const leadingSide: OutcomeSide = laggingSide === "UP" ? "DOWN" : "UP";
+  const preferCloneResidualRepair =
+    ctx.allowControlledOverlap &&
+    config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
+    (ctx.protectedResidualShares ?? 0) > 0;
+  const overlapInspection = ctx.allowControlledOverlap
+    ? inspectBalancedPairCandidates(
         config,
         state,
         books,
-        ctx,
+        ctx.lot,
+        pairCap,
+        ctx.secsToClose,
         dailyNegativeEdgeSpentUsdc,
-      );
-      if (
-        overlapTemporalSeed.decision &&
-        overlapTemporalSeed.decision.side === ctx.protectedResidualSide
-      ) {
-        return {
+        ctx.fairValueSnapshot,
+      )
+    : undefined;
+  const overlapTemporalSeed =
+    ctx.allowControlledOverlap && (ctx.protectedResidualShares ?? 0) > 0
+      ? evaluateTemporalSingleLegSeed(
+          config,
+          state,
+          books,
+          ctx,
+          dailyNegativeEdgeSpentUsdc,
+        )
+      : undefined;
+  const buildOverlapPairReentry = (): EntryEvaluation | undefined =>
+    overlapInspection?.bestCandidate
+      ? {
+          decisions: buildBalancedPairEntryBuys(
+            state,
+            overlapInspection.bestCandidate,
+            config.cryptoTakerFeeRate,
+            "balanced_pair_reentry",
+          ),
+          trace: {
+            mode: "balanced_pair",
+            requestedLot: ctx.lot,
+            totalShares,
+            shareGap,
+            pairCap,
+            selectedMode: overlapInspection.bestCandidate.mode,
+            laggingSide,
+            ...(overlapInspection.bestRawPair !== undefined ? { bestRawPair: overlapInspection.bestRawPair } : {}),
+            ...(overlapInspection.bestEffectivePair !== undefined
+              ? { bestEffectivePair: overlapInspection.bestEffectivePair }
+              : {}),
+            candidates: overlapInspection.traces,
+            skipReason: "controlled_overlap_pair",
+          },
+        }
+      : undefined;
+  const buildOverlapTemporalSeedEvaluation = (): EntryEvaluation | undefined =>
+    overlapTemporalSeed?.decision
+      ? {
           decisions: [overlapTemporalSeed.decision],
           trace: {
             mode: "temporal_pair_cycle",
@@ -326,18 +335,29 @@ export function evaluateEntryBuys(
             shareGap,
             pairCap,
             selectedMode: overlapTemporalSeed.decision.mode,
-            laggingSide: state.upShares > state.downShares ? "DOWN" : "UP",
-            candidates: inspected.traces,
+            laggingSide,
+            candidates: overlapInspection?.traces ?? [],
             seedCandidates: overlapTemporalSeed.trace,
             skipReason: "protected_residual_overlap_seed",
           },
-        };
-      }
+        }
+      : undefined;
+  const withCloneOverlapFallback = (fallback: EntryEvaluation): EntryEvaluation =>
+    preferCloneResidualRepair
+      ? buildOverlapTemporalSeedEvaluation() ?? buildOverlapPairReentry() ?? fallback
+      : fallback;
+
+  if (ctx.allowControlledOverlap && !preferCloneResidualRepair) {
+    const pairReentry = buildOverlapPairReentry();
+    if (pairReentry) {
+      return pairReentry;
+    }
+
+    const overlapSeedEvaluation = buildOverlapTemporalSeedEvaluation();
+    if (overlapSeedEvaluation) {
+      return overlapSeedEvaluation;
     }
   }
-
-  const laggingSide: OutcomeSide = state.upShares > state.downShares ? "DOWN" : "UP";
-  const leadingSide: OutcomeSide = laggingSide === "UP" ? "DOWN" : "UP";
   const repairRequestedQty = Math.min(
     Math.max(ctx.lot, shareGap),
     ctx.lot * config.rebalanceMaxLaggingMultiplier,
@@ -389,37 +409,42 @@ export function evaluateEntryBuys(
       (state.reentryDisabled ||
         (state.postMergeCompletionOnlyUntil !== undefined && nowTs < state.postMergeCompletionOnlyUntil)),
   });
+  const phaseCap =
+    config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
+    partialAgeSec <= config.temporalRepairUltraFastWindowSec
+      ? Math.max(phase.cap, config.temporalRepairUltraFastCap)
+      : phase.cap;
   const phasedRepairSize = normalizeOrderSize(
     Math.min(repairSize, Number.isFinite(phase.maxQty) ? phase.maxQty : repairSize),
     config.repairMinQty,
   );
   if (phasedRepairSize <= 0) {
-    return {
+    return withCloneOverlapFallback({
       decisions: [],
       trace: {
         ...trace,
         skipReason: "repair_phase_qty_cap",
       },
-    };
+    });
   }
   const execution = books.quoteForSize(laggingSide, "ask", phasedRepairSize);
   const executableSize = normalizeOrderSize(execution.filledSize, config.repairMinQty);
   if (executableSize <= 0) {
-    return {
+    return withCloneOverlapFallback({
       decisions: [],
       trace: {
         ...trace,
         repairFilledSize: executableSize,
         skipReason: "lagging_depth",
       },
-    };
+    });
   }
 
   const oldGap = absoluteShareGap(state);
   const newGap = projectedShareGapAfterBuy(state, laggingSide, executableSize);
   const wouldIncreaseImbalance = newGap > oldGap + config.maxCompletionOvershootShares;
   if ((config.forbidBuyThatIncreasesImbalance || config.partialCompletionRequiresImbalanceReduction) && wouldIncreaseImbalance) {
-    return {
+    return withCloneOverlapFallback({
       decisions: [],
       trace: {
         ...trace,
@@ -430,7 +455,7 @@ export function evaluateEntryBuys(
         repairWouldIncreaseImbalance: wouldIncreaseImbalance,
         skipReason: "repair_increases_imbalance",
       },
-    };
+    });
   }
 
   const oppositeAveragePrice = averageCost(state, leadingSide);
@@ -446,8 +471,8 @@ export function evaluateEntryBuys(
     missingSidePrice: execution.averagePrice,
   });
   const highLowPhaseCapOverride = Boolean(allowance.highLowMismatch && allowance.allowed);
-  if ((repairCost > phase.cap && !highLowPhaseCapOverride) || executableSize > phase.maxQty) {
-    return {
+  if ((repairCost > phaseCap && !highLowPhaseCapOverride) || executableSize > phase.maxQty) {
+    return withCloneOverlapFallback({
       decisions: [],
       trace: {
         ...trace,
@@ -463,7 +488,7 @@ export function evaluateEntryBuys(
         repairHighLowMismatch: allowance.highLowMismatch ?? false,
         skipReason: executableSize > phase.maxQty ? "repair_phase_qty_cap" : "repair_phase_cap",
       },
-    };
+    });
   }
   const fairValueRequired =
     allowance.highLowMismatch && allowance.allowed && !allowance.requiresFairValue
@@ -503,22 +528,22 @@ export function evaluateEntryBuys(
     !config.allowAnyNewBuyInLast10S &&
     allowance.capMode !== "strict"
   ) {
-    return {
+    return withCloneOverlapFallback({
       decisions: [],
       trace: {
         ...detailedTrace,
         skipReason: "repair_last10_strict_only",
       },
-    };
+    });
   }
   if (!allowance.allowed || !fairValueDecision.allowed) {
-    return {
+    return withCloneOverlapFallback({
       decisions: [],
       trace: {
         ...detailedTrace,
         skipReason: !allowance.allowed ? "repair_cap" : fairValueDecision.reason ?? "repair_fair_value",
       },
-    };
+    });
   }
 
   return {

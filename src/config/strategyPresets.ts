@@ -140,6 +140,8 @@ export interface XuanStrategyConfig {
   temporalRepairSoftCap: number;
   temporalRepairPatientCap: number;
   temporalRepairEmergencyCap: number;
+  temporalRepairUltraFastWindowSec: number;
+  temporalRepairUltraFastCap: number;
   partialSoftMaxQty: number;
   partialHardMaxQty: number;
   partialEmergencyMaxQty: number;
@@ -398,6 +400,8 @@ export function buildStrategyConfig(env: AppEnv): XuanStrategyConfig {
     temporalRepairSoftCap: env.PARTIAL_SOFT_CAP,
     temporalRepairPatientCap: env.PARTIAL_HARD_CAP,
     temporalRepairEmergencyCap: env.PARTIAL_EMERGENCY_CAP,
+    temporalRepairUltraFastWindowSec: 0,
+    temporalRepairUltraFastCap: env.PARTIAL_FAST_CAP,
     partialSoftMaxQty: env.PARTIAL_SOFT_MAX_QTY,
     partialHardMaxQty: env.PARTIAL_HARD_MAX_QTY,
     partialEmergencyMaxQty: env.PARTIAL_EMERGENCY_MAX_QTY,
@@ -570,6 +574,8 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     temporalRepairSoftCap: Math.max(config.temporalRepairSoftCap, 1.075),
     temporalRepairPatientCap: Math.max(config.temporalRepairPatientCap, 1.13),
     temporalRepairEmergencyCap: Math.max(config.temporalRepairEmergencyCap, elevatedBehaviorCap),
+    temporalRepairUltraFastWindowSec: Math.max(config.temporalRepairUltraFastWindowSec, 8),
+    temporalRepairUltraFastCap: Math.max(config.temporalRepairUltraFastCap, 1.065),
     partialSoftMaxQty: Math.max(config.partialSoftMaxQty, maxLadderLot),
     partialHardMaxQty: Math.max(config.partialHardMaxQty, maxLadderLot),
     partialEmergencyMaxQty: Math.max(config.partialEmergencyMaxQty, maxLadderLot),
@@ -590,10 +596,11 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     cloneChildPreferredShares: Math.min(config.cloneChildPreferredShares, 20),
     cloneChildOrderDelayMs: Math.max(config.cloneChildOrderDelayMs, 120),
     mergeBatchMode: "HYBRID_DELAYED",
-    minCompletedCyclesBeforeFirstMerge: Math.max(config.minCompletedCyclesBeforeFirstMerge, 3),
-    minFirstMatchedAgeBeforeMergeSec: Math.max(config.minFirstMatchedAgeBeforeMergeSec, 75),
-    maxMatchedAgeBeforeForcedMergeSec: Math.max(config.maxMatchedAgeBeforeForcedMergeSec, 120),
-    mergeShieldSecFromOpen: Math.max(config.mergeShieldSecFromOpen, 90),
+    minCompletedCyclesBeforeFirstMerge: Math.max(config.minCompletedCyclesBeforeFirstMerge, 4),
+    minFirstMatchedAgeBeforeMergeSec: Math.max(config.minFirstMatchedAgeBeforeMergeSec, 90),
+    maxMatchedAgeBeforeForcedMergeSec: Math.max(config.maxMatchedAgeBeforeForcedMergeSec, 150),
+    mergeShieldSecFromOpen: Math.max(config.mergeShieldSecFromOpen, 120),
+    forceMergeOnHardImbalance: false,
     reentryDelayMs: Math.min(config.reentryDelayMs, 350),
   };
 }

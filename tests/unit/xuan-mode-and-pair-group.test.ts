@@ -362,7 +362,7 @@ describe("xuan mode and pair order groups", () => {
 
     const books = new OrderBookState(
       buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.38, size: 200 }], [{ price: 0.39, size: 200 }]),
-      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.64, size: 200 }], [{ price: 0.65, size: 200 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.74, size: 200 }], [{ price: 0.75, size: 200 }]),
     );
 
     const evaluation = evaluateEntryBuys(
@@ -395,6 +395,109 @@ describe("xuan mode and pair order groups", () => {
       reason: "temporal_single_leg_seed",
     });
     expect(evaluation.trace.skipReason).toBe("protected_residual_overlap_seed");
+  });
+
+  it("preempts controlled-overlap pair reentry with opposite-leg repair when a protected residual is open", () => {
+    const market = buildOfflineMarket(1713696000);
+    const state = createMarketState(market);
+    state.upShares = 80;
+    state.upCost = 32.8;
+    state.upLots = [
+      {
+        size: 80,
+        price: 0.41,
+        timestamp: market.startTs,
+      },
+    ];
+    state.downShares = 40;
+    state.downCost = 19.6;
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.49, size: 200 }], [{ price: 0.5, size: 200 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.48, size: 200 }], [{ price: 0.49, size: 200 }]),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 20,
+        secsToClose: 240,
+        lot: 40,
+        allowControlledOverlap: true,
+        protectedResidualShares: 40,
+        protectedResidualSide: "UP",
+        fairValueSnapshot: {
+          status: "valid",
+          estimatedThreshold: false,
+          fairUp: 0.51,
+          fairDown: 0.49,
+        },
+      },
+    );
+
+    expect(evaluation.decisions).toHaveLength(1);
+    expect(evaluation.decisions[0]).toMatchObject({
+      side: "DOWN",
+      reason: "lagging_rebalance",
+    });
+    expect(evaluation.trace.mode).toBe("lagging_rebalance");
+  });
+
+  it("preempts controlled-overlap pair reentry with high-low chase on a cheap aged residual", () => {
+    const market = buildOfflineMarket(1713696000);
+    const state = createMarketState(market);
+    state.downShares = 80;
+    state.downCost = 13.6;
+    state.downLots = [
+      {
+        size: 80,
+        price: 0.17,
+        timestamp: market.startTs,
+      },
+    ];
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.89, size: 200 }], [{ price: 0.9, size: 200 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.1, size: 200 }], [{ price: 0.11, size: 200 }]),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        XUAN_BEHAVIOR_CAP: "1.3",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 44,
+        secsToClose: 256,
+        lot: 80,
+        allowControlledOverlap: true,
+        protectedResidualShares: 80,
+        protectedResidualSide: "DOWN",
+        fairValueSnapshot: {
+          status: "valid",
+          estimatedThreshold: false,
+          fairUp: 0.74,
+          fairDown: 0.26,
+        },
+      },
+    );
+
+    expect(evaluation.decisions).toHaveLength(1);
+    expect(evaluation.decisions[0]).toMatchObject({
+      side: "UP",
+      mode: "HIGH_LOW_COMPLETION_CHASE",
+      reason: "lagging_rebalance",
+    });
+    expect(evaluation.trace.mode).toBe("lagging_rebalance");
+    expect(evaluation.trace.repairHighLowMismatch).toBe(true);
   });
 
   it("uses high-low completion chase when public footprint clone completes a cheap residual at a high price", () => {

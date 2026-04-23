@@ -1,0 +1,99 @@
+{
+  "generatedAt": "2026-04-23T09:53:12.625Z",
+  "slugs": [
+    "btc-updown-5m-1776928800"
+  ],
+  "sources": {
+    "tradeTapeFile": "local-runtime-extract:data/xuan_state.sqlite+logs"
+  },
+  "references": [
+    {
+      "slug": "btc-updown-5m-1776928800",
+      "startTs": 1776928800,
+      "endTs": 1776929100,
+      "orderedClipSequence": [
+        {
+          "sequenceIndex": 0,
+          "clipIndex": 1,
+          "cycleId": 1,
+          "phase": "ENTRY",
+          "kind": "BUY",
+          "tOffsetSec": 11,
+          "tOffsetMs": 11000,
+          "outcome": "UP",
+          "price": 0.4,
+          "qty": 5.125,
+          "qtyBucket": "6_10",
+          "baseLot": 5,
+          "normalizedClipTier": "1x",
+          "familyLabel": "ENTRY",
+          "internalLabel": "XUAN_HARD_PAIR_SWEEP"
+        },
+        {
+          "sequenceIndex": 1,
+          "clipIndex": 2,
+          "cycleId": 1,
+          "phase": "ENTRY",
+          "kind": "BUY",
+          "tOffsetSec": 17,
+          "tOffsetMs": 17000,
+          "outcome": "UP",
+          "price": 0.41,
+          "qty": 4.9036,
+          "qtyBucket": "1_5",
+          "baseLot": 5,
+          "normalizedClipTier": "1x",
+          "familyLabel": "ENTRY",
+          "internalLabel": "XUAN_HARD_PAIR_SWEEP"
+        }
+      ],
+      "cycleCount": 1,
+      "mergeCount": 0,
+      "redeemCount": 0,
+      "completionCount": 0,
+      "overlapClipCount": 0,
+      "hasOverlap": false,
+      "repairLatencyBucket": "none",
+      "mergeTimingBucket": "none",
+      "finalResidualSide": "UP",
+      "finalResidualBucket": "medium",
+      "clipBucketCounts": {
+        "1_5": 1,
+        "6_10": 1,
+        "11_15": 0,
+        "16_30": 0,
+        "31_plus": 0
+      },
+      "normalizedClipTierCounts": {
+        "0_5x": 0,
+        "1x": 2,
+        "2x": 0,
+        "3x": 0,
+        "4x_plus": 0
+      },
+      "buySequence": [
+        "UP",
+        "UP"
+      ],
+      "alternatingTransitionCount": 0,
+      "authority": {
+        "tradeTape": "paper",
+        "lifecycle": "paper",
+        "verifiedBuyCount": 2,
+        "totalBuyCount": 2,
+        "mergeEventCount": 0,
+        "redeemEventCount": 0
+      }
+    }
+  ],
+  "hardFailsBySlug": {
+    "btc-updown-5m-1776928800": {
+      "overshoot": 0,
+      "sameSideAmplification": 1,
+      "completionQtyExceedsMissing": 0,
+      "grouplessBotFill": 0,
+      "repairSizeZeroWithGap": 0,
+      "mergeMissWithValidQty": 0
+    }
+  }
+}

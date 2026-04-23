@@ -326,6 +326,19 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function childOrderDelayMs(baseDelayMs: number, salt: string): number {
+  if (baseDelayMs <= 0) {
+    return 0;
+  }
+
+  let hash = 0;
+  for (let index = 0; index < salt.length; index += 1) {
+    hash = (hash * 31 + salt.charCodeAt(index)) % 10_000;
+  }
+  const jitter = (hash % 41) - 20;
+  return Math.max(0, baseDelayMs + jitter);
+}
+
 function normalizeBookTimestampSec(book: OrderBook): number {
   return book.timestamp > 10_000_000_000 ? Math.floor(book.timestamp / 1000) : book.timestamp;
 }
@@ -939,7 +952,7 @@ async function executeMarketOrdersInSequence(
       index < orders.length - 1 &&
       isOrderResultAccepted(executed[executed.length - 1]!.result)
     ) {
-      await sleep(interOrderDelayMs);
+      await sleep(childOrderDelayMs(interOrderDelayMs, `${order.tokenId}:${index}`));
     }
   }
   return executed;
@@ -1023,7 +1036,7 @@ async function executePairOrderPlan(args: {
           break;
         }
         if (args.interChildDelayMs > 0 && index < sideOrders.length - 1) {
-          await sleep(args.interChildDelayMs);
+          await sleep(childOrderDelayMs(args.interChildDelayMs, `${entryBuy.side}:${index}`));
         }
       }
     }
@@ -1058,7 +1071,7 @@ async function executePairOrderPlan(args: {
       break;
     }
     if (args.interChildDelayMs > 0 && batchIndex < maxBatchCount - 1) {
-      await sleep(args.interChildDelayMs);
+      await sleep(childOrderDelayMs(args.interChildDelayMs, `pair-batch:${batchIndex}`));
     }
   }
 

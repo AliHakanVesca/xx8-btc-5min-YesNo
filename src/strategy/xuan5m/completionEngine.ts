@@ -157,8 +157,13 @@ function chooseCompletion(
         .filter((size) => size >= config.completionMinQty),
     ),
   ).sort((left, right) => right - left);
+  const prioritizedExactQty = exactCompletionQtyPrior ? normalizeSize(exactCompletionQtyPrior.qty) : undefined;
+  const orderedCandidateSizes =
+    prioritizedExactQty !== undefined && candidateSizes.includes(prioritizedExactQty)
+      ? [prioritizedExactQty, ...candidateSizes.filter((size) => Math.abs(size - prioritizedExactQty) > 1e-6)]
+      : candidateSizes;
 
-  for (const candidateSize of candidateSizes) {
+  for (const candidateSize of orderedCandidateSizes) {
     if (candidateSize > phaseMaxQty) {
       continue;
     }
@@ -214,6 +219,15 @@ function chooseCompletion(
           effectiveCost: costWithFees,
           required: fairValueRequired,
         });
+    const cheapLateCompletionChase =
+      allowance.allowed &&
+      shouldUseCheapLateCompletionChase({
+        config,
+        completionQtyPrior,
+        oppositeAveragePrice: existingAverage,
+        missingSidePrice: execution.averagePrice,
+        partialAgeSec,
+      });
     if (!allowance.allowed) {
       continue;
     }
@@ -268,7 +282,11 @@ function chooseCompletion(
     }
 
     const selectedMode: StrategyExecutionMode =
-      allowance.highLowMismatch && allowance.allowed ? "HIGH_LOW_COMPLETION_CHASE" : phase.mode;
+      allowance.highLowMismatch && allowance.allowed
+        ? "HIGH_LOW_COMPLETION_CHASE"
+        : cheapLateCompletionChase
+          ? "CHEAP_LATE_COMPLETION_CHASE"
+          : phase.mode;
 
     return {
       sideToBuy,
@@ -294,6 +312,32 @@ function chooseCompletion(
   }
 
   return null;
+}
+
+function shouldUseCheapLateCompletionChase(args: {
+  config: XuanStrategyConfig;
+  completionQtyPrior:
+    | {
+        internalLabel: string;
+        scope: "exact" | "family";
+      }
+    | undefined;
+  oppositeAveragePrice: number;
+  missingSidePrice: number;
+  partialAgeSec: number;
+}): boolean {
+  if (args.config.xuanCloneMode !== "PUBLIC_FOOTPRINT") {
+    return false;
+  }
+  if (args.completionQtyPrior?.internalLabel === "CHEAP_LATE_COMPLETION") {
+    return true;
+  }
+  return (
+    args.completionQtyPrior?.scope === "exact" &&
+    args.partialAgeSec >= Math.max(10, args.config.partialFastWindowSec) &&
+    args.missingSidePrice <= args.config.lowSideMaxForHighCompletion + 0.02 &&
+    args.oppositeAveragePrice >= args.config.highSidePriceThreshold - 0.02
+  );
 }
 
 function chooseResidualUnwind(

@@ -5,7 +5,11 @@ import type {
   CanonicalSequenceEvent,
   NormalizedClipTier,
 } from "../../src/analytics/xuanCanonicalReference.js";
-import { exact1776253500Reference, exact1776928800Reference } from "../../src/analytics/xuanExactReference.js";
+import {
+  exact1776248100Reference,
+  exact1776253500Reference,
+  exact1776928800Reference,
+} from "../../src/analytics/xuanExactReference.js";
 import publicSequenceFixture from "../fixtures/xuan_public_sequence_bundle.json" with { type: "json" };
 import runtimeIncidentFixture from "../fixtures/runtime_extract_btc-updown-5m-1776928800.json" with { type: "json" };
 
@@ -380,6 +384,48 @@ describe("xuan replay comparator", () => {
     const shifted = compareCanonicalReference(reference, candidate);
 
     expect(shifted.details.mergeClusterQtySimilarity).toBeLessThan(baseline.details.mergeClusterQtySimilarity);
+    expect(shifted.score).toBeLessThan(baseline.score);
+  });
+
+  it("penalizes deviations from the exact 1776248100 expensive-first to cheap-late completion path", () => {
+    const reference = exact1776248100Reference;
+    const baseline = compareCanonicalReference(reference, {
+      ...reference,
+      slug: "baseline-candidate",
+    });
+    const candidate: CanonicalReferenceExtract = {
+      ...reference,
+      slug: "candidate-market",
+      orderedClipSequence: reference.orderedClipSequence.map((event) => {
+        if (event.sequenceIndex === 10) {
+          return {
+            ...event,
+            outcome: "UP",
+            price: 0.41,
+            internalLabel: "OVERLAP",
+          };
+        }
+        if (event.sequenceIndex === 11) {
+          return {
+            ...event,
+            phase: "HIGH_LOW_COMPLETION",
+            familyLabel: "HIGH_LOW_COMPLETION",
+            internalLabel: "HIGH_LOW_COMPLETION",
+            qty: 61.37359,
+            price: 0.9,
+          };
+        }
+        return event;
+      }),
+      buySequence: reference.buySequence.map((side, index) =>
+        index === 10 ? "UP" : index === 11 ? "UP" : side,
+      ),
+    };
+
+    const shifted = compareCanonicalReference(reference, candidate);
+
+    expect(shifted.details.sideSequenceMismatchCount).toBeGreaterThan(0);
+    expect(shifted.details.eventQtySimilarity).toBeLessThan(baseline.details.eventQtySimilarity);
     expect(shifted.score).toBeLessThan(baseline.score);
   });
 

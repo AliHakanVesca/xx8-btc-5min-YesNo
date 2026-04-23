@@ -201,7 +201,7 @@ export function evaluateEntryBuys(
       dailyNegativeEdgeSpentUsdc,
       ctx.fairValueSnapshot,
     );
-    const trace: EntryDecisionTrace = {
+  const trace: EntryDecisionTrace = {
       mode: "balanced_pair",
       requestedLot: ctx.lot,
       totalShares,
@@ -212,7 +212,23 @@ export function evaluateEntryBuys(
       candidates: inspected.traces,
     };
 
-    if (inspected.bestCandidate) {
+    const temporalSeedEvaluation = evaluateTemporalSingleLegSeed(
+      config,
+      state,
+      books,
+      ctx,
+      dailyNegativeEdgeSpentUsdc,
+    );
+    const preferTemporalCloneCycle =
+      inspected.bestCandidate !== undefined &&
+      shouldPreferTemporalCloneCycleOverBalancedPair({
+        config,
+        state,
+        ctx,
+        bestCandidate: inspected.bestCandidate,
+      });
+
+    if (inspected.bestCandidate && !preferTemporalCloneCycle) {
       return {
         decisions: buildBalancedPairEntryBuys(
           state,
@@ -227,14 +243,6 @@ export function evaluateEntryBuys(
       };
     }
 
-    const temporalSeedEvaluation = evaluateTemporalSingleLegSeed(
-      config,
-      state,
-      books,
-      ctx,
-      dailyNegativeEdgeSpentUsdc,
-    );
-
     if (temporalSeedEvaluation.decision) {
       return {
         decisions: [temporalSeedEvaluation.decision],
@@ -243,7 +251,25 @@ export function evaluateEntryBuys(
           mode: "temporal_pair_cycle",
           selectedMode: temporalSeedEvaluation.decision.mode,
           seedCandidates: temporalSeedEvaluation.trace,
-          skipReason: determineBalancedPairSkipReason(inspected.maxCandidateSize, inspected.traces),
+          skipReason:
+            preferTemporalCloneCycle
+              ? "clone_temporal_priority_over_pair_reentry"
+              : determineBalancedPairSkipReason(inspected.maxCandidateSize, inspected.traces),
+        },
+      };
+    }
+
+    if (inspected.bestCandidate) {
+      return {
+        decisions: buildBalancedPairEntryBuys(
+          state,
+          inspected.bestCandidate,
+          config.cryptoTakerFeeRate,
+          totalShares === 0 ? "balanced_pair_seed" : "balanced_pair_reentry",
+        ),
+        trace: {
+          ...trace,
+          selectedMode: inspected.bestCandidate.mode,
         },
       };
     }
@@ -540,8 +566,21 @@ export function evaluateEntryBuys(
         effectiveCost: repairCost,
         required: fairValueRequired,
       });
+  const cheapLateCompletionChase =
+    allowance.allowed &&
+    shouldUseCheapLateCompletionChase({
+      config,
+      completionQtyPrior,
+      oppositeAveragePrice,
+      missingSidePrice: execution.averagePrice,
+      partialAgeSec,
+    });
   const repairMode: StrategyExecutionMode =
-    allowance.highLowMismatch && allowance.allowed ? "HIGH_LOW_COMPLETION_CHASE" : phase.mode;
+    allowance.highLowMismatch && allowance.allowed
+      ? "HIGH_LOW_COMPLETION_CHASE"
+      : cheapLateCompletionChase
+        ? "CHEAP_LATE_COMPLETION_CHASE"
+        : phase.mode;
   const detailedTrace: EntryDecisionTrace = {
     ...trace,
     selectedMode: repairMode,
@@ -733,6 +772,7 @@ function recentTemporalSequenceBias(state: XuanMarketState, side: OutcomeSide): 
       "PARTIAL_EMERGENCY_COMPLETION",
       "POST_MERGE_RESIDUAL_COMPLETION",
       "HIGH_LOW_COMPLETION_CHASE",
+      "CHEAP_LATE_COMPLETION_CHASE",
     ].includes(state.lastExecutionMode)
   ) {
     score += 0.75;
@@ -802,6 +842,57 @@ function bundledSeedSequencePriorBias(args: {
     bias: sameSide ? 1.35 * phaseWeight : -1.05 * phaseWeight,
     fairValueScale: prior.scope === "exact" ? 0.55 : 0.75,
   };
+}
+
+function shouldPreferTemporalCloneCycleOverBalancedPair(args: {
+  config: XuanStrategyConfig;
+  state: XuanMarketState;
+  ctx: EntryLadderContext;
+  bestCandidate: BalancedPairCandidate;
+}): boolean {
+  if (args.config.xuanCloneMode !== "PUBLIC_FOOTPRINT") {
+    return false;
+  }
+  if (args.bestCandidate.mode === "STRICT_PAIR_SWEEP") {
+    return false;
+  }
+  if (!args.state.fillHistory.some((fill) => fill.side === "BUY")) {
+    return false;
+  }
+  const prior = resolveBundledSeedSequencePrior(args.state.market.slug, args.ctx.secsFromOpen);
+  if (!prior) {
+    return false;
+  }
+  if (prior.scope === "family" && args.ctx.fairValueSnapshot?.status === "valid") {
+    return false;
+  }
+  return args.ctx.secsFromOpen >= prior.activeFromSec - 1e-9 && args.ctx.secsFromOpen <= prior.activeUntilSec + 1e-9;
+}
+
+function shouldUseCheapLateCompletionChase(args: {
+  config: XuanStrategyConfig;
+  completionQtyPrior:
+    | {
+        internalLabel: string;
+        scope: "exact" | "family";
+      }
+    | undefined;
+  oppositeAveragePrice: number;
+  missingSidePrice: number;
+  partialAgeSec: number;
+}): boolean {
+  if (args.config.xuanCloneMode !== "PUBLIC_FOOTPRINT") {
+    return false;
+  }
+  if (args.completionQtyPrior?.internalLabel === "CHEAP_LATE_COMPLETION") {
+    return true;
+  }
+  return (
+    args.completionQtyPrior?.scope === "exact" &&
+    args.partialAgeSec >= Math.max(10, args.config.partialFastWindowSec) &&
+    args.missingSidePrice <= args.config.lowSideMaxForHighCompletion + 0.02 &&
+    args.oppositeAveragePrice >= args.config.highSidePriceThreshold - 0.02
+  );
 }
 
 function scoreTemporalSeedCycle(args: {

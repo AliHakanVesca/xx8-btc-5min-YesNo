@@ -513,6 +513,152 @@ describe("xuan mode and pair order groups", () => {
     expect(adjustment?.completion?.missingShares).toBeCloseTo(90.04696, 5);
   });
 
+  it("uses the exact 1776248100 open-side prior for the first clone seed", () => {
+    const market = buildOfflineMarket(1776248100);
+    const state = createMarketState(market);
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.49, size: 300 }], [{ price: 0.5, size: 300 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.52, size: 300 }], [{ price: 0.53, size: 300 }]),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 4,
+        secsToClose: 296,
+        lot: 116.0656,
+        fairValueSnapshot: {
+          status: "threshold_missing",
+          estimatedThreshold: false,
+        },
+      },
+    );
+
+    expect(evaluation.decisions).toHaveLength(1);
+    expect(evaluation.decisions[0]).toMatchObject({
+      side: "UP",
+      mode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+    expect(evaluation.decisions[0]?.size).toBeCloseTo(116.0656, 5);
+  });
+
+  it("prefers the exact 1776248100 staggered overlap seed over pair reentry in the mid-sequence cluster", () => {
+    const market = buildOfflineMarket(1776248100);
+    const state = createMarketState(market);
+    state.fillHistory = [
+      { outcome: "UP", side: "BUY", price: 0.5, size: 116.0656, timestamp: market.startTs + 4, makerTaker: "taker" },
+      { outcome: "DOWN", side: "BUY", price: 0.526921096345515, size: 116.29898, timestamp: market.startTs + 6, makerTaker: "taker" },
+      { outcome: "DOWN", side: "BUY", price: 0.55, size: 116.49904, timestamp: market.startTs + 8, makerTaker: "taker" },
+      { outcome: "UP", side: "BUY", price: 0.4502948504983389, size: 115.63472, timestamp: market.startTs + 12, makerTaker: "taker" },
+    ];
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.48, size: 300 }], [{ price: 0.49, size: 300 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.48, size: 300 }], [{ price: 0.49, size: 300 }]),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 16,
+        secsToClose: 284,
+        lot: 88.3988,
+        fairValueSnapshot: {
+          status: "valid",
+          estimatedThreshold: false,
+          fairUp: 0.49,
+          fairDown: 0.53,
+        },
+      },
+    );
+
+    expect(evaluation.decisions).toHaveLength(1);
+    expect(evaluation.decisions[0]).toMatchObject({
+      side: "UP",
+      mode: "TEMPORAL_SINGLE_LEG_SEED",
+      reason: "temporal_single_leg_seed",
+    });
+    expect(evaluation.trace.skipReason).toBe("clone_temporal_priority_over_pair_reentry");
+  });
+
+  it("uses the exact 1776248100 late taper clip size for clone lot selection", () => {
+    const lot = chooseLot(
+      buildConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      }),
+      {
+        marketSlug: "btc-updown-5m-1776248100",
+        dryRunOrSmallLive: false,
+        secsFromOpen: 50,
+        imbalance: 0,
+        bookDepthGood: true,
+        pairCostWithinCap: false,
+        pairCostComfortable: false,
+        inventoryBalanced: true,
+        recentBothSidesFilled: true,
+        marketVolumeHigh: true,
+        pnlTodayPositive: true,
+      },
+    );
+
+    expect(lot).toBeCloseTo(60.82812, 5);
+  });
+
+  it("uses a cheap-late completion chase mode for the exact 1776248100 expensive-first residual", () => {
+    const market = buildOfflineMarket(1776248100);
+    const state = createMarketState(market);
+    state.downShares = 61.37359;
+    state.downCost = Number((61.37359 * 0.62).toFixed(6));
+    state.downLots = [
+      {
+        size: 61.37359,
+        price: 0.62,
+        timestamp: market.startTs + 58,
+      },
+    ];
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.24, size: 300 }], [{ price: 0.2461664025356577, size: 300 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.61, size: 300 }], [{ price: 0.62, size: 300 }]),
+    );
+
+    const adjustment = chooseInventoryAdjustment(
+      buildConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      }),
+      state,
+      books,
+      {
+        secsToClose: 232,
+        nowTs: market.startTs + 68,
+        fairValueSnapshot: {
+          status: "threshold_missing",
+          estimatedThreshold: false,
+        },
+      },
+    );
+
+    expect(adjustment?.completion).toMatchObject({
+      sideToBuy: "UP",
+      mode: "CHEAP_LATE_COMPLETION_CHASE",
+      highLowMismatch: false,
+    });
+    expect(adjustment?.completion?.missingShares).toBeCloseTo(59.67519, 5);
+  });
+
   it("does not clamp public footprint clone lots to the smallest clip in dry-run style contexts", () => {
     const lot = chooseLot(
       buildConfig({

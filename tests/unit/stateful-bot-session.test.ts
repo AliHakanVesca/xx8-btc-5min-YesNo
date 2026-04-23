@@ -3,6 +3,7 @@ import { buildOfflineMarket } from "../../src/infra/gamma/marketDiscovery.js";
 import { applyFill } from "../../src/strategy/xuan5m/inventoryState.js";
 import { createMarketState } from "../../src/strategy/xuan5m/marketState.js";
 import {
+  refreshRuntimeProtectedResidualLock,
   inferImmediateOrderResultFill,
   inferUserTradeFill,
   reconcileStateWithBalances,
@@ -206,5 +207,53 @@ describe("stateful bot session helpers", () => {
       }),
     ]);
     expect(reconciled.state.upCost).toBeCloseTo(2.010476, 8);
+  });
+
+  it("opens a runtime protected residual lock after a temporal seed creates an imbalance", () => {
+    const lock = refreshRuntimeProtectedResidualLock({
+      lock: undefined,
+      state: {
+        upShares: 116.0656,
+        downShares: 0,
+      },
+      nowTs: 1776248104,
+      mode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+
+    expect(lock).toEqual({
+      openedAt: 1776248104,
+      protectedSide: "UP",
+      protectedShares: 116.0656,
+      sourceMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+  });
+
+  it("keeps a runtime protected residual lock alive while a delayed completion still leaves residual exposure", () => {
+    const initialLock = refreshRuntimeProtectedResidualLock({
+      lock: undefined,
+      state: {
+        upShares: 116.0656,
+        downShares: 0,
+      },
+      nowTs: 1776248104,
+      mode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+
+    const refreshedLock = refreshRuntimeProtectedResidualLock({
+      lock: initialLock,
+      state: {
+        upShares: 116.0656,
+        downShares: 60.87384,
+      },
+      nowTs: 1776248156,
+      mode: "PARTIAL_FAST_COMPLETION",
+    });
+
+    expect(refreshedLock).toEqual({
+      openedAt: 1776248104,
+      protectedSide: "UP",
+      protectedShares: 55.19176,
+      sourceMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
   });
 });

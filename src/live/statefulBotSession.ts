@@ -182,6 +182,13 @@ interface PartialOpenGroupLock {
   protectedShares: number;
 }
 
+export interface RuntimeProtectedResidualLock {
+  openedAt: number;
+  protectedSide: OutcomeSide;
+  protectedShares: number;
+  sourceMode: Extract<StrategyExecutionMode, "TEMPORAL_SINGLE_LEG_SEED" | "PAIRGROUP_COVERED_SEED">;
+}
+
 interface ActivePairSubmission {
   groupId: string;
   expiresAt: number;
@@ -260,7 +267,10 @@ function shouldAllowControlledOverlap(args: {
   >;
   nowTs: number;
   secsToClose: number;
-  partialOpenGroupLock: PartialOpenGroupLock | undefined;
+  protectedResidualLock:
+    | Pick<PartialOpenGroupLock, "openedAt">
+    | Pick<RuntimeProtectedResidualLock, "openedAt">
+    | undefined;
   completionActive: boolean;
   linkageHealthy: boolean;
   entryBuys: EntryBuyDecision[];
@@ -270,7 +280,7 @@ function shouldAllowControlledOverlap(args: {
   if (!args.config.allowControlledOverlap) {
     return false;
   }
-  if (!args.partialOpenGroupLock || args.entryBuys.length !== 2) {
+  if (!args.protectedResidualLock || args.entryBuys.length !== 2) {
     return false;
   }
   if (args.config.maxOpenGroupsPerMarket < 2 || args.config.maxOpenPartialGroups < 1) {
@@ -279,7 +289,7 @@ function shouldAllowControlledOverlap(args: {
   if (!args.config.allowOverlapInLast30S && args.secsToClose <= args.config.finalWindowCompletionOnlySec) {
     return false;
   }
-  const partialAgeSec = Math.max(0, args.nowTs - args.partialOpenGroupLock.openedAt);
+  const partialAgeSec = Math.max(0, args.nowTs - args.protectedResidualLock.openedAt);
   if (partialAgeSec < args.config.partialFastWindowSec) {
     return false;
   }
@@ -392,6 +402,52 @@ function clampFallbackPrice(price: number | undefined): number {
 
 function normalizeShares(value: number): number {
   return Number(value.toFixed(6));
+}
+
+function isProtectedResidualSeedMode(
+  mode: StrategyExecutionMode | undefined,
+): mode is Extract<StrategyExecutionMode, "TEMPORAL_SINGLE_LEG_SEED" | "PAIRGROUP_COVERED_SEED"> {
+  return mode === "TEMPORAL_SINGLE_LEG_SEED" || mode === "PAIRGROUP_COVERED_SEED";
+}
+
+function dominantResidualSide(state: Pick<XuanMarketState, "upShares" | "downShares">): OutcomeSide | undefined {
+  if (Math.abs(state.upShares - state.downShares) <= 1e-6) {
+    return undefined;
+  }
+  return state.upShares > state.downShares ? "UP" : "DOWN";
+}
+
+export function refreshRuntimeProtectedResidualLock(args: {
+  lock: RuntimeProtectedResidualLock | undefined;
+  state: Pick<XuanMarketState, "upShares" | "downShares">;
+  nowTs: number;
+  mode?: StrategyExecutionMode | undefined;
+}): RuntimeProtectedResidualLock | undefined {
+  const protectedSide = dominantResidualSide(args.state);
+  const protectedShares = normalizeShares(Math.abs(args.state.upShares - args.state.downShares));
+  if (!protectedSide || protectedShares <= 1e-6) {
+    return undefined;
+  }
+
+  if (isProtectedResidualSeedMode(args.mode)) {
+    return {
+      openedAt: args.nowTs,
+      protectedSide,
+      protectedShares,
+      sourceMode: args.mode,
+    };
+  }
+
+  if (!args.lock) {
+    return undefined;
+  }
+
+  return {
+    ...args.lock,
+    openedAt: args.lock.protectedSide === protectedSide ? args.lock.openedAt : args.nowTs,
+    protectedSide,
+    protectedShares,
+  };
 }
 
 function pushEvent(events: Array<Record<string, unknown>>, event: Record<string, unknown>, limit = 200): void {
@@ -1275,6 +1331,7 @@ export async function runStatefulBotSession(
   const events: Array<Record<string, unknown>> = [];
   let pendingPairExecution: PendingPairExecution | undefined;
   let partialOpenGroupLock: PartialOpenGroupLock | undefined;
+  let runtimeProtectedResidualLock: RuntimeProtectedResidualLock | undefined;
   let activePairSubmission: ActivePairSubmission | undefined;
   let lastDecisionTraceAt = 0;
   let lastDecisionTraceSignature = "";
@@ -1578,6 +1635,7 @@ export async function runStatefulBotSession(
           ),
         ),
       };
+      runtimeProtectedResidualLock = undefined;
     } else if (partialOpenGroupLock?.groupId === finalized.group.groupId) {
       partialOpenGroupLock = undefined;
     }
@@ -1660,6 +1718,12 @@ export async function runStatefulBotSession(
     },
   });
   state = stateStore.loadMarketState(state);
+  runtimeProtectedResidualLock = refreshRuntimeProtectedResidualLock({
+    lock: undefined,
+    state,
+    nowTs: startedAt,
+    mode: state.lastExecutionMode,
+  });
   stateStore.upsertMarketState(state);
   if (config.restartRestorePartialAsCompletionOnly) {
     const restoredPartialGroup = stateStore.loadLatestOpenPartialPairGroup(market.slug);
@@ -1675,6 +1739,7 @@ export async function runStatefulBotSession(
         protectedSide: restoredPartialGroup.status === "UP_ONLY" ? "UP" : "DOWN",
         protectedShares: normalizeShares(restoredGap),
       };
+      runtimeProtectedResidualLock = undefined;
       startupCompletionOnly = true;
       if (config.blockNewPairWhenRestoredPartialExists) {
         startupBlockNewEntries = true;
@@ -1911,6 +1976,15 @@ export async function runStatefulBotSession(
         orderId: submittedIntent.orderId,
       });
     }
+    runtimeProtectedResidualLock =
+      partialOpenGroupLock !== undefined
+        ? undefined
+        : refreshRuntimeProtectedResidualLock({
+            lock: runtimeProtectedResidualLock,
+            state,
+            nowTs: normalizedFill.timestamp,
+            mode: submittedIntent?.mode ?? normalizedFill.executionMode,
+          });
     stateStore.upsertMarketState(state);
     userTradeCount += 1;
     pushEvent(events, {
@@ -2079,6 +2153,14 @@ export async function runStatefulBotSession(
         });
       }
     }
+    runtimeProtectedResidualLock =
+      partialOpenGroupLock !== undefined
+        ? undefined
+        : refreshRuntimeProtectedResidualLock({
+            lock: runtimeProtectedResidualLock,
+            state,
+            nowTs: args.nowTs,
+          });
     stateStore.upsertMarketState(state);
     stateStore.recordReconcileRun({
       scope: args.scope,
@@ -2387,6 +2469,12 @@ export async function runStatefulBotSession(
         stateStore.upsertMarketState(state);
       }
       if (
+        runtimeProtectedResidualLock &&
+        Math.abs(state.upShares - state.downShares) <= Math.max(config.repairMinQty, config.completionMinQty)
+      ) {
+        runtimeProtectedResidualLock = undefined;
+      }
+      if (
         state.reentryDisabled &&
         Math.abs(state.upShares - state.downShares) <= config.postMergeFlatDustShares &&
         config.postMergeAllowNewPairIfFlat
@@ -2399,8 +2487,9 @@ export async function runStatefulBotSession(
         };
         stateStore.upsertMarketState(state);
       }
+      const activeProtectedResidualLock = partialOpenGroupLock ?? runtimeProtectedResidualLock;
       const overlapCompletionProbe =
-        partialOpenGroupLock !== undefined
+        activeProtectedResidualLock !== undefined
           ? chooseInventoryAdjustment(config, state, books, {
               secsToClose: market.endTs - nowTs,
               usdcBalance: cachedUsdcBalance,
@@ -2410,13 +2499,13 @@ export async function runStatefulBotSession(
           : undefined;
       const overlapCompletionActive = Boolean(overlapCompletionProbe?.completion);
       const partialAgeSec =
-        partialOpenGroupLock !== undefined ? Math.max(0, nowTs - partialOpenGroupLock.openedAt) : undefined;
+        activeProtectedResidualLock !== undefined ? Math.max(0, nowTs - activeProtectedResidualLock.openedAt) : undefined;
       const overlapBaseLot = config.liveSmallLotLadder[0] ?? config.defaultLot;
       const openMatchedQty = Number(Math.min(state.upShares, state.downShares).toFixed(6));
       const matchedInventoryTargetMet =
         mergeBatchTracker.windows.length >= 1 || openMatchedQty + 1e-6 >= overlapBaseLot;
       const previewControlledOverlapAllowed =
-        partialOpenGroupLock !== undefined &&
+        activeProtectedResidualLock !== undefined &&
         config.allowControlledOverlap &&
         config.maxOpenGroupsPerMarket >= 2 &&
         config.maxOpenPartialGroups >= 1 &&
@@ -2436,8 +2525,8 @@ export async function runStatefulBotSession(
         partialOpenGroupLock !== undefined &&
         config.maxOpenPartialGroups <= 1 &&
         !previewControlledOverlapAllowed;
-      const protectedResidualShares = partialOpenGroupLock
-        ? Math.min(partialOpenGroupLock.protectedShares, Math.abs(state.upShares - state.downShares))
+      const protectedResidualShares = activeProtectedResidualLock
+        ? Math.min(activeProtectedResidualLock.protectedShares, Math.abs(state.upShares - state.downShares))
         : 0;
       const decision = bot.evaluateTick({
         config,
@@ -2469,7 +2558,7 @@ export async function runStatefulBotSession(
         fairValueSnapshot: latestFairValueSnapshot,
         allowControlledOverlap: previewControlledOverlapAllowed,
         protectedResidualShares,
-        protectedResidualSide: partialOpenGroupLock?.protectedSide,
+        protectedResidualSide: activeProtectedResidualLock?.protectedSide,
       });
       const decisionTraceContext: DecisionTraceContext = {
         eventSeq: marketEventSeq,
@@ -2538,11 +2627,12 @@ export async function runStatefulBotSession(
       }
 
       const worstCaseAmplificationShares = computeWorstCaseAmplificationShares(state, decision.entryBuys);
+      const controlledOverlapLock = partialOpenGroupLock ?? runtimeProtectedResidualLock;
       const controlledOverlapActive = shouldAllowControlledOverlap({
         config,
         nowTs,
         secsToClose: market.endTs - nowTs,
-        partialOpenGroupLock,
+        protectedResidualLock: controlledOverlapLock,
         completionActive: overlapCompletionActive,
         linkageHealthy: pairgroupLinkageHealthy,
         entryBuys: decision.entryBuys,
@@ -2550,17 +2640,18 @@ export async function runStatefulBotSession(
         worstCaseAmplificationShares,
       });
 
-      if (partialOpenGroupLock && decision.entryBuys.length > 1 && !controlledOverlapActive) {
+      if (controlledOverlapLock && decision.entryBuys.length > 1 && !controlledOverlapActive) {
         await traceLogger.write("risk_events", {
           reason: "controlled_overlap_blocked",
-          partialGroupId: partialOpenGroupLock.groupId,
-          partialStatus: partialOpenGroupLock.status,
+          partialGroupId: partialOpenGroupLock?.groupId ?? null,
+          partialStatus: partialOpenGroupLock?.status ?? "SEED_ONLY",
           partialAgeSec,
           completionActive: overlapCompletionActive,
           linkageHealthy: pairgroupLinkageHealthy,
           matchedInventoryTargetMet,
           worstCaseAmplificationShares,
           secsToClose: market.endTs - nowTs,
+          residualLockSource: partialOpenGroupLock ? "partial_group" : runtimeProtectedResidualLock?.sourceMode ?? null,
         });
         await waitForDecisionPulse();
         continue;
@@ -2971,6 +3062,15 @@ export async function runStatefulBotSession(
                 groupId: temporalSeedGroup.groupId,
                 orderId: execution.result.orderId,
               });
+              runtimeProtectedResidualLock =
+                partialOpenGroupLock !== undefined
+                  ? undefined
+                  : refreshRuntimeProtectedResidualLock({
+                      lock: runtimeProtectedResidualLock,
+                      state,
+                      nowTs,
+                      mode: entryBuy.mode,
+                    });
               consumeSubmittedIntent(submittedPrices, immediateFill.outcome, immediateFill.size);
               rememberOrderResultFillSuppression(immediateFill);
               pushEvent(events, {

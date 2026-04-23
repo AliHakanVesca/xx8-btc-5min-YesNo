@@ -47,7 +47,7 @@ export function chooseLot(config: XuanStrategyConfig, ctx: LotContext): number {
         ctx.secsFromOpen <= sequencePrior.activeUntilSec + 1e-9 &&
         ctx.bookDepthGood
       ) {
-        return Number(Math.max(cloneBase, sequencePrior.qty).toFixed(6));
+        return Number((sequencePrior.scope === "exact" ? sequencePrior.qty : Math.max(cloneBase, sequencePrior.qty)).toFixed(6));
       }
       if (ctx.secsFromOpen < 45) {
         if (!ctx.bookDepthGood) {

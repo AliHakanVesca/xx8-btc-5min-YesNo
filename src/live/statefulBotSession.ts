@@ -52,6 +52,7 @@ import { isOrderResultAccepted, summarizeOrderResult } from "../infra/clob/order
 import { PersistentStateStore } from "./persistentStateStore.js";
 import { MarketFairValueRuntime } from "./fairValueRuntime.js";
 import type { FairValueSnapshot } from "../strategy/xuan5m/fairValueEngine.js";
+import { planCloneChildBuyOrders } from "./childOrderPlanner.js";
 
 export interface BotSessionOptions {
   durationSec?: number;
@@ -98,6 +99,13 @@ export interface SubmittedIntent {
 }
 
 type SubmittedIntentBook = Partial<Record<OutcomeSide, SubmittedIntent[]>>;
+
+interface ExecutedMarketOrder {
+  order: MarketOrderArgs;
+  result: OrderResult;
+}
+
+type PairOrderPlan = Record<OutcomeSide, MarketOrderArgs[]>;
 
 export interface BotSessionReport {
   runtime: {
@@ -892,6 +900,150 @@ function withAvailableUsdcBalance(order: MarketOrderArgs, usdcBalance: number | 
     ...order,
     userUsdcBalance: Number(usdcBalance.toFixed(6)),
   };
+}
+
+function assignSequentialUsdcBalances(
+  orders: MarketOrderArgs[],
+  usdcBalance: number | undefined,
+): MarketOrderArgs[] {
+  if (usdcBalance === undefined || !Number.isFinite(usdcBalance) || usdcBalance <= 0) {
+    return orders;
+  }
+
+  let remainingBalance = usdcBalance;
+  return orders.map((order) => {
+    const balancedOrder = withAvailableUsdcBalance(order, remainingBalance);
+    if (order.side === "BUY") {
+      remainingBalance = normalizeShares(Math.max(0, remainingBalance - order.amount));
+    }
+    return balancedOrder;
+  });
+}
+
+async function executeMarketOrdersInSequence(
+  completionManager: TakerCompletionManager,
+  orders: MarketOrderArgs[],
+): Promise<ExecutedMarketOrder[]> {
+  const executed: ExecutedMarketOrder[] = [];
+  for (const order of orders) {
+    executed.push({
+      order,
+      result: await completionManager.execute(order),
+    });
+  }
+  return executed;
+}
+
+function selectRepresentativeExecution(executions: ExecutedMarketOrder[]): ExecutedMarketOrder {
+  return executions.find((execution) => isOrderResultAccepted(execution.result)) ?? executions[executions.length - 1]!;
+}
+
+function selectRepresentativeResult(executions: ExecutedMarketOrder[]): OrderResult | undefined {
+  return executions.length > 0 ? selectRepresentativeExecution(executions).result : undefined;
+}
+
+function sumOrderShareTargets(orders: MarketOrderArgs[]): number | undefined {
+  const total = orders.reduce((acc, order) => acc + (order.shareTarget ?? 0), 0);
+  return total > 0 ? normalizeShares(total) : undefined;
+}
+
+function sumOrderAmounts(orders: MarketOrderArgs[]): number {
+  return normalizeShares(orders.reduce((acc, order) => acc + order.amount, 0));
+}
+
+function buildPairOrderPlan(args: {
+  config: XuanStrategyConfig;
+  entriesBySide: Record<OutcomeSide, EntryBuyDecision>;
+  books: OrderBookState;
+  minOrderSize: number;
+  cachedUsdcBalance: number | undefined;
+}): PairOrderPlan {
+  const buildSideOrders = (side: OutcomeSide): MarketOrderArgs[] => {
+    const baseOrder = args.entriesBySide[side].order;
+    const plannedOrders =
+      args.config.xuanCloneMode === "PUBLIC_FOOTPRINT"
+        ? planCloneChildBuyOrders({
+            order: baseOrder,
+            outcome: side,
+            books: args.books,
+            minOrderSize: args.minOrderSize,
+          })
+        : [baseOrder];
+    return assignSequentialUsdcBalances(plannedOrders, args.cachedUsdcBalance);
+  };
+
+  return {
+    UP: buildSideOrders("UP"),
+    DOWN: buildSideOrders("DOWN"),
+  };
+}
+
+async function executePairOrderPlan(args: {
+  completionManager: TakerCompletionManager;
+  orderPlanBySide: PairOrderPlan;
+  orderedEntries: EntryBuyDecision[];
+  sequentialPairExecutionActive: boolean;
+}): Promise<Record<OutcomeSide, ExecutedMarketOrder[]>> {
+  const executedBySide: Record<OutcomeSide, ExecutedMarketOrder[]> = {
+    UP: [],
+    DOWN: [],
+  };
+
+  if (args.sequentialPairExecutionActive) {
+    let abortRemainingSides = false;
+    for (const entryBuy of args.orderedEntries) {
+      if (abortRemainingSides) {
+        break;
+      }
+      const sideOrders = args.orderPlanBySide[entryBuy.side];
+      for (let index = 0; index < sideOrders.length; index += 1) {
+        const order = sideOrders[index]!;
+        const execution = {
+          order,
+          result: await args.completionManager.execute(order),
+        };
+        executedBySide[entryBuy.side].push(execution);
+        if (!isOrderResultAccepted(execution.result)) {
+          if (index === 0) {
+            abortRemainingSides = true;
+          }
+          break;
+        }
+      }
+    }
+    return executedBySide;
+  }
+
+  const maxBatchCount = Math.max(args.orderPlanBySide.UP.length, args.orderPlanBySide.DOWN.length);
+  for (let batchIndex = 0; batchIndex < maxBatchCount; batchIndex += 1) {
+    const batch = (["UP", "DOWN"] as OutcomeSide[])
+      .map((side) => {
+        const order = args.orderPlanBySide[side][batchIndex];
+        return order ? { side, order } : undefined;
+      })
+      .filter((item): item is { side: OutcomeSide; order: MarketOrderArgs } => item !== undefined);
+    if (batch.length === 0) {
+      continue;
+    }
+    const results = await Promise.all(batch.map((item) => args.completionManager.execute(item.order)));
+    let batchAccepted = true;
+    for (let index = 0; index < batch.length; index += 1) {
+      const item = batch[index]!;
+      const result = results[index]!;
+      executedBySide[item.side].push({
+        order: item.order,
+        result,
+      });
+      if (!isOrderResultAccepted(result)) {
+        batchAccepted = false;
+      }
+    }
+    if (!batchAccepted) {
+      break;
+    }
+  }
+
+  return executedBySide;
 }
 
 async function logRejectedOrder(args: {
@@ -2407,66 +2559,56 @@ export async function runStatefulBotSession(
                     return left.side === missingSide ? -1 : 1;
                   })
                 : groupedEntries;
-          const liveOrderBySide = {
-            UP: withAvailableUsdcBalance(upEntry.order, cachedUsdcBalance),
-            DOWN: withAvailableUsdcBalance(downEntry.order, cachedUsdcBalance),
-          } satisfies Record<OutcomeSide, MarketOrderArgs>;
-          let upResult: OrderResult | undefined;
-          let downResult: OrderResult | undefined;
-          const executedEntries: EntryBuyDecision[] = [];
+          const groupedEntryBySide = {
+            UP: groupedEntries.find((entryBuy) => entryBuy.side === "UP")!,
+            DOWN: groupedEntries.find((entryBuy) => entryBuy.side === "DOWN")!,
+          } satisfies Record<OutcomeSide, EntryBuyDecision>;
+          const orderPlanBySide = buildPairOrderPlan({
+            config,
+            entriesBySide: groupedEntryBySide,
+            books,
+            minOrderSize: state.market.minOrderSize,
+            cachedUsdcBalance,
+          });
           activePairSubmission = {
             groupId: group.groupId,
             expiresAt: submittedAtTs + submittedIntentMaxAgeSec,
             entries: groupedEntries.map((entryBuy) => ({
               outcome: entryBuy.side,
-              price: liveOrderBySide[entryBuy.side].price,
-              expectedShares: liveOrderBySide[entryBuy.side].shareTarget,
+              price: orderPlanBySide[entryBuy.side][0]?.price,
+              expectedShares: sumOrderShareTargets(orderPlanBySide[entryBuy.side]),
               mode: entryBuy.mode,
             })),
           };
-
-          if (sequentialPairExecutionActive) {
-            for (let index = 0; index < orderedEntries.length; index += 1) {
-              const entryBuy = orderedEntries[index]!;
-              const result = await completionManager.execute(liveOrderBySide[entryBuy.side]);
-              executedEntries.push(entryBuy);
-              if (entryBuy.side === "UP") {
-                upResult = result;
-              } else {
-                downResult = result;
-              }
-              if (index === 0 && !isOrderResultAccepted(result)) {
-                break;
-              }
-            }
-          } else {
-            const [parallelUpResult, parallelDownResult] = await Promise.all(
-              groupedEntries.map((entryBuy) => completionManager.execute(liveOrderBySide[entryBuy.side])),
-            );
-            upResult = parallelUpResult;
-            downResult = parallelDownResult;
-            executedEntries.push(...groupedEntries);
-          }
+          const executedBySide = await executePairOrderPlan({
+            completionManager,
+            orderPlanBySide,
+            orderedEntries,
+            sequentialPairExecutionActive,
+          });
+          const upResult = selectRepresentativeResult(executedBySide.UP);
+          const downResult = selectRepresentativeResult(executedBySide.DOWN);
+          const allExecutions = [...executedBySide.UP, ...executedBySide.DOWN];
 
           rememberSubmittedPrices(
             submittedPrices,
             market,
-            executedEntries.map((entryBuy) => ({
-              ...liveOrderBySide[entryBuy.side],
-              side: liveOrderBySide[entryBuy.side].side,
-              mode: entryBuy.mode,
+            allExecutions.map(({ order, result }) => ({
+              ...order,
+              side: order.side,
+              mode:
+                order.tokenId === market.tokens.UP.tokenId
+                  ? groupedEntryBySide.UP.mode
+                  : groupedEntryBySide.DOWN.mode,
               groupId: group.groupId,
-              orderId: entryBuy.side === "UP" ? upResult?.orderId : downResult?.orderId,
-              expectedShares: expectedSharesForSubmission(
-                liveOrderBySide[entryBuy.side].shareTarget,
-                entryBuy.side === "UP" ? upResult : downResult,
-              ),
+              orderId: result.orderId,
+              expectedShares: expectedSharesForSubmission(order.shareTarget, result),
             })),
             submittedAtTs,
           );
           const negativeEdgeUsdc = estimateNegativeEdgeUsdc(upEntry.pairCostWithFees ?? 1, group.intendedQty);
           pairGroupCount += 1;
-          entrySubmitCount += executedEntries.length;
+          entrySubmitCount += allExecutions.length;
           actionCooldownUntil = Date.now() + config.reentryDelayMs;
           const anyAccepted = Boolean(
             (upResult && isOrderResultAccepted(upResult)) ||
@@ -2487,32 +2629,18 @@ export async function runStatefulBotSession(
           };
           stateStore.upsertPairGroup(group);
           let immediateFinalizedPairExecution: PairExecutionResult | undefined;
-          const immediateOrderResultFills = [
-            {
-              fill: inferImmediateOrderResultFill({
-                result: upResult,
-                order: liveOrderBySide.UP,
-                outcome: "UP",
-                nowTs,
-                mode: upEntry.mode,
-              }),
-              result: upResult,
-              mode: upEntry.mode,
-            },
-            {
-              fill: inferImmediateOrderResultFill({
-                result: downResult,
-                order: liveOrderBySide.DOWN,
-                outcome: "DOWN",
-                nowTs,
-                mode: downEntry.mode,
-              }),
-              result: downResult,
-              mode: downEntry.mode,
-            },
-          ].filter((item): item is { fill: FillRecord; result: OrderResult | undefined; mode: StrategyExecutionMode } =>
-            item.fill !== undefined,
-          );
+          const immediateOrderResultFills = allExecutions.flatMap(({ order, result }) => {
+            const outcome: OutcomeSide = order.tokenId === market.tokens.UP.tokenId ? "UP" : "DOWN";
+            const mode = outcome === "UP" ? upEntry.mode : downEntry.mode;
+            const fill = inferImmediateOrderResultFill({
+              result,
+              order,
+              outcome,
+              nowTs,
+              mode,
+            });
+            return fill ? [{ fill, result, mode }] : [];
+          });
           for (const immediateFill of immediateOrderResultFills) {
             state = applyFill(state, immediateFill.fill);
             stateStore.recordFill(state, immediateFill.fill, {
@@ -2580,6 +2708,8 @@ export async function runStatefulBotSession(
             marketNegativeSpentBefore: group.marketNegativeSpentBefore,
             marketNegativeSpentAfter: group.marketNegativeSpentAfter,
             controlledOverlap: controlledOverlapActive,
+            upChildOrderCount: executedBySide.UP.length,
+            downChildOrderCount: executedBySide.DOWN.length,
             upResult,
             downResult,
           });
@@ -2607,12 +2737,16 @@ export async function runStatefulBotSession(
             orderType: group.orderType,
             controlledOverlap: controlledOverlapActive,
             sequentialPairExecution: sequentialPairExecutionActive,
+            upChildOrderCount: executedBySide.UP.length,
+            downChildOrderCount: executedBySide.DOWN.length,
             upOrderId: upResult?.orderId ?? null,
             downOrderId: downResult?.orderId ?? null,
             upStatus: upResult?.status ?? null,
             downStatus: downResult?.status ?? null,
             upAccepted: upResult ? isOrderResultAccepted(upResult) : false,
             downAccepted: downResult ? isOrderResultAccepted(downResult) : false,
+            upChildResults: executedBySide.UP.map((execution) => summarizeOrderResult(execution.result)),
+            downChildResults: executedBySide.DOWN.map((execution) => summarizeOrderResult(execution.result)),
             upResult: upResult ? summarizeOrderResult(upResult) : null,
             downResult: downResult ? summarizeOrderResult(downResult) : null,
           });
@@ -2629,16 +2763,18 @@ export async function runStatefulBotSession(
             sequentialPairExecution: sequentialPairExecutionActive,
             up: {
               price: group.maxUpPrice ?? null,
-              shareTarget: liveOrderBySide.UP.shareTarget ?? null,
-              spendAmount: liveOrderBySide.UP.amount,
+              shareTarget: sumOrderShareTargets(orderPlanBySide.UP) ?? null,
+              spendAmount: sumOrderAmounts(orderPlanBySide.UP),
+              childOrderCount: executedBySide.UP.length,
               orderId: upResult?.orderId ?? null,
               status: upResult?.status ?? null,
               accepted: upResult ? isOrderResultAccepted(upResult) : false,
             },
             down: {
               price: group.maxDownPrice ?? null,
-              shareTarget: liveOrderBySide.DOWN.shareTarget ?? null,
-              spendAmount: liveOrderBySide.DOWN.amount,
+              shareTarget: sumOrderShareTargets(orderPlanBySide.DOWN) ?? null,
+              spendAmount: sumOrderAmounts(orderPlanBySide.DOWN),
+              childOrderCount: executedBySide.DOWN.length,
               orderId: downResult?.orderId ?? null,
               status: downResult?.status ?? null,
               accepted: downResult ? isOrderResultAccepted(downResult) : false,
@@ -2679,7 +2815,16 @@ export async function runStatefulBotSession(
                 metadata: `${temporalSeedGroup.groupId}:${entryBuy.side}`,
               }
             : entryBuy.order;
-          const liveOrder = withAvailableUsdcBalance(groupedSingleOrder, cachedUsdcBalance);
+          const plannedOrders =
+            config.xuanCloneMode === "PUBLIC_FOOTPRINT"
+              ? planCloneChildBuyOrders({
+                  order: groupedSingleOrder,
+                  outcome: entryBuy.side,
+                  books,
+                  minOrderSize: state.market.minOrderSize,
+                })
+              : [groupedSingleOrder];
+          const liveOrders = assignSequentialUsdcBalances(plannedOrders, cachedUsdcBalance);
           if (temporalSeedGroup) {
             stateStore.upsertPairGroup(temporalSeedGroup);
             activePairSubmission = {
@@ -2688,30 +2833,30 @@ export async function runStatefulBotSession(
               entries: [
                 {
                   outcome: entryBuy.side,
-                  price: liveOrder.price,
-                  expectedShares: liveOrder.shareTarget,
+                  price: liveOrders[0]?.price,
+                  expectedShares: entryBuy.size,
                   mode: entryBuy.mode,
                 },
               ],
             };
           }
-          const result = await completionManager.execute(liveOrder);
+          const executions = await executeMarketOrdersInSequence(completionManager, liveOrders);
+          const representativeExecution = selectRepresentativeExecution(executions);
+          const result = representativeExecution.result;
+          const accepted = executions.some((execution) => isOrderResultAccepted(execution.result));
           rememberSubmittedPrices(
             submittedPrices,
             market,
-            [
-              {
-                ...liveOrder,
-                side: liveOrder.side,
-                mode: entryBuy.mode,
-                groupId: temporalSeedGroup?.groupId,
-                orderId: result.orderId,
-                expectedShares: expectedSharesForSubmission(liveOrder.shareTarget, result),
-              },
-            ],
+            executions.map(({ order, result: executionResult }) => ({
+              ...order,
+              side: order.side,
+              mode: entryBuy.mode,
+              groupId: temporalSeedGroup?.groupId,
+              orderId: executionResult.orderId,
+              expectedShares: expectedSharesForSubmission(order.shareTarget, executionResult),
+            })),
             submittedAtTs,
           );
-          const accepted = isOrderResultAccepted(result);
           if (temporalSeedGroup) {
             pendingPairExecution = {
               group: temporalSeedGroup,
@@ -2729,7 +2874,7 @@ export async function runStatefulBotSession(
             persistDailyBudget(state);
             state = updateSeedSubmissionState(state, entryBuy.mode, entryBuy.side);
             stateStore.upsertMarketState(state);
-          } else {
+          } else if (!accepted) {
             await logRejectedOrder({
               traceLogger,
               phase: "entry",
@@ -2737,29 +2882,34 @@ export async function runStatefulBotSession(
               side: entryBuy.side,
               size: entryBuy.size,
               result,
-              order: liveOrder,
+              order: representativeExecution.order,
               negativeEdgeUsdc: entryBuy.negativeEdgeUsdc,
             });
           }
           if (temporalSeedGroup && pendingPairExecution) {
-            const immediateFill = inferImmediateOrderResultFill({
-              result,
-              order: liveOrder,
-              outcome: entryBuy.side,
-              nowTs,
-              mode: entryBuy.mode,
-            });
-            if (immediateFill) {
+            let sawImmediateFill = false;
+            for (const execution of executions) {
+              const immediateFill = inferImmediateOrderResultFill({
+                result: execution.result,
+                order: execution.order,
+                outcome: entryBuy.side,
+                nowTs,
+                mode: entryBuy.mode,
+              });
+              if (!immediateFill) {
+                continue;
+              }
+              sawImmediateFill = true;
               state = applyFill(state, immediateFill);
               stateStore.recordFill(state, immediateFill, {
-                orderId: result.orderId,
+                orderId: execution.result.orderId,
                 groupId: temporalSeedGroup.groupId,
                 executionMode: entryBuy.mode,
                 source: "ORDER_RESULT",
               });
               rememberBotOwnedBuyFill(immediateFill, {
                 groupId: temporalSeedGroup.groupId,
-                orderId: result.orderId,
+                orderId: execution.result.orderId,
               });
               consumeSubmittedIntent(submittedPrices, immediateFill.outcome, immediateFill.size);
               rememberOrderResultFillSuppression(immediateFill);
@@ -2770,7 +2920,7 @@ export async function runStatefulBotSession(
                 outcome: immediateFill.outcome,
                 size: immediateFill.size,
                 price: immediateFill.price,
-                orderId: result.orderId ?? null,
+                orderId: execution.result.orderId ?? null,
               });
               await traceLogger.write("user_fills", {
                 eventType: "order_result_fill",
@@ -2780,12 +2930,12 @@ export async function runStatefulBotSession(
                 price: immediateFill.price,
                 executionMode: entryBuy.mode,
                 groupId: temporalSeedGroup.groupId,
-                orderId: result.orderId ?? null,
+                orderId: execution.result.orderId ?? null,
                 source: "ORDER_RESULT",
                 correlationId: temporalSeedGroup.groupId,
               });
             }
-            if (immediateFill || !accepted) {
+            if (sawImmediateFill || !accepted) {
               const finalized = finalizePairExecutionResult({
                 group: temporalSeedGroup,
                 upResult: entryBuy.side === "UP" ? result : undefined,
@@ -2809,30 +2959,29 @@ export async function runStatefulBotSession(
           pushEvent(events, {
             timestamp: nowTs,
             type: "entry_submit",
-            orders: [
-              {
-                side: entryBuy.side,
-                size: entryBuy.size,
-                price: entryBuy.order.price,
-                reason: entryBuy.reason,
-                mode: entryBuy.mode,
-                rawPair: entryBuy.rawPairCost ?? null,
-                effectivePair: entryBuy.pairCostWithFees ?? null,
-                negativeEdgeUsdc: entryBuy.negativeEdgeUsdc ?? 0,
-                shareTarget: liveOrder.shareTarget ?? null,
-                spendAmount: liveOrder.amount,
-                result: summarizeOrderResult(result),
-              },
-            ],
+            orders: executions.map(({ order, result: executionResult }) => ({
+              side: entryBuy.side,
+              size: order.shareTarget ?? entryBuy.size,
+              price: order.price,
+              reason: entryBuy.reason,
+              mode: entryBuy.mode,
+              rawPair: entryBuy.rawPairCost ?? null,
+              effectivePair: entryBuy.pairCostWithFees ?? null,
+              negativeEdgeUsdc: entryBuy.negativeEdgeUsdc ?? 0,
+              shareTarget: order.shareTarget ?? null,
+              spendAmount: order.amount,
+              result: summarizeOrderResult(executionResult),
+            })),
           });
           await traceLogger.write("orders", {
             eventType: "entry_submit",
             selectedMode: entryBuy.mode,
             side: entryBuy.side,
             size: entryBuy.size,
-            price: liveOrder.price ?? null,
-            shareTarget: liveOrder.shareTarget ?? null,
-            spendAmount: liveOrder.amount,
+            childOrderCount: executions.length,
+            price: representativeExecution.order.price ?? null,
+            shareTarget: entryBuy.size,
+            spendAmount: Number(executions.reduce((total, execution) => total + execution.order.amount, 0).toFixed(6)),
             negativeEdgeUsdc: entryBuy.negativeEdgeUsdc ?? 0,
             orderId: result.orderId,
             orderStatus: result.status,
@@ -2856,9 +3005,10 @@ export async function runStatefulBotSession(
             outcome: entryBuy.side,
             reason: entryBuy.reason,
             size: entryBuy.size,
-            price: liveOrder.price ?? null,
-            shareTarget: liveOrder.shareTarget ?? null,
-            spendAmount: liveOrder.amount,
+            childOrderCount: executions.length,
+            price: representativeExecution.order.price ?? null,
+            shareTarget: entryBuy.size,
+            spendAmount: Number(executions.reduce((total, execution) => total + execution.order.amount, 0).toFixed(6)),
             rawPair: entryBuy.rawPairCost ?? null,
             effectivePair: entryBuy.pairCostWithFees ?? null,
             negativeEdgeUsdc: entryBuy.negativeEdgeUsdc ?? 0,

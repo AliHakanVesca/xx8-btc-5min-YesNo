@@ -1,4 +1,4 @@
-import { mkdir } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import { DatabaseSync } from "node:sqlite";
 import { writeJson } from "../utils/fs.js";
 import type { OutcomeSide } from "../infra/clob/types.js";
@@ -896,4 +896,8 @@ export async function writeCanonicalReferenceBundle(
   await mkdir("reports", { recursive: true });
   await writeJson(filePath, bundle);
   return filePath;
+}
+
+export async function loadCanonicalReferenceBundleFile(filePath: string): Promise<CanonicalReferenceBundle> {
+  return JSON.parse(await readFile(filePath, "utf8")) as CanonicalReferenceBundle;
 }

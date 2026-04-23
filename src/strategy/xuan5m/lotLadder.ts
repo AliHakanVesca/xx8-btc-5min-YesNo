@@ -19,6 +19,10 @@ export function chooseLot(config: XuanStrategyConfig, ctx: LotContext): number {
   const clippedBase = smallLots[0] ?? config.defaultLot;
   const clippedMid = smallLots[1] ?? clippedBase;
   const clippedHigh = smallLots[2] ?? clippedMid;
+  const cloneBase = baseLots[0] ?? clippedBase;
+  const cloneMid = baseLots[1] ?? cloneBase;
+  const cloneHigh = baseLots[2] ?? cloneMid;
+  const cloneMax = baseLots[3] ?? cloneHigh;
   if (ctx.dryRunOrSmallLive) {
     return clippedBase;
   }
@@ -26,6 +30,27 @@ export function chooseLot(config: XuanStrategyConfig, ctx: LotContext): number {
   if (config.lotScalingMode === "BANKROLL_ADJUSTED") {
     if (ctx.imbalance >= config.forceRebalanceImbalanceFrac) {
       return clippedBase;
+    }
+    if (config.xuanCloneMode === "PUBLIC_FOOTPRINT") {
+      if (!ctx.inventoryBalanced) {
+        return cloneBase;
+      }
+      if (ctx.secsFromOpen < 45) {
+        if (!ctx.bookDepthGood) {
+          return cloneBase;
+        }
+        return ctx.pairCostWithinCap ? cloneHigh : cloneMid;
+      }
+      if (ctx.secsFromOpen < 150 && ctx.recentBothSidesFilled && ctx.bookDepthGood) {
+        return ctx.pairCostComfortable ? cloneMax : cloneHigh;
+      }
+      if (ctx.marketVolumeHigh && ctx.bookDepthGood) {
+        if (ctx.pairCostComfortable && ctx.pnlTodayPositive) {
+          return cloneHigh;
+        }
+        return cloneMid;
+      }
+      return cloneBase;
     }
     if (!ctx.pairCostWithinCap) {
       return clippedBase;

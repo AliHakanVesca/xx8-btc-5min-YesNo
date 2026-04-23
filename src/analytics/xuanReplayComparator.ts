@@ -30,6 +30,7 @@ export interface ComparatorBreakdown {
   residualBucketScore: number;
   clipBucketScore: number;
   alternationScore: number;
+  sideSequenceScore: number;
   overlapFamilyScore: number;
   phaseFamilyScore: number;
 }
@@ -51,6 +52,8 @@ export interface CanonicalComparisonResult {
     residualBucketMatch: boolean;
     clipBucketSimilarity: number;
     alternationSimilarity: number;
+    sideSequenceSimilarity: number;
+    sideSequenceMismatchCount: number;
     overlapFamilySimilarity: number;
     phaseFamilySimilarity: number;
   };
@@ -139,6 +142,30 @@ function overlapSimilarity(reference: CanonicalReferenceExtract, candidate: Cano
   return 0;
 }
 
+function sideSequenceComparison(reference: CanonicalReferenceExtract, candidate: CanonicalReferenceExtract): {
+  similarity: number;
+  mismatchCount: number;
+} {
+  const maxLength = Math.max(reference.buySequence.length, candidate.buySequence.length);
+  if (maxLength === 0) {
+    return {
+      similarity: 1,
+      mismatchCount: 0,
+    };
+  }
+  let samePositionMatches = 0;
+  const minLength = Math.min(reference.buySequence.length, candidate.buySequence.length);
+  for (let index = 0; index < minLength; index += 1) {
+    if (reference.buySequence[index] === candidate.buySequence[index]) {
+      samePositionMatches += 1;
+    }
+  }
+  return {
+    similarity: samePositionMatches / maxLength,
+    mismatchCount: maxLength - samePositionMatches,
+  };
+}
+
 function phaseToken(phase: CanonicalPhase): string {
   switch (phase) {
     case "ENTRY":
@@ -213,6 +240,7 @@ export function compareCanonicalReference(
     normalizedClipTiers,
   );
   const alternationSimilarity = boundedRatioSimilarity(alternationRatio(reference), alternationRatio(candidate));
+  const sideSequence = sideSequenceComparison(reference, candidate);
   const overlapFamily = overlapSimilarity(reference, candidate);
   const phaseFamily = phaseFamilySimilarity(reference, candidate);
 
@@ -226,7 +254,8 @@ export function compareCanonicalReference(
 
   const familyScore =
     clipBucketSimilarity * 20 +
-    alternationSimilarity * 10 +
+    alternationSimilarity * 5 +
+    sideSequence.similarity * 5 +
     overlapFamily * 5 +
     phaseFamily * 5;
 
@@ -259,6 +288,7 @@ export function compareCanonicalReference(
       residualBucketScore,
       clipBucketScore: clipBucketSimilarity,
       alternationScore: alternationSimilarity,
+      sideSequenceScore: sideSequence.similarity,
       overlapFamilyScore: overlapFamily,
       phaseFamilyScore: phaseFamily,
     },
@@ -273,6 +303,8 @@ export function compareCanonicalReference(
       residualBucketMatch: reference.finalResidualBucket === candidate.finalResidualBucket,
       clipBucketSimilarity,
       alternationSimilarity,
+      sideSequenceSimilarity: sideSequence.similarity,
+      sideSequenceMismatchCount: sideSequence.mismatchCount,
       overlapFamilySimilarity: overlapFamily,
       phaseFamilySimilarity: phaseFamily,
     },

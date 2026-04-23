@@ -13,6 +13,7 @@ import { runPaperSession, type PaperSessionVariant } from "./analytics/paperSess
 import {
   buildCanonicalReferenceBundle,
   buildCanonicalReferenceFromPaperSession,
+  loadCanonicalReferenceBundleFile,
   writeCanonicalReferenceBundle,
 } from "./analytics/xuanCanonicalReference.js";
 import { compareCanonicalReference } from "./analytics/xuanReplayComparator.js";
@@ -82,6 +83,7 @@ const defaultXuanReferenceSlugs = [
 ];
 
 const preferredXuanSqlitePath = "/Users/cakir/Documents/tmp/polymarket-wallet-sc/data/polymarket-wallets.sqlite";
+const bundledCanonicalFixturePath = "tests/fixtures/xuan_public_sequence_bundle.json";
 
 async function resolveDefaultXuanTradeTapePath(): Promise<string> {
   const preferredPath = "data/xuanxuan008_data_20260415_145447.json";
@@ -91,6 +93,33 @@ async function resolveDefaultXuanTradeTapePath(): Promise<string> {
 
 async function resolveDefaultXuanSqlitePath(): Promise<string | undefined> {
   return (await fileExists(preferredXuanSqlitePath)) ? preferredXuanSqlitePath : undefined;
+}
+
+async function resolveCanonicalReferenceBundleForSlug(options: {
+  referenceSlug: string;
+  jsonPath?: string | undefined;
+  sqlitePath?: string | undefined;
+  wallet?: string | undefined;
+}) {
+  const hasExplicitSource = Boolean(
+    (options.jsonPath && options.jsonPath.length > 0) || (options.sqlitePath && options.sqlitePath.length > 0),
+  );
+  if (!hasExplicitSource && (await fileExists(bundledCanonicalFixturePath))) {
+    const bundled = await loadCanonicalReferenceBundleFile(bundledCanonicalFixturePath);
+    if (bundled.references.some((item) => item.slug === options.referenceSlug)) {
+      return bundled;
+    }
+  }
+
+  const jsonPath = options.jsonPath && options.jsonPath.length > 0 ? options.jsonPath : await resolveDefaultXuanTradeTapePath();
+  const sqlitePath =
+    options.sqlitePath && options.sqlitePath.length > 0 ? options.sqlitePath : await resolveDefaultXuanSqlitePath();
+  return buildCanonicalReferenceBundle({
+    filePath: jsonPath,
+    sqlitePath,
+    wallet: options.wallet,
+    slugs: [options.referenceSlug],
+  });
 }
 
 async function runXuanExtractCommand(options: {
@@ -139,14 +168,11 @@ async function runXuanComparePaperCommand(options: {
 }): Promise<void> {
   const env = loadEnv();
   const config = buildStrategyConfig(env);
-  const jsonPath = options.jsonPath && options.jsonPath.length > 0 ? options.jsonPath : await resolveDefaultXuanTradeTapePath();
-  const sqlitePath =
-    options.sqlitePath && options.sqlitePath.length > 0 ? options.sqlitePath : await resolveDefaultXuanSqlitePath();
-  const bundle = await buildCanonicalReferenceBundle({
-    filePath: jsonPath,
-    sqlitePath,
+  const bundle = await resolveCanonicalReferenceBundleForSlug({
+    referenceSlug: options.referenceSlug,
+    jsonPath: options.jsonPath,
+    sqlitePath: options.sqlitePath,
     wallet: options.wallet,
-    slugs: [options.referenceSlug],
   });
   const reference = bundle.references.find((item) => item.slug === options.referenceSlug);
   if (!reference) {
@@ -239,14 +265,11 @@ async function runXuanCompareRuntimeCommand(options: {
 }): Promise<void> {
   const env = loadEnv();
   const config = buildStrategyConfig(env);
-  const jsonPath = options.jsonPath && options.jsonPath.length > 0 ? options.jsonPath : await resolveDefaultXuanTradeTapePath();
-  const sqlitePath =
-    options.sqlitePath && options.sqlitePath.length > 0 ? options.sqlitePath : await resolveDefaultXuanSqlitePath();
-  const referenceBundle = await buildCanonicalReferenceBundle({
-    filePath: jsonPath,
-    sqlitePath,
+  const referenceBundle = await resolveCanonicalReferenceBundleForSlug({
+    referenceSlug: options.referenceSlug,
+    jsonPath: options.jsonPath,
+    sqlitePath: options.sqlitePath,
     wallet: options.wallet,
-    slugs: [options.referenceSlug],
   });
   const reference = referenceBundle.references.find((item) => item.slug === options.referenceSlug);
   if (!reference) {

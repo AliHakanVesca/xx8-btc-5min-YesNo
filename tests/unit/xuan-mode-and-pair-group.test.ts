@@ -10,6 +10,7 @@ import {
 import { buildOfflineMarket } from "../../src/infra/gamma/marketDiscovery.js";
 import { chooseInventoryAdjustment } from "../../src/strategy/xuan5m/completionEngine.js";
 import { evaluateEntryBuys } from "../../src/strategy/xuan5m/entryLadderEngine.js";
+import { chooseLot } from "../../src/strategy/xuan5m/lotLadder.js";
 import { createMarketState } from "../../src/strategy/xuan5m/marketState.js";
 import { OrderBookState } from "../../src/strategy/xuan5m/orderBookState.js";
 import { Xuan5mBot } from "../../src/strategy/xuan5m/Xuan5mBot.js";
@@ -207,9 +208,72 @@ describe("xuan mode and pair order groups", () => {
         side: "UP",
         filledSize: 80,
         oppositeCoverageRatio: 1,
+        classifierScore: expect.any(Number),
         selectedMode: "TEMPORAL_SINGLE_LEG_SEED",
       }),
     );
+  });
+
+  it("uses a temporal cycle classifier instead of blindly preferring the cheapest first leg", () => {
+    const market = buildOfflineMarket(1713696000);
+    const state = createMarketState(market);
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.66, size: 200 }], [{ price: 0.67, size: 200 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.38, size: 200 }], [{ price: 0.39, size: 200 }]),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 20,
+        secsToClose: 240,
+        lot: 80,
+        fairValueSnapshot: {
+          status: "valid",
+          estimatedThreshold: false,
+          fairUp: 0.79,
+          fairDown: 0.4,
+        },
+      },
+    );
+
+    expect(evaluation.decisions).toHaveLength(1);
+    expect(evaluation.decisions[0]).toMatchObject({
+      side: "UP",
+      mode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+    expect(evaluation.trace.seedCandidates?.[0]?.side).toBe("UP");
+    expect(evaluation.trace.seedCandidates?.[0]?.classifierScore).toBeGreaterThan(
+      evaluation.trace.seedCandidates?.[1]?.classifierScore ?? Number.NEGATIVE_INFINITY,
+    );
+  });
+
+  it("keeps clone-mode lot sizing large even when strict pair-cap is not currently available", () => {
+    const lot = chooseLot(
+      buildConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      }),
+      {
+        dryRunOrSmallLive: false,
+        secsFromOpen: 20,
+        imbalance: 0,
+        bookDepthGood: true,
+        pairCostWithinCap: false,
+        pairCostComfortable: false,
+        inventoryBalanced: true,
+        recentBothSidesFilled: false,
+        marketVolumeHigh: true,
+        pnlTodayPositive: true,
+      },
+    );
+
+    expect(lot).toBe(90);
   });
 
   it("uses high-low completion chase when public footprint clone completes a cheap residual at a high price", () => {

@@ -1,0 +1,159 @@
+{
+  "generatedAt": "2026-04-23T00:00:00.000Z",
+  "slugs": [
+    "btc-updown-5m-1713696300"
+  ],
+  "sources": {
+    "tradeTapeFile": "tests/fixtures/xuan_sample.json"
+  },
+  "references": [
+    {
+      "slug": "btc-updown-5m-1713696300",
+      "startTs": 1713696300,
+      "endTs": 1713696600,
+      "orderedClipSequence": [
+        {
+          "sequenceIndex": 0,
+          "clipIndex": 1,
+          "cycleId": 1,
+          "phase": "ENTRY",
+          "kind": "BUY",
+          "tOffsetSec": 10,
+          "tOffsetMs": 10000,
+          "outcome": "UP",
+          "price": 0.46,
+          "qty": 60,
+          "qtyBucket": "31_plus",
+          "baseLot": 60,
+          "normalizedClipTier": "1x",
+          "familyLabel": "ENTRY",
+          "internalLabel": "ENTRY"
+        },
+        {
+          "sequenceIndex": 1,
+          "clipIndex": 2,
+          "cycleId": 1,
+          "phase": "COMPLETION",
+          "kind": "BUY",
+          "tOffsetSec": 14,
+          "tOffsetMs": 14000,
+          "outcome": "DOWN",
+          "price": 0.5,
+          "qty": 60,
+          "qtyBucket": "31_plus",
+          "baseLot": 60,
+          "normalizedClipTier": "1x",
+          "familyLabel": "COMPLETION",
+          "internalLabel": "COMPLETION"
+        },
+        {
+          "sequenceIndex": 2,
+          "clipIndex": null,
+          "cycleId": 1,
+          "phase": "MERGE",
+          "kind": "MERGE",
+          "tOffsetSec": 14,
+          "tOffsetMs": 14000,
+          "outcome": null,
+          "price": null,
+          "qty": 60,
+          "qtyBucket": "31_plus",
+          "baseLot": 60,
+          "normalizedClipTier": "1x",
+          "familyLabel": "MERGE",
+          "internalLabel": "MERGE"
+        },
+        {
+          "sequenceIndex": 3,
+          "clipIndex": 3,
+          "cycleId": 2,
+          "phase": "ENTRY",
+          "kind": "BUY",
+          "tOffsetSec": 100,
+          "tOffsetMs": 100000,
+          "outcome": "UP",
+          "price": 0.47,
+          "qty": 90,
+          "qtyBucket": "31_plus",
+          "baseLot": 90,
+          "normalizedClipTier": "1x",
+          "familyLabel": "ENTRY",
+          "internalLabel": "ENTRY"
+        },
+        {
+          "sequenceIndex": 4,
+          "clipIndex": 4,
+          "cycleId": 2,
+          "phase": "COMPLETION",
+          "kind": "BUY",
+          "tOffsetSec": 150,
+          "tOffsetMs": 150000,
+          "outcome": "DOWN",
+          "price": 0.49,
+          "qty": 90,
+          "qtyBucket": "31_plus",
+          "baseLot": 90,
+          "normalizedClipTier": "1x",
+          "familyLabel": "COMPLETION",
+          "internalLabel": "COMPLETION"
+        },
+        {
+          "sequenceIndex": 5,
+          "clipIndex": null,
+          "cycleId": 2,
+          "phase": "MERGE",
+          "kind": "MERGE",
+          "tOffsetSec": 150,
+          "tOffsetMs": 150000,
+          "outcome": null,
+          "price": null,
+          "qty": 90,
+          "qtyBucket": "31_plus",
+          "baseLot": 90,
+          "normalizedClipTier": "1x",
+          "familyLabel": "MERGE",
+          "internalLabel": "MERGE"
+        }
+      ],
+      "cycleCount": 2,
+      "mergeCount": 2,
+      "redeemCount": 0,
+      "completionCount": 2,
+      "overlapClipCount": 0,
+      "hasOverlap": false,
+      "repairLatencyBucket": "10_30",
+      "mergeTimingBucket": "0_10",
+      "finalResidualSide": "FLAT",
+      "finalResidualBucket": "flat",
+      "clipBucketCounts": {
+        "1_5": 0,
+        "6_10": 0,
+        "11_15": 0,
+        "16_30": 0,
+        "31_plus": 4
+      },
+      "normalizedClipTierCounts": {
+        "0_5x": 0,
+        "1x": 4,
+        "2x": 0,
+        "3x": 0,
+        "4x_plus": 0
+      },
+      "buySequence": [
+        "UP",
+        "DOWN",
+        "UP",
+        "DOWN"
+      ],
+      "alternatingTransitionCount": 3,
+      "authority": {
+        "tradeTape": "json",
+        "lifecycle": "inferred",
+        "verifiedBuyCount": 4,
+        "totalBuyCount": 4,
+        "mergeEventCount": 0,
+        "redeemEventCount": 0
+      }
+    }
+  ]
+}

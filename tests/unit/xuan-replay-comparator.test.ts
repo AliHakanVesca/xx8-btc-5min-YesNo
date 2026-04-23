@@ -5,6 +5,7 @@ import type {
   CanonicalSequenceEvent,
   NormalizedClipTier,
 } from "../../src/analytics/xuanCanonicalReference.js";
+import publicSequenceFixture from "../fixtures/xuan_public_sequence_bundle.json" with { type: "json" };
 
 function buildEvent(overrides: Partial<CanonicalSequenceEvent>): CanonicalSequenceEvent {
   return {
@@ -260,5 +261,32 @@ describe("xuan replay comparator", () => {
     expect(result.verdict).toBe("FAIL");
     expect(result.hardFailTotal).toBe(1);
     expect(result.hardFails.overshoot).toBe(1);
+  });
+
+  it("penalizes side-first sequence mismatches against the bundled public-sequence fixture", () => {
+    const reference = publicSequenceFixture.references[0] as CanonicalReferenceExtract;
+    const candidate: CanonicalReferenceExtract = {
+      ...reference,
+      slug: "candidate-market",
+      buySequence: ["DOWN", "UP", "DOWN", "UP"],
+      orderedClipSequence: reference.orderedClipSequence.map((event, index) =>
+        event.kind !== "BUY"
+          ? event
+          : {
+              ...event,
+              outcome: index % 2 === 0 ? "DOWN" : "UP",
+            },
+      ),
+    };
+
+    const baseline = compareCanonicalReference(reference, {
+      ...reference,
+      slug: "baseline-candidate",
+    });
+    const shifted = compareCanonicalReference(reference, candidate);
+
+    expect(shifted.details.sideSequenceMismatchCount).toBeGreaterThan(0);
+    expect(shifted.details.sideSequenceSimilarity).toBeLessThan(1);
+    expect(shifted.score).toBeLessThan(baseline.score);
   });
 });

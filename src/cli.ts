@@ -1062,9 +1062,18 @@ async function runPaperLive(options: {
   durationSec: number;
   sampleMs: number;
   initialBookWaitMs: number;
+  auditFile?: string;
+  bookDepthLevels?: number;
 }): Promise<void> {
   const env = loadEnv();
-  const report = await runLivePaperSession(env, options);
+  const livePaperOptions = {
+    durationSec: options.durationSec,
+    sampleMs: options.sampleMs,
+    initialBookWaitMs: options.initialBookWaitMs,
+    ...(options.auditFile !== undefined ? { auditFile: options.auditFile } : {}),
+    ...(options.bookDepthLevels !== undefined ? { bookDepthLevels: options.bookDepthLevels } : {}),
+  };
+  const report = await runLivePaperSession(env, livePaperOptions);
   const payload = {
     runtime: {
       stackMode: env.POLY_STACK_MODE,
@@ -1622,11 +1631,22 @@ export async function runCli(argv = process.argv): Promise<void> {
     .option("--duration-sec <n>", "Observe the live market for N seconds", "20")
     .option("--sample-ms <n>", "Sampling interval in milliseconds", "2000")
     .option("--initial-book-wait-ms <n>", "How long to wait for initial orderbooks", "8000")
-    .action(async (options: { durationSec: string; sampleMs: string; initialBookWaitMs: string }) =>
+    .option("--audit-file <path>", "Write full stateful paper audit JSONL to this path")
+    .option("--book-depth-levels <n>", "How many bid/ask levels to include in each audit tick", "10")
+    .action(
+      async (options: {
+        durationSec: string;
+        sampleMs: string;
+        initialBookWaitMs: string;
+        auditFile?: string;
+        bookDepthLevels: string;
+      }) =>
       runPaperLive({
         durationSec: Number(options.durationSec),
         sampleMs: Number(options.sampleMs),
         initialBookWaitMs: Number(options.initialBookWaitMs),
+        ...(options.auditFile !== undefined ? { auditFile: options.auditFile } : {}),
+        bookDepthLevels: Number(options.bookDepthLevels),
       }),
     );
   program.command("bot:dry").action(async () => runBotDry());

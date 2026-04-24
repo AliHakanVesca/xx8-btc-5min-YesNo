@@ -77,14 +77,36 @@ export function countActiveIndependentFlowCount(
   nowTs: number,
   windowSec = 120,
 ): number {
-  const uniqueFlowKeys = new Set<string>();
-  for (const fill of fillHistory) {
+  const recentSeedFills = fillHistory
+    .filter((fill) => isRecentSeedFill(fill, nowTs, windowSec))
+    .sort((left, right) => left.timestamp - right.timestamp);
+  const groups: Array<{ lastTimestamp: number; sides: Set<OutcomeSide>; hasPairGroupCoveredSeed: boolean }> = [];
+  const pairedSeedWindowSec = 4;
+
+  for (const fill of recentSeedFills) {
     if (!isRecentSeedFill(fill, nowTs, windowSec)) {
       continue;
     }
-    uniqueFlowKeys.add(fill.flowLineage ?? `UNCLASSIFIED_${fill.outcome}`);
+    const lastGroup = groups.at(-1);
+    const canAttachToRecentPairedSeed =
+      lastGroup !== undefined &&
+      fill.timestamp - lastGroup.lastTimestamp <= pairedSeedWindowSec &&
+      (lastGroup.hasPairGroupCoveredSeed || fill.executionMode === "PAIRGROUP_COVERED_SEED") &&
+      (lastGroup.sides.size < 2 || lastGroup.sides.has(fill.outcome));
+    if (canAttachToRecentPairedSeed && lastGroup) {
+      lastGroup.lastTimestamp = fill.timestamp;
+      lastGroup.sides.add(fill.outcome);
+      lastGroup.hasPairGroupCoveredSeed =
+        lastGroup.hasPairGroupCoveredSeed || fill.executionMode === "PAIRGROUP_COVERED_SEED";
+      continue;
+    }
+    groups.push({
+      lastTimestamp: fill.timestamp,
+      sides: new Set([fill.outcome]),
+      hasPairGroupCoveredSeed: fill.executionMode === "PAIRGROUP_COVERED_SEED",
+    });
   }
-  return uniqueFlowKeys.size;
+  return groups.length;
 }
 
 export function createMarketState(market: MarketInfo): XuanMarketState {

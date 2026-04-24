@@ -118,6 +118,7 @@ describe("entry and inventory adjustment", () => {
         POLY_STACK_MODE: "current-prod-v1",
         ORPHAN_LEG_MAX_NOTIONAL_USDC: "10",
         MAX_MARKET_ORPHAN_USDC: "10",
+        ALLOW_TEMPORAL_SINGLE_LEG_SEED: "false",
       }),
     );
     state.downShares = 10;
@@ -144,6 +145,9 @@ describe("entry and inventory adjustment", () => {
       },
       dryRunOrSmallLive: false,
       allowControlledOverlap: true,
+      arbitrationCarry: {
+        recommendation: "favor_independent_overlap",
+      },
     });
 
     expect(decision.entryBuys).toHaveLength(2);
@@ -194,7 +198,10 @@ describe("entry and inventory adjustment", () => {
         XUAN_BASE_LOT_LADDER: "20,40,60,80,100",
         LIVE_SMALL_LOT_LADDER: "20,40",
         DEFAULT_LOT: "40",
+        CLIP_SPLIT_MODE: "OFF",
         NORMAL_PAIR_EFFECTIVE_CAP: "1.01",
+        FLAT_STATE_SOFT_PAIR_MAX_QTY: "40",
+        FLAT_STATE_HARD_PAIR_MAX_QTY: "40",
         MAX_SINGLE_ORPHAN_QTY: "40",
         ORPHAN_LEG_MAX_NOTIONAL_USDC: "40",
         MAX_MARKET_ORPHAN_USDC: "40",
@@ -276,6 +283,8 @@ describe("entry and inventory adjustment", () => {
         XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
         PARTIAL_SOFT_CAP: "1.04",
         COMPLETION_SOFT_CAP: "1.04",
+        COMPLETION_QUALITY_MAX_EFFECTIVE_COST: "1.2",
+        COMPLETION_QUALITY_MAX_NEGATIVE_EDGE_USDC: "100",
       }),
     );
     const market = buildOfflineMarket(1713696000);

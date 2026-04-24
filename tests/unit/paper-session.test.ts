@@ -7,48 +7,67 @@ describe("paper session replay", () => {
   const env = parseEnv({
     DRY_RUN: "true",
     POLY_STACK_MODE: "current-prod-v1",
+    STRICT_NEW_CYCLE_CAP: "1.25",
+    SOFT_NEW_CYCLE_CAP: "1.25",
+    HARD_NEW_CYCLE_CAP: "1.25",
+    ALLOW_HARD_NEW_CYCLE_ONLY_IF_PREVIOUS_CYCLE_POSITIVE: "true",
+    REQUIRE_REEVALUATION_AFTER_EACH_CYCLE: "false",
+    MAX_NEW_CYCLES_PER_30S: "99",
+    FORBID_FLAT_BAD_CYCLE_SPAM: "false",
+    FLAT_STATE_SOFT_PAIR_MAX_QTY: "130",
+    FLAT_STATE_HARD_PAIR_MAX_QTY: "130",
+    COVERED_SEED_REQUIRES_FAIR_VALUE: "false",
+    SINGLE_LEG_FAIR_VALUE_VETO: "false",
+    BLOCK_NEW_PAIR_WHILE_PARTIAL_OPEN: "false",
+    MAX_OPEN_GROUPS_PER_MARKET: "4",
+    MAX_OPEN_PARTIAL_GROUPS_PER_MARKET: "3",
+    ALLOW_OVERLAP_ONLY_AFTER_PARTIAL_CLASSIFIED: "false",
+    ALLOW_OVERLAP_ONLY_WHEN_COMPLETION_ENGINE_ACTIVE: "false",
+    REQUIRE_MATCHED_INVENTORY_BEFORE_SECOND_GROUP: "false",
+    WORST_CASE_AMPLIFICATION_TOLERANCE_SHARES: "125",
+    MAX_WORST_CASE_AMPLIFICATION_SHARES: "125",
   });
 
-  it("runs the xuan-flow session with xuan-like overlap, high/low completion, and flat ending inventory", () => {
+  it("runs the xuan-flow session with early overlap, late-seed cutoff, and flat ending inventory", () => {
     const report = runPaperSession(env, "xuan-flow");
     const canonical = buildCanonicalReferenceFromPaperSession(report);
 
     expect(report.summary).toMatchObject({
       stepCount: 25,
-      entryStepCount: 12,
+      entryStepCount: 10,
       completionStepCount: 0,
-      mergeStepCount: 3,
-      totalBuyShares: 60.275,
-      totalEntryBuyShares: 60.275,
+      mergeStepCount: 2,
+      totalBuyShares: 50,
+      totalEntryBuyShares: 50,
       totalCompletionShares: 0,
-      totalMergeShares: 30,
-      totalRedeemShares: 0.275,
+      totalMergeShares: 25,
+      totalRedeemShares: 0,
       finalUpShares: 0,
       finalDownShares: 0,
     });
-    expect(report.summary.totalRawSpend).toBeCloseTo(27.51725, 8);
-    expect(report.summary.totalFeeUsd).toBeCloseTo(0.95800482, 8);
-    expect(report.summary.totalEffectiveSpend).toBeCloseTo(28.47525482, 8);
-    expect(report.summary.realizedMergeProfit).toBeCloseTo(1.74528, 8);
-    expect(report.summary.roiPct).toBeCloseTo(6.1291, 4);
+    expect(report.summary.totalRawSpend).toBeCloseTo(22.65, 8);
+    expect(report.summary.totalFeeUsd).toBeCloseTo(0.851652, 8);
+    expect(report.summary.totalEffectiveSpend).toBeCloseTo(23.501652, 8);
+    expect(report.summary.realizedMergeProfit).toBeCloseTo(1.498348, 8);
+    expect(report.summary.roiPct).toBeCloseTo(6.3755, 4);
     expect(report.summary.footprint).toMatchObject({
-      cycleCount: 3,
+      cycleCount: 2,
       cycleBucket: "2_3",
-      alternatingTransitionCount: 9,
+      alternatingTransitionCount: 7,
       partialRepairLatencyBucket: "none",
       dominantResidualSide: "FLAT",
       residualMagnitudeBucket: "flat",
       clipBucketCounts: {
-        "1_5": 11,
-        "6_10": 1,
+        "1_5": 10,
+        "6_10": 0,
       },
     });
 
     expect(canonical).toMatchObject({
-      cycleCount: 6,
-      mergeCount: 3,
-      redeemCount: 1,
-      completionCount: 6,
+      cycleCount: 5,
+      mergeCount: 2,
+      redeemCount: 0,
+      completionCount: 5,
       overlapClipCount: 4,
       hasOverlap: true,
       repairLatencyBucket: "0_10",
@@ -56,11 +75,11 @@ describe("paper session replay", () => {
       finalResidualBucket: "flat",
       normalizedClipTierCounts: {
         "0_5x": 0,
-        "1x": 12,
+        "1x": 10,
       },
     });
-    expect(canonical.orderedClipSequence.filter((event) => event.kind === "BUY")).toHaveLength(12);
-    expect(canonical.orderedClipSequence.some((event) => event.phase === "HIGH_LOW_COMPLETION")).toBe(true);
+    expect(canonical.orderedClipSequence.filter((event) => event.kind === "BUY")).toHaveLength(10);
+    expect(canonical.orderedClipSequence.some((event) => event.phase === "HIGH_LOW_COMPLETION")).toBe(false);
 
     const openingSeed = report.steps.find((step) => step.name === "open-down-seed");
     expect(openingSeed?.execution.fills).toHaveLength(1);
@@ -71,15 +90,9 @@ describe("paper session replay", () => {
     expect(openingSeed?.execution.skippedEntrySides).toEqual(["UP"]);
 
     const highLowCompletion = report.steps.find((step) => step.name === "high-low-up-completion-3");
-    expect(highLowCompletion?.execution.fills).toHaveLength(1);
-    expect(highLowCompletion?.execution.fills[0]?.kind).toBe("entry");
-    expect(highLowCompletion?.execution.fills[0]?.side).toBe("UP");
-    expect(highLowCompletion?.execution.fills[0]?.size).toBeCloseTo(5.275, 8);
-    expect(highLowCompletion?.execution.fills[0]?.price).toBeCloseTo(0.79, 8);
-
-    const residualRedeem = report.steps.find((step) => step.execution.redeemShares > 0);
-    expect(residualRedeem?.execution.redeemShares).toBeCloseTo(0.275, 8);
-    expect(residualRedeem?.execution.redeemSide).toBe("UP");
+    expect(highLowCompletion?.execution.fills).toHaveLength(0);
+    expect(highLowCompletion?.decision.entryTrace?.skipReason).toBe("late_fresh_seed_cutoff");
+    expect(report.steps.some((step) => step.execution.redeemShares > 0)).toBe(false);
   });
 
   it("calibrates scripted completion opportunities while preserving the guarded cycle count", () => {
@@ -89,7 +102,7 @@ describe("paper session replay", () => {
     const completionStep = report.steps.find((step) => step.name === "patient-up-completion");
 
     expect(report.summary.stepCount).toBe(25);
-    expect(buildCanonicalReferenceFromPaperSession(report).cycleCount).toBe(6);
+    expect(buildCanonicalReferenceFromPaperSession(report).cycleCount).toBe(5);
     expect(completionStep?.timestamp).toBe(report.market.startTs + 103);
   });
 
@@ -117,8 +130,8 @@ describe("paper session replay", () => {
     const secondCycleSeed = report.steps.find((step) => step.name === "overlap-up-seed-1");
 
     expect(secondCycleSeed?.timestamp).toBe(report.market.startTs + 24);
-    expect(canonical.orderedClipSequence.filter((event) => event.kind === "BUY")).toHaveLength(12);
-    expect(canonical.redeemCount).toBe(1);
+    expect(canonical.orderedClipSequence.filter((event) => event.kind === "BUY")).toHaveLength(10);
+    expect(canonical.redeemCount).toBe(0);
   });
 
   it("can compress intermediate forced merge flushes into a later lifecycle cohort", () => {
@@ -142,44 +155,45 @@ describe("paper session replay", () => {
 
     expect(report.summary).toMatchObject({
       stepCount: 5,
-      entryStepCount: 2,
+      entryStepCount: 1,
       completionStepCount: 0,
       mergeStepCount: 1,
-      totalEntryBuyShares: 15,
+      totalEntryBuyShares: 10,
       totalCompletionShares: 0,
       totalMergeShares: 5,
-      finalUpShares: 5,
+      finalUpShares: 0,
       finalDownShares: 0,
     });
-    expect(report.summary.totalRawSpend).toBeCloseTo(7.2, 8);
-    expect(report.summary.totalFeeUsd).toBeCloseTo(0.269568, 8);
-    expect(report.summary.totalEffectiveSpend).toBeCloseTo(7.469568, 8);
+    expect(report.summary.totalRawSpend).toBeCloseTo(4.8, 8);
+    expect(report.summary.totalFeeUsd).toBeCloseTo(0.179712, 8);
+    expect(report.summary.totalEffectiveSpend).toBeCloseTo(4.979712, 8);
     expect(report.summary.realizedMergeProfit).toBeCloseTo(0.020288, 8);
     expect(report.summary.footprint).toMatchObject({
       cycleCount: 1,
       cycleBucket: "1",
-      dominantResidualSide: "UP",
-      residualMagnitudeBucket: "small",
+      dominantResidualSide: "FLAT",
+      residualMagnitudeBucket: "flat",
       partialRepairLatencyBucket: "none",
     });
     expect(canonical).toMatchObject({
-      cycleCount: 2,
+      cycleCount: 1,
       mergeCount: 1,
       completionCount: 1,
       overlapClipCount: 0,
       hasOverlap: false,
       repairLatencyBucket: "0_10",
-      finalResidualSide: "UP",
-      finalResidualBucket: "small",
+      finalResidualSide: "FLAT",
+      finalResidualBucket: "flat",
       normalizedClipTierCounts: {
-        "1x": 3,
+        "1x": 2,
       },
     });
 
     const blockedStep = report.steps.find((step) => step.name === "expensive-completion-blocked");
     expect(blockedStep?.decision.hasCompletion).toBe(false);
     expect(blockedStep?.execution.mergeShares).toBe(0);
-    expect(blockedStep?.stateAfter.upShares).toBe(5);
+    expect(blockedStep?.decision.entryTrace?.skipReason).toBe("late_fresh_seed_cutoff");
+    expect(blockedStep?.stateAfter.upShares).toBe(0);
     expect(blockedStep?.stateAfter.downShares).toBe(0);
   });
 });

@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { buildLivePaperSample, summarizeLivePaperSamples } from "../../src/analytics/livePaper.js";
+import { buildLivePaperSample, buildLivePaperTick, summarizeLivePaperSamples } from "../../src/analytics/livePaper.js";
 import { buildOfflineMarket } from "../../src/infra/gamma/marketDiscovery.js";
 import { parseEnv } from "../../src/config/env.js";
+import { buildStrategyConfig } from "../../src/config/strategyPresets.js";
+import { createMarketState } from "../../src/strategy/xuan5m/marketState.js";
+import { createMergeBatchTracker } from "../../src/strategy/xuan5m/mergeCoordinator.js";
 
 function buildBook(assetId: string, market: string, bid: number, ask: number, timestamp: number) {
   return {
@@ -131,5 +134,60 @@ describe("live paper analytics", () => {
     expect(sample.allowNewEntries).toBe(false);
     expect(sample.hardCancel).toBe(true);
     expect(sample.riskReasons).toEqual(["preopen"]);
+  });
+
+  it("applies simulated live-paper fills to state without sending orders", () => {
+    const env = parseEnv({
+      DRY_RUN: "true",
+      POLY_STACK_MODE: "current-prod-v1",
+      MERGE_BATCH_MODE: "HYBRID_DELAYED",
+    });
+    const config = buildStrategyConfig(env);
+    const market = buildOfflineMarket(1713696000);
+    const nowTs = market.startTs + 20;
+    const tick = buildLivePaperTick({
+      config,
+      market,
+      state: createMarketState(market),
+      mergeTracker: createMergeBatchTracker(),
+      nowTs,
+      upBook: buildBook(market.tokens.UP.tokenId, market.conditionId, 0.47, 0.48, nowTs),
+      downBook: buildBook(market.tokens.DOWN.tokenId, market.conditionId, 0.47, 0.48, nowTs),
+    });
+
+    expect(tick.executions).toHaveLength(2);
+    expect(tick.executions.every((execution) => execution.status === "filled")).toBe(true);
+    expect(tick.sample.simulatedFillCount).toBe(2);
+    expect(tick.sample.simulatedBuyShares).toBe(10);
+    expect(tick.stateAfter.upShares).toBe(5);
+    expect(tick.stateAfter.downShares).toBe(5);
+    expect(tick.merge?.status).toBe("skipped");
+  });
+
+  it("records simulated merge when the configured merge gate allows it", () => {
+    const env = parseEnv({
+      DRY_RUN: "true",
+      POLY_STACK_MODE: "current-prod-v1",
+      MERGE_BATCH_MODE: "IMMEDIATE",
+      MERGE_DUST_LEAVE_SHARES: "0",
+    });
+    const config = buildStrategyConfig(env);
+    const market = buildOfflineMarket(1713696000);
+    const nowTs = market.startTs + 20;
+    const tick = buildLivePaperTick({
+      config,
+      market,
+      state: createMarketState(market),
+      mergeTracker: createMergeBatchTracker(),
+      nowTs,
+      upBook: buildBook(market.tokens.UP.tokenId, market.conditionId, 0.47, 0.48, nowTs),
+      downBook: buildBook(market.tokens.DOWN.tokenId, market.conditionId, 0.47, 0.48, nowTs),
+    });
+
+    expect(tick.merge).toMatchObject({ status: "merged", mergedShares: 5 });
+    expect(tick.sample.simulatedMergeShares).toBe(5);
+    expect(tick.stateAfter.upShares).toBe(0);
+    expect(tick.stateAfter.downShares).toBe(0);
+    expect(tick.stateAfter.mergeCount).toBe(1);
   });
 });

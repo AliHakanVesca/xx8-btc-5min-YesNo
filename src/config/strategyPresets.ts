@@ -32,6 +32,44 @@ export interface XuanStrategyConfig {
   pairSweepStrictCap: number;
   xuanPairSweepSoftCap: number;
   xuanPairSweepHardCap: number;
+  strictNewCycleCap: number;
+  softNewCycleCap: number;
+  hardNewCycleCap: number;
+  allowHardNewCycleOnlyIfPreviousCyclePositive: boolean;
+  allowNewCycleWhenFlatOnly: boolean;
+  maxConsecutiveBadCycles: number;
+  badCycleCooldownSec: number;
+  badCycleMode: "OFF" | "COMPLETION_ONLY";
+  minSecondsBetweenNewCycles: number;
+  requireReevaluationAfterEachCycle: boolean;
+  maxNewCyclesPer30Sec: number;
+  flatStateHardPairMaxQty: number;
+  flatStateSoftPairMaxQty: number;
+  residualStateSoftCompletionMaxQty: number;
+  xuanBorderlineEntryEnabled: boolean;
+  xuanBorderlineEntryMaxAgeSec: number;
+  xuanBorderlineEntryMidMaxAgeSec: number;
+  xuanBorderlineEntryLateMaxAgeSec: number;
+  freshSeedHardCutoffSec: number;
+  xuanBorderlineEntryMaxQty: number;
+  xuanBorderlineEntryMidMaxQty: number;
+  xuanBorderlineEntryLateMaxQty: number;
+  xuanBorderlineEntryRequiresCoveredSeed: boolean;
+  xuanBorderlineRawPairCap: number;
+  xuanBorderlineEffectivePairCap: number;
+  xuanBorderlineMidRawPairCap: number;
+  xuanBorderlineMidEffectivePairCap: number;
+  xuanBorderlineLateRawPairCap: number;
+  xuanBorderlineLateEffectivePairCap: number;
+  borderlinePairStagedEntryEnabled: boolean;
+  borderlinePairInitialQty: number;
+  borderlinePairFollowupQty: number;
+  borderlinePairReevaluateAfterSec: number;
+  borderlinePairRepeatCooldownSec: number;
+  borderlinePairRepeatMinEffectiveImprovement: number;
+  clipSplitMode: "OFF" | "DEPTH_ADAPTIVE_XUAN_BIAS";
+  preferMulticlipWhenCostNeutral: boolean;
+  deterministicTemplateDebugOnly: boolean;
   enableXuanHardPairSweep: boolean;
   maxNegativePairEdgePerCycleUsdc: number;
   maxNegativePairEdgePerMarketUsdc: number;
@@ -52,6 +90,7 @@ export interface XuanStrategyConfig {
   coveredSeedMinOppositeCoverageRatio: number;
   coveredSeedMaxQty: number;
   coveredSeedRequiresFairValue: boolean;
+  coveredSeedMissingFairValueMode: "FAIL_CLOSED" | "ALLOW_PAIR_REFERENCE_CAP";
   singleLegOrphanCap: number;
   singleLegFairValueVeto: boolean;
   singleLegOrphanMaxFairPremium: number;
@@ -77,6 +116,8 @@ export interface XuanStrategyConfig {
   maxOpenPartialGroups: number;
   partialOpenAction: "COMPLETION_ONLY" | "ALLOW_OVERLAP";
   allowControlledOverlap: boolean;
+  controlledOverlapMinResidualShares: number;
+  controlledOverlapSeedMaxQty: number;
   allowOverlapOnlyAfterPartialClassified: boolean;
   allowOverlapOnlyWhenCompletionEngineActive: boolean;
   allowOverlapInLast30S: boolean;
@@ -106,6 +147,24 @@ export interface XuanStrategyConfig {
   highSideEmergencyRequiresFairValue: boolean;
   highSideEmergencyRequiresHardImbalance: boolean;
   highSideEmergencyCap: number;
+  highSideCompletionMaxQty: number;
+  highSideCompletionMaxCost: number;
+  highSideCompletionRequiresFairValue: boolean;
+  highSideCompletionRequiresHardImbalance: boolean;
+  highSideCompletionExactPriorBypass: boolean;
+  completionQualityMaxEffectiveCost: number;
+  completionQualityMaxNegativeEdgeUsdc: number;
+  completionQualityEnforceAfterSec: number;
+  completionTargetMaxDelaySec: number;
+  completionUrgencyStrictSec: number;
+  completionUrgencyPatientSec: number;
+  completionUrgencyForceSec: number;
+  completionUrgencyMaxPricePremium: number;
+  residualJanitorEnabled: boolean;
+  residualJanitorMaxQty: number;
+  residualJanitorMaxShareGap: number;
+  residualJanitorMaxInventoryShares: number;
+  residualJanitorMaxEffectivePair: number;
   enableResidualSell: boolean;
   allowUnresolvedSell: boolean;
   allowEmergencySell: boolean;
@@ -223,6 +282,7 @@ export interface XuanStrategyConfig {
   liveSmokeMaxQty: number;
   liveSmokeDisableHardSweep: boolean;
   liveSmokeDisableSeed: boolean;
+  forbidFlatBadCycleSpam: boolean;
   pairgroupFinalizeAfterBalanceSync: boolean;
   pairgroupFinalizeTimeoutMs: number;
   pairgroupRequireReconcileBeforeNoneFilled: boolean;
@@ -232,6 +292,7 @@ export interface XuanStrategyConfig {
   minCompletedCyclesBeforeFirstMerge: number;
   minFirstMatchedAgeBeforeMergeSec: number;
   maxMatchedAgeBeforeForcedMergeSec: number;
+  requireMinAgeForCycleTargetMerge: boolean;
   mergeShieldSecFromOpen: number;
   forceMergeInLast30S: boolean;
   forceMergeOnHardImbalance: boolean;
@@ -240,6 +301,9 @@ export interface XuanStrategyConfig {
   mergeOnMarketClose: boolean;
   mergeMaxTxPerMarket: number;
   mergeDustLeaveShares: number;
+  hardImbalanceMergeMinAgeSec: number;
+  hardImbalanceMergeOverlapGraceSec: number;
+  hardImbalanceMergeMaxDeferrableShares: number;
   allowMergeWithPendingGroups: boolean;
   mergeOnlyConfirmedMatchedUnlockedLots: boolean;
   lockReservedQtyForPendingOrders: boolean;
@@ -289,6 +353,44 @@ export function buildStrategyConfig(env: AppEnv): XuanStrategyConfig {
     pairSweepStrictCap: env.PAIR_SWEEP_STRICT_CAP,
     xuanPairSweepSoftCap: env.XUAN_PAIR_SWEEP_SOFT_CAP,
     xuanPairSweepHardCap: env.XUAN_PAIR_SWEEP_HARD_CAP,
+    strictNewCycleCap: env.STRICT_NEW_CYCLE_CAP,
+    softNewCycleCap: env.SOFT_NEW_CYCLE_CAP,
+    hardNewCycleCap: env.HARD_NEW_CYCLE_CAP,
+    allowHardNewCycleOnlyIfPreviousCyclePositive: env.ALLOW_HARD_NEW_CYCLE_ONLY_IF_PREVIOUS_CYCLE_POSITIVE,
+    allowNewCycleWhenFlatOnly: env.ALLOW_NEW_CYCLE_WHEN_FLAT_ONLY,
+    maxConsecutiveBadCycles: env.MAX_CONSECUTIVE_BAD_CYCLES,
+    badCycleCooldownSec: env.BAD_CYCLE_COOLDOWN_SEC,
+    badCycleMode: env.BAD_CYCLE_MODE,
+    minSecondsBetweenNewCycles: env.MIN_SECONDS_BETWEEN_NEW_CYCLES,
+    requireReevaluationAfterEachCycle: env.REQUIRE_REEVALUATION_AFTER_EACH_CYCLE,
+    maxNewCyclesPer30Sec: env.MAX_NEW_CYCLES_PER_30S,
+    flatStateHardPairMaxQty: env.FLAT_STATE_HARD_PAIR_MAX_QTY,
+    flatStateSoftPairMaxQty: env.FLAT_STATE_SOFT_PAIR_MAX_QTY,
+    residualStateSoftCompletionMaxQty: env.RESIDUAL_STATE_SOFT_COMPLETION_MAX_QTY,
+    xuanBorderlineEntryEnabled: env.XUAN_BORDERLINE_ENTRY_ENABLED,
+    xuanBorderlineEntryMaxAgeSec: env.XUAN_BORDERLINE_ENTRY_MAX_AGE_SEC,
+    xuanBorderlineEntryMidMaxAgeSec: env.XUAN_BORDERLINE_ENTRY_MID_MAX_AGE_SEC,
+    xuanBorderlineEntryLateMaxAgeSec: env.XUAN_BORDERLINE_ENTRY_LATE_MAX_AGE_SEC,
+    freshSeedHardCutoffSec: env.FRESH_SEED_HARD_CUTOFF_SEC,
+    xuanBorderlineEntryMaxQty: env.XUAN_BORDERLINE_ENTRY_MAX_QTY,
+    xuanBorderlineEntryMidMaxQty: env.XUAN_BORDERLINE_ENTRY_MID_MAX_QTY,
+    xuanBorderlineEntryLateMaxQty: env.XUAN_BORDERLINE_ENTRY_LATE_MAX_QTY,
+    xuanBorderlineEntryRequiresCoveredSeed: env.XUAN_BORDERLINE_ENTRY_REQUIRES_COVERED_SEED,
+    xuanBorderlineRawPairCap: env.XUAN_BORDERLINE_RAW_PAIR_CAP,
+    xuanBorderlineEffectivePairCap: env.XUAN_BORDERLINE_EFFECTIVE_PAIR_CAP,
+    xuanBorderlineMidRawPairCap: env.XUAN_BORDERLINE_MID_RAW_PAIR_CAP,
+    xuanBorderlineMidEffectivePairCap: env.XUAN_BORDERLINE_MID_EFFECTIVE_PAIR_CAP,
+    xuanBorderlineLateRawPairCap: env.XUAN_BORDERLINE_LATE_RAW_PAIR_CAP,
+    xuanBorderlineLateEffectivePairCap: env.XUAN_BORDERLINE_LATE_EFFECTIVE_PAIR_CAP,
+    borderlinePairStagedEntryEnabled: env.BORDERLINE_PAIR_STAGED_ENTRY_ENABLED,
+    borderlinePairInitialQty: env.BORDERLINE_PAIR_INITIAL_QTY,
+    borderlinePairFollowupQty: env.BORDERLINE_PAIR_FOLLOWUP_QTY,
+    borderlinePairReevaluateAfterSec: env.BORDERLINE_PAIR_REEVALUATE_AFTER_SEC,
+    borderlinePairRepeatCooldownSec: env.BORDERLINE_PAIR_REPEAT_COOLDOWN_SEC,
+    borderlinePairRepeatMinEffectiveImprovement: env.BORDERLINE_PAIR_REPEAT_MIN_EFFECTIVE_IMPROVEMENT,
+    clipSplitMode: env.CLIP_SPLIT_MODE,
+    preferMulticlipWhenCostNeutral: env.PREFER_MULTICLIP_WHEN_COST_NEUTRAL,
+    deterministicTemplateDebugOnly: env.DETERMINISTIC_TEMPLATE_DEBUG_ONLY,
     enableXuanHardPairSweep: env.ENABLE_XUAN_HARD_PAIR_SWEEP,
     maxNegativePairEdgePerCycleUsdc: env.MAX_NEGATIVE_PAIR_EDGE_PER_CYCLE_USDC,
     maxNegativePairEdgePerMarketUsdc: env.MAX_NEGATIVE_PAIR_EDGE_PER_MARKET_USDC,
@@ -313,6 +415,7 @@ export function buildStrategyConfig(env: AppEnv): XuanStrategyConfig {
     coveredSeedMinOppositeCoverageRatio: env.COVERED_SEED_MIN_OPPOSITE_COVERAGE_RATIO,
     coveredSeedMaxQty: env.COVERED_SEED_MAX_QTY,
     coveredSeedRequiresFairValue: env.COVERED_SEED_REQUIRES_FAIR_VALUE,
+    coveredSeedMissingFairValueMode: env.COVERED_SEED_MISSING_FAIR_VALUE_MODE,
     singleLegOrphanCap: env.SINGLE_LEG_ORPHAN_CAP,
     singleLegFairValueVeto: env.SINGLE_LEG_FAIR_VALUE_VETO,
     singleLegOrphanMaxFairPremium: env.SINGLE_LEG_ORPHAN_MAX_FAIR_PREMIUM,
@@ -337,12 +440,17 @@ export function buildStrategyConfig(env: AppEnv): XuanStrategyConfig {
     maxOpenGroupsPerMarket: env.MAX_OPEN_GROUPS_PER_MARKET,
     maxOpenPartialGroups: env.MAX_OPEN_PARTIAL_GROUPS_PER_MARKET || env.MAX_OPEN_PARTIAL_GROUPS,
     partialOpenAction: env.PARTIAL_OPEN_ACTION,
-    allowControlledOverlap: env.ALLOW_CONTROLLED_OVERLAP,
+    allowControlledOverlap: env.ALLOW_CONTROLLED_OVERLAP || env.ALLOW_TRUE_CONTROLLED_OVERLAP,
+    controlledOverlapMinResidualShares: env.CONTROLLED_OVERLAP_MIN_RESIDUAL_SHARES,
+    controlledOverlapSeedMaxQty: env.CONTROLLED_OVERLAP_SEED_MAX_QTY,
     allowOverlapOnlyAfterPartialClassified: env.ALLOW_OVERLAP_ONLY_AFTER_PARTIAL_CLASSIFIED,
     allowOverlapOnlyWhenCompletionEngineActive: env.ALLOW_OVERLAP_ONLY_WHEN_COMPLETION_ENGINE_ACTIVE,
     allowOverlapInLast30S: env.ALLOW_OVERLAP_IN_LAST_30S,
     requireMatchedInventoryBeforeSecondGroup: env.REQUIRE_MATCHED_INVENTORY_BEFORE_SECOND_GROUP,
-    worstCaseAmplificationToleranceShares: env.WORST_CASE_AMPLIFICATION_TOLERANCE_SHARES,
+    worstCaseAmplificationToleranceShares:
+      env.MAX_WORST_CASE_AMPLIFICATION_SHARES > 0
+        ? env.MAX_WORST_CASE_AMPLIFICATION_SHARES
+        : env.WORST_CASE_AMPLIFICATION_TOLERANCE_SHARES,
     postMergeNewSeedCooldownMs: env.POST_MERGE_NEW_SEED_COOLDOWN_MS,
     postMergePairReopenCooldownMs: env.POST_MERGE_PAIR_REOPEN_COOLDOWN_MS,
     postMergeOnlyCompletion: env.POST_MERGE_ONLY_COMPLETION,
@@ -367,6 +475,24 @@ export function buildStrategyConfig(env: AppEnv): XuanStrategyConfig {
     highSideEmergencyRequiresFairValue: env.HIGH_SIDE_EMERGENCY_REQUIRES_FAIR_VALUE,
     highSideEmergencyRequiresHardImbalance: env.HIGH_SIDE_EMERGENCY_REQUIRES_HARD_IMBALANCE,
     highSideEmergencyCap: env.HIGH_SIDE_EMERGENCY_CAP,
+    highSideCompletionMaxQty: env.HIGH_SIDE_COMPLETION_MAX_QTY,
+    highSideCompletionMaxCost: env.HIGH_SIDE_COMPLETION_MAX_COST,
+    highSideCompletionRequiresFairValue: env.HIGH_SIDE_COMPLETION_REQUIRES_FAIR_VALUE,
+    highSideCompletionRequiresHardImbalance: env.HIGH_SIDE_COMPLETION_REQUIRES_HARD_IMBALANCE,
+    highSideCompletionExactPriorBypass: env.HIGH_SIDE_COMPLETION_EXACT_PRIOR_BYPASS,
+    completionQualityMaxEffectiveCost: env.COMPLETION_QUALITY_MAX_EFFECTIVE_COST,
+    completionQualityMaxNegativeEdgeUsdc: env.COMPLETION_QUALITY_MAX_NEGATIVE_EDGE_USDC,
+    completionQualityEnforceAfterSec: env.COMPLETION_QUALITY_ENFORCE_AFTER_SEC,
+    completionTargetMaxDelaySec: env.COMPLETION_TARGET_MAX_DELAY_SEC,
+    completionUrgencyStrictSec: env.COMPLETION_URGENCY_STRICT_SEC,
+    completionUrgencyPatientSec: env.COMPLETION_URGENCY_PATIENT_SEC,
+    completionUrgencyForceSec: env.COMPLETION_URGENCY_FORCE_SEC,
+    completionUrgencyMaxPricePremium: env.COMPLETION_URGENCY_MAX_PRICE_PREMIUM,
+    residualJanitorEnabled: env.RESIDUAL_JANITOR_ENABLED,
+    residualJanitorMaxQty: env.RESIDUAL_JANITOR_MAX_QTY,
+    residualJanitorMaxShareGap: env.RESIDUAL_JANITOR_MAX_SHARE_GAP,
+    residualJanitorMaxInventoryShares: env.RESIDUAL_JANITOR_MAX_INVENTORY_SHARES,
+    residualJanitorMaxEffectivePair: env.RESIDUAL_JANITOR_MAX_EFFECTIVE_PAIR,
     enableResidualSell: env.ENABLE_RESIDUAL_SELL,
     allowUnresolvedSell: env.ALLOW_UNRESOLVED_SELL,
     allowEmergencySell: env.ALLOW_EMERGENCY_SELL,
@@ -488,6 +614,7 @@ export function buildStrategyConfig(env: AppEnv): XuanStrategyConfig {
     liveSmokeMaxQty: env.LIVE_SMOKE_MAX_QTY,
     liveSmokeDisableHardSweep: env.LIVE_SMOKE_DISABLE_HARD_SWEEP,
     liveSmokeDisableSeed: env.LIVE_SMOKE_DISABLE_SEED,
+    forbidFlatBadCycleSpam: env.FORBID_FLAT_BAD_CYCLE_SPAM,
     pairgroupFinalizeAfterBalanceSync: env.PAIRGROUP_FINALIZE_AFTER_BALANCE_SYNC,
     pairgroupFinalizeTimeoutMs: env.PAIRGROUP_FINALIZE_TIMEOUT_MS,
     pairgroupRequireReconcileBeforeNoneFilled: env.PAIRGROUP_REQUIRE_RECONCILE_BEFORE_NONE_FILLED,
@@ -496,6 +623,7 @@ export function buildStrategyConfig(env: AppEnv): XuanStrategyConfig {
     minCompletedCyclesBeforeFirstMerge: env.MIN_COMPLETED_CYCLES_BEFORE_FIRST_MERGE,
     minFirstMatchedAgeBeforeMergeSec: env.MIN_FIRST_MATCHED_AGE_BEFORE_MERGE_SEC,
     maxMatchedAgeBeforeForcedMergeSec: env.MAX_MATCHED_AGE_BEFORE_FORCED_MERGE_SEC,
+    requireMinAgeForCycleTargetMerge: env.REQUIRE_MIN_AGE_FOR_CYCLE_TARGET_MERGE,
     mergeShieldSecFromOpen: 0,
     forceMergeInLast30S: env.FORCE_MERGE_IN_LAST_30S,
     forceMergeOnHardImbalance: env.FORCE_MERGE_ON_HARD_IMBALANCE,
@@ -504,6 +632,9 @@ export function buildStrategyConfig(env: AppEnv): XuanStrategyConfig {
     mergeOnMarketClose: env.MERGE_ON_MARKET_CLOSE,
     mergeMaxTxPerMarket: env.MERGE_MAX_TX_PER_MARKET,
     mergeDustLeaveShares: env.MERGE_DUST_LEAVE_SHARES,
+    hardImbalanceMergeMinAgeSec: env.HARD_IMBALANCE_MERGE_MIN_AGE_SEC,
+    hardImbalanceMergeOverlapGraceSec: env.HARD_IMBALANCE_MERGE_OVERLAP_GRACE_SEC,
+    hardImbalanceMergeMaxDeferrableShares: env.HARD_IMBALANCE_MERGE_MAX_DEFERRABLE_SHARES,
     allowMergeWithPendingGroups: env.ALLOW_MERGE_WITH_PENDING_GROUPS,
     mergeOnlyConfirmedMatchedUnlockedLots: env.MERGE_ONLY_CONFIRMED_MATCHED_UNLOCKED_LOTS,
     lockReservedQtyForPendingOrders: env.LOCK_RESERVED_QTY_FOR_PENDING_ORDERS,
@@ -531,8 +662,8 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     allowNakedSingleLegSeed: false,
     allowXuanCoveredSeed: true,
     allowCheapUnderdogSeed: true,
-    coveredSeedRequiresFairValue: false,
-    singleLegFairValueVeto: false,
+    coveredSeedRequiresFairValue: config.coveredSeedRequiresFairValue,
+    singleLegFairValueVeto: config.singleLegFairValueVeto,
     xuanBaseLotLadder: ladder,
     liveSmallLotLadder: ladder,
     liveSmallLots: ladder,
@@ -555,14 +686,17 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     maxOneSidedExposureShares: Math.max(config.maxOneSidedExposureShares, 150),
     maxCyclesPerMarket: Math.max(config.maxCyclesPerMarket, 8),
     maxBuysPerSide: Math.max(config.maxBuysPerSide, 10),
-    blockNewPairWhilePartialOpen: false,
-    maxOpenGroupsPerMarket: Math.max(config.maxOpenGroupsPerMarket, 4),
-    maxOpenPartialGroups: Math.max(config.maxOpenPartialGroups, 3),
+    blockNewPairWhilePartialOpen: config.blockNewPairWhilePartialOpen,
+    maxOpenGroupsPerMarket: config.maxOpenGroupsPerMarket,
+    maxOpenPartialGroups: config.maxOpenPartialGroups,
     partialOpenAction: "ALLOW_OVERLAP",
-    allowOverlapOnlyAfterPartialClassified: false,
-    allowOverlapOnlyWhenCompletionEngineActive: false,
-    requireMatchedInventoryBeforeSecondGroup: false,
-    worstCaseAmplificationToleranceShares: Math.max(config.worstCaseAmplificationToleranceShares, 125),
+    allowControlledOverlap: true,
+    controlledOverlapMinResidualShares: config.controlledOverlapMinResidualShares,
+    controlledOverlapSeedMaxQty: config.controlledOverlapSeedMaxQty,
+    allowOverlapOnlyAfterPartialClassified: config.allowOverlapOnlyAfterPartialClassified,
+    allowOverlapOnlyWhenCompletionEngineActive: config.allowOverlapOnlyWhenCompletionEngineActive,
+    requireMatchedInventoryBeforeSecondGroup: config.requireMatchedInventoryBeforeSecondGroup,
+    worstCaseAmplificationToleranceShares: config.worstCaseAmplificationToleranceShares,
     postMergeNewSeedCooldownMs: 0,
     postMergePairReopenCooldownMs: 0,
     postMergeOnlyCompletion: false,
@@ -584,8 +718,8 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
       config.temporalRepairUltraFastMissingFairValueCap,
       1.075,
     ),
-    partialSoftMaxQty: Math.max(config.partialSoftMaxQty, maxLadderLot),
-    partialHardMaxQty: Math.max(config.partialHardMaxQty, maxLadderLot),
+    partialSoftMaxQty: Math.min(Math.max(config.partialSoftMaxQty, maxLadderLot), config.residualStateSoftCompletionMaxQty),
+    partialHardMaxQty: Math.min(Math.max(config.partialHardMaxQty, maxLadderLot), config.residualStateSoftCompletionMaxQty),
     partialEmergencyMaxQty: Math.max(config.partialEmergencyMaxQty, maxLadderLot),
     partialEmergencyRequiresFairValue: false,
     temporalSeedOwnDiscountWeight: 11,
@@ -597,7 +731,7 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     temporalSeedOrphanPenaltyWeight: 0.03,
     finalHardCompletionMaxQty: Math.max(config.finalHardCompletionMaxQty, maxLadderLot),
     fairValueFailClosedForSeed: false,
-    fairValueFailClosedForNegativePair: false,
+    fairValueFailClosedForNegativePair: config.fairValueFailClosedForNegativePair,
     fairValueFailClosedForHighSideChase: false,
     requireStrictCapForHighLowMismatch: false,
     xuanBehaviorCap: elevatedBehaviorCap,
@@ -605,11 +739,12 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     cloneChildOrderDelayMs: Math.max(config.cloneChildOrderDelayMs, 120),
     cloneStaleCheapOppositeQuoteMinAgeSec: Math.min(config.cloneStaleCheapOppositeQuoteMinAgeSec, 75),
     mergeBatchMode: "HYBRID_DELAYED",
-    minCompletedCyclesBeforeFirstMerge: Math.max(config.minCompletedCyclesBeforeFirstMerge, 5),
-    minFirstMatchedAgeBeforeMergeSec: Math.max(config.minFirstMatchedAgeBeforeMergeSec, 75),
-    maxMatchedAgeBeforeForcedMergeSec: Math.max(config.maxMatchedAgeBeforeForcedMergeSec, 135),
-    mergeShieldSecFromOpen: Math.max(config.mergeShieldSecFromOpen, 75),
-    forceMergeOnHardImbalance: false,
+    minCompletedCyclesBeforeFirstMerge: config.minCompletedCyclesBeforeFirstMerge,
+    minFirstMatchedAgeBeforeMergeSec: config.minFirstMatchedAgeBeforeMergeSec,
+    maxMatchedAgeBeforeForcedMergeSec: config.maxMatchedAgeBeforeForcedMergeSec,
+    mergeShieldSecFromOpen: config.mergeShieldSecFromOpen,
+    forceMergeInLast30S: true,
+    forceMergeOnHardImbalance: true,
     reentryDelayMs: Math.min(config.reentryDelayMs, 350),
   };
 }

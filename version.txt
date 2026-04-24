@@ -1,6 +1,16 @@
 
 ##############################################
 
+Version : V.0.0.24
+Date    : 24.04.2026
+Author  : Ali Hakan Çakır
+Changes : - Live paper loop stateful fill, merge ve audit kaydiyla genisletildi.
+          - XUAN entry/completion kalite kapilari ve borderline staged seed kurallari guncellendi.
+
+##############################################
+
+##############################################
+
 Version : V.0.0.23
 Date    : 24.04.2026
 Author  : Ali Hakan Çakır

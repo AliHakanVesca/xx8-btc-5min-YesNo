@@ -43,7 +43,7 @@ describe("merge coordinator", () => {
     expect(gate.pendingMatchedQty).toBe(5);
   });
 
-  it("allows merge immediately after two completed matched windows accumulate", () => {
+  it("holds cycle-target merge until the first matched window also ages", () => {
     const config = buildConfig();
     const market = buildOfflineMarket(1713696000);
     const state = createMarketState(market);
@@ -51,18 +51,26 @@ describe("merge coordinator", () => {
     tracker = syncMergeBatchTracker(tracker, 5, market.startTs);
     tracker = syncMergeBatchTracker(tracker, 10, market.startTs + 12);
 
-    const gate = evaluateDelayedMergeGate(config, state, {
+    const earlyGate = evaluateDelayedMergeGate(config, state, {
       nowTs: market.startTs + 20,
       secsToClose: 220,
       usdcBalance: 100,
       tracker,
     });
+    const releasedGate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 46,
+      secsToClose: 194,
+      usdcBalance: 100,
+      tracker,
+    });
 
-    expect(gate.allow).toBe(true);
-    expect(gate.forced).toBe(false);
-    expect(gate.reason).toBe("cycle_target");
-    expect(gate.completedCycles).toBe(2);
-    expect(gate.pendingMatchedQty).toBe(10);
+    expect(earlyGate.allow).toBe(false);
+    expect(earlyGate.reason).toBe("not_ready");
+    expect(earlyGate.completedCycles).toBe(2);
+    expect(releasedGate.allow).toBe(true);
+    expect(releasedGate.forced).toBe(false);
+    expect(releasedGate.reason).toBe("cycle_target");
+    expect(releasedGate.pendingMatchedQty).toBe(10);
   });
 
   it("forces merge once the oldest matched window exceeds the hard age cap", () => {
@@ -113,7 +121,111 @@ describe("merge coordinator", () => {
     expect(lowCollateralGate.reason).toBe("low_collateral");
   });
 
-  it("keeps clone-mode merges held without an exact public-footprint merge prior", () => {
+  it("defers small hard-imbalance merges briefly in xuan mode to preserve batching rhythm", () => {
+    const config = buildConfig({
+      BOT_MODE: "XUAN",
+      FORCE_MERGE_ON_HARD_IMBALANCE: "true",
+    });
+    const market = buildOfflineMarket(1713696000);
+    const state = createMarketState(market);
+    state.upShares = 5;
+    state.downShares = 4.25;
+    let tracker = createMergeBatchTracker();
+    tracker = syncMergeBatchTracker(tracker, 4.25, market.startTs + 153);
+
+    const deferredGate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 153,
+      secsFromOpen: 153,
+      secsToClose: 147,
+      usdcBalance: 100,
+      tracker,
+    });
+    const releasedGate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 169,
+      secsFromOpen: 169,
+      secsToClose: 131,
+      usdcBalance: 100,
+      tracker,
+    });
+
+    expect(deferredGate.allow).toBe(false);
+    expect(deferredGate.reason).toBe("hard_imbalance_deferred");
+    expect(releasedGate.allow).toBe(true);
+    expect(releasedGate.reason).toBe("hard_imbalance");
+  });
+
+  it("defers hard-imbalance flush caused by a small overlap seed", () => {
+    const config = buildConfig({
+      BOT_MODE: "XUAN",
+      FORCE_MERGE_ON_HARD_IMBALANCE: "true",
+      CONTROLLED_OVERLAP_SEED_MAX_QTY: "5",
+    });
+    const market = buildOfflineMarket(1713696000);
+    const state = createMarketState(market);
+    state.upShares = 10;
+    state.downShares = 5;
+    let tracker = createMergeBatchTracker();
+    tracker = syncMergeBatchTracker(tracker, 5, market.startTs + 7);
+
+    const deferredGate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 11,
+      secsFromOpen: 11,
+      secsToClose: 289,
+      usdcBalance: 100,
+      tracker,
+    });
+    const releasedGate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 23,
+      secsFromOpen: 23,
+      secsToClose: 277,
+      usdcBalance: 100,
+      tracker,
+    });
+
+    expect(deferredGate.allow).toBe(false);
+    expect(deferredGate.reason).toBe("hard_imbalance_deferred");
+    expect(releasedGate.allow).toBe(true);
+    expect(releasedGate.reason).toBe("hard_imbalance");
+  });
+
+  it("extends hard-imbalance deferral while a bounded B2 overlap window is active", () => {
+    const config = buildConfig({
+      BOT_MODE: "XUAN",
+      FORCE_MERGE_ON_HARD_IMBALANCE: "true",
+      CONTROLLED_OVERLAP_SEED_MAX_QTY: "5",
+      HARD_IMBALANCE_MERGE_OVERLAP_GRACE_SEC: "45",
+    });
+    const market = buildOfflineMarket(1713696000);
+    const state = createMarketState(market);
+    state.upShares = 10;
+    state.downShares = 5;
+    let tracker = createMergeBatchTracker();
+    tracker = syncMergeBatchTracker(tracker, 5, market.startTs + 7);
+
+    const stillDeferredGate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 30,
+      secsFromOpen: 30,
+      secsToClose: 270,
+      usdcBalance: 100,
+      tracker,
+      activeIndependentFlowCount: 2,
+    });
+    const releasedGate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 53,
+      secsFromOpen: 53,
+      secsToClose: 247,
+      usdcBalance: 100,
+      tracker,
+      activeIndependentFlowCount: 2,
+    });
+
+    expect(stillDeferredGate.allow).toBe(false);
+    expect(stillDeferredGate.reason).toBe("hard_imbalance_deferred");
+    expect(releasedGate.allow).toBe(true);
+    expect(releasedGate.reason).toBe("hard_imbalance");
+  });
+
+  it("uses generic age and forced-age merge gates when clone mode has no exact merge prior", () => {
     const config = buildConfig({
       BOT_MODE: "XUAN",
       XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
@@ -138,13 +250,13 @@ describe("merge coordinator", () => {
       tracker,
     });
 
-    expect(shieldedGate.allow).toBe(false);
-    expect(shieldedGate.reason).toBe("public_footprint_hold");
-    expect(releasedGate.allow).toBe(false);
-    expect(releasedGate.reason).toBe("public_footprint_hold");
+    expect(shieldedGate.allow).toBe(true);
+    expect(shieldedGate.reason).toBe("age_target");
+    expect(releasedGate.allow).toBe(true);
+    expect(releasedGate.reason).toBe("forced_age");
   });
 
-  it("does not release clone-mode cycle-target merge without an exact merge prior", () => {
+  it("uses generic cycle-target merge when clone mode has no exact merge prior", () => {
     const config = buildConfig({
       BOT_MODE: "XUAN",
       XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
@@ -159,16 +271,16 @@ describe("merge coordinator", () => {
     tracker = syncMergeBatchTracker(tracker, 25, market.startTs + 40);
 
     const gate = evaluateDelayedMergeGate(config, state, {
-      nowTs: market.startTs + 76,
-      secsFromOpen: 76,
-      secsToClose: 224,
+      nowTs: market.startTs + 46,
+      secsFromOpen: 46,
+      secsToClose: 254,
       usdcBalance: 100,
       tracker,
     });
 
-    expect(gate.allow).toBe(false);
+    expect(gate.allow).toBe(true);
     expect(gate.forced).toBe(false);
-    expect(gate.reason).toBe("public_footprint_hold");
+    expect(gate.reason).toBe("cycle_target");
     expect(gate.completedCycles).toBe(5);
   });
 
@@ -205,10 +317,10 @@ describe("merge coordinator", () => {
       activeIndependentFlowCount: 2,
     });
 
-    expect(delayedGate.allow).toBe(false);
-    expect(delayedGate.reason).toBe("public_footprint_hold");
-    expect(releasedGate.allow).toBe(false);
-    expect(releasedGate.reason).toBe("public_footprint_hold");
+    expect(delayedGate.allow).toBe(true);
+    expect(delayedGate.reason).toBe("forced_age");
+    expect(releasedGate.allow).toBe(true);
+    expect(releasedGate.reason).toBe("forced_age");
   });
 
   it("coalesces nearby matched windows when strong multi-flow pressure is still active", () => {
@@ -274,8 +386,8 @@ describe("merge coordinator", () => {
       flowPressureState,
     });
 
-    expect(delayedGate.allow).toBe(false);
-    expect(delayedGate.reason).toBe("public_footprint_hold");
+    expect(delayedGate.allow).toBe(true);
+    expect(delayedGate.reason).toBe("forced_age");
   });
 
   it("uses the exact 1776253500 first merge cluster timing and qty envelope", () => {

@@ -39,6 +39,7 @@ export interface MergeGateDecision extends MergeBatchMetrics {
     | "forced_age"
     | "final_window"
     | "hard_imbalance"
+    | "hard_imbalance_deferred"
     | "low_collateral";
 }
 
@@ -141,17 +142,23 @@ export function evaluateDelayedMergeGate(
   config: Pick<
     XuanStrategyConfig,
     | "xuanCloneMode"
+    | "botMode"
     | "mergeMode"
     | "mergeBatchMode"
     | "minCompletedCyclesBeforeFirstMerge"
     | "minFirstMatchedAgeBeforeMergeSec"
     | "maxMatchedAgeBeforeForcedMergeSec"
+    | "requireMinAgeForCycleTargetMerge"
     | "mergeShieldSecFromOpen"
     | "forceMergeInLast30S"
     | "forceMergeOnHardImbalance"
     | "forceMergeOnLowCollateral"
     | "finalWindowCompletionOnlySec"
     | "hardImbalanceRatio"
+    | "hardImbalanceMergeMinAgeSec"
+    | "hardImbalanceMergeOverlapGraceSec"
+    | "hardImbalanceMergeMaxDeferrableShares"
+    | "controlledOverlapSeedMaxQty"
     | "minUsdcBalanceForNewEntry"
   >,
   state: XuanMarketState,
@@ -177,22 +184,21 @@ export function evaluateDelayedMergeGate(
   const publicFootprintHoldWithoutPrior =
     config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
     !exactMergePriorActive;
-  const mergeShieldSecFromOpen = timingPrior
+  const exactTimingPrior = timingPrior?.scope === "exact" ? timingPrior : undefined;
+  const mergeShieldSecFromOpen = exactTimingPrior
     ? Math.max(
         config.mergeShieldSecFromOpen,
-        timingPrior.scope === "exact" ? timingPrior.firstMergeSec : Math.max(0, timingPrior.firstMergeSec - 1),
+        exactTimingPrior.firstMergeSec,
       )
     : config.mergeShieldSecFromOpen;
-  const minCompletedCyclesBeforeFirstMerge = timingPrior
-    ? Math.max(config.minCompletedCyclesBeforeFirstMerge, timingPrior.completedCyclesBeforeMerge)
+  const minCompletedCyclesBeforeFirstMerge = exactTimingPrior
+    ? Math.max(config.minCompletedCyclesBeforeFirstMerge, exactTimingPrior.completedCyclesBeforeMerge)
     : config.minCompletedCyclesBeforeFirstMerge;
-  const minFirstMatchedAgeBeforeMergeSec = timingPrior
-    ? timingPrior.scope === "exact"
-      ? Math.max(config.minFirstMatchedAgeBeforeMergeSec, timingPrior.firstMergeSec)
-      : Math.min(config.minFirstMatchedAgeBeforeMergeSec, timingPrior.firstMergeSec)
+  const minFirstMatchedAgeBeforeMergeSec = exactTimingPrior
+    ? Math.max(config.minFirstMatchedAgeBeforeMergeSec, exactTimingPrior.firstMergeSec)
     : config.minFirstMatchedAgeBeforeMergeSec;
-  const maxMatchedAgeBeforeForcedMergeSec = timingPrior
-    ? Math.min(config.maxMatchedAgeBeforeForcedMergeSec, timingPrior.forcedAgeSec)
+  const maxMatchedAgeBeforeForcedMergeSec = exactTimingPrior
+    ? Math.min(config.maxMatchedAgeBeforeForcedMergeSec, exactTimingPrior.forcedAgeSec)
     : config.maxMatchedAgeBeforeForcedMergeSec;
   const flowPressureState =
     args.flowPressureState ??
@@ -229,6 +235,32 @@ export function evaluateDelayedMergeGate(
   }
 
   if (config.forceMergeOnHardImbalance && imbalance(state) >= config.hardImbalanceRatio) {
+    const hardImbalanceShareGap = Math.abs(state.upShares - state.downShares);
+    const oldestMatchedAgeSec = metrics.oldestMatchedAgeSec ?? 0;
+    const hardImbalanceDeferrableShares = Math.max(
+      config.hardImbalanceMergeMaxDeferrableShares,
+      config.controlledOverlapSeedMaxQty,
+    );
+    const multiFlowGraceActive =
+      activeIndependentFlowCount >= 2 ||
+      (flowPressureState.confirmed && flowPressureState.remainingBudget >= 0.35);
+    const hardImbalanceMinAgeSec =
+      multiFlowGraceActive
+        ? Math.max(config.hardImbalanceMergeMinAgeSec, config.hardImbalanceMergeOverlapGraceSec)
+        : config.hardImbalanceMergeMinAgeSec;
+    const canDeferSmallHardImbalance =
+      config.botMode === "XUAN" &&
+      args.secsToClose > config.finalWindowCompletionOnlySec &&
+      oldestMatchedAgeSec < hardImbalanceMinAgeSec &&
+      hardImbalanceShareGap <= hardImbalanceDeferrableShares + 1e-9;
+    if (canDeferSmallHardImbalance) {
+      return {
+        allow: false,
+        forced: false,
+        reason: "hard_imbalance_deferred",
+        ...metrics,
+      };
+    }
     return {
       allow: true,
       forced: true,
@@ -246,20 +278,23 @@ export function evaluateDelayedMergeGate(
     };
   }
 
-  if (publicFootprintHoldWithoutPrior) {
-    return {
-      allow: false,
-      forced: false,
-      reason: "public_footprint_hold",
-      ...metrics,
-    };
-  }
-
   if (config.forceMergeInLast30S && args.secsToClose <= config.finalWindowCompletionOnlySec) {
     return {
       allow: true,
       forced: true,
       reason: "final_window",
+      ...metrics,
+    };
+  }
+
+  if (
+    mergeClusterPrior?.scope === "exact" &&
+    (args.secsFromOpen ?? Number.POSITIVE_INFINITY) < mergeClusterPrior.anchorSec
+  ) {
+    return {
+      allow: false,
+      forced: false,
+      reason: "cluster_window",
       ...metrics,
     };
   }
@@ -286,22 +321,28 @@ export function evaluateDelayedMergeGate(
   }
 
   if (
-    mergeClusterPrior?.scope === "exact" &&
-    (args.secsFromOpen ?? Number.POSITIVE_INFINITY) < mergeClusterPrior.anchorSec
+    metrics.completedCycles >= effectiveMinCompletedCyclesBeforeFirstMerge &&
+    (!config.requireMinAgeForCycleTargetMerge ||
+      exactMergePriorActive ||
+      metrics.oldestMatchedAgeSec === undefined ||
+      metrics.oldestMatchedAgeSec >= effectiveMinFirstMatchedAgeBeforeMergeSec)
   ) {
-    return {
-      allow: false,
-      forced: false,
-      reason: "cluster_window",
-      ...metrics,
-    };
-  }
-
-  if (metrics.completedCycles >= effectiveMinCompletedCyclesBeforeFirstMerge) {
     return {
       allow: true,
       forced: false,
       reason: "cycle_target",
+      ...metrics,
+    };
+  }
+
+  if (
+    config.requireMinAgeForCycleTargetMerge &&
+    metrics.completedCycles >= effectiveMinCompletedCyclesBeforeFirstMerge
+  ) {
+    return {
+      allow: false,
+      forced: false,
+      reason: "not_ready",
       ...metrics,
     };
   }
@@ -314,6 +355,15 @@ export function evaluateDelayedMergeGate(
       allow: true,
       forced: false,
       reason: "age_target",
+      ...metrics,
+    };
+  }
+
+  if (publicFootprintHoldWithoutPrior) {
+    return {
+      allow: false,
+      forced: false,
+      reason: "public_footprint_hold",
       ...metrics,
     };
   }

@@ -352,6 +352,11 @@ export function resolveResidualCompletionDelayProfile(args: {
     | "liveSmallLotLadder"
     | "lowSideMaxForHighCompletion"
     | "highSidePriceThreshold"
+    | "completionTargetMaxDelaySec"
+    | "completionUrgencyStrictSec"
+    | "completionUrgencyPatientSec"
+    | "completionUrgencyForceSec"
+    | "completionUrgencyMaxPricePremium"
   >;
   residualShares: number;
   partialAgeSec: number;
@@ -393,16 +398,31 @@ export function resolveResidualCompletionDelayProfile(args: {
     0.25,
     Math.min(1.35, calibrationPatienceMultiplier * rolePatienceMultiplier),
   );
+  const behaviorWaitUntilSec = baseWaitUntilSec * behaviorState.completionPatienceBias * effectivePatienceMultiplier;
+  const urgencyPatientSec =
+    args.config.botMode === "XUAN"
+      ? Math.max(args.config.partialFastWindowSec, args.config.completionUrgencyPatientSec)
+      : args.config.partialPatientWindowSec;
+  const xuanTargetMaxDelaySec =
+    args.config.botMode === "XUAN" && args.config.completionTargetMaxDelaySec > 0
+      ? Math.max(args.config.partialFastWindowSec, Math.min(args.config.completionTargetMaxDelaySec, urgencyPatientSec))
+      : args.config.partialPatientWindowSec;
   const waitUntilSec = Math.min(
     args.config.partialPatientWindowSec,
-    baseWaitUntilSec * behaviorState.completionPatienceBias * effectivePatienceMultiplier,
+    xuanTargetMaxDelaySec,
+    behaviorWaitUntilSec,
   );
   const pricePremium = args.missingSidePrice - args.oppositeAveragePrice;
   const definitelyNotCheapLate =
     args.missingSidePrice > args.config.lowSideMaxForHighCompletion + 0.03 ||
     args.oppositeAveragePrice < args.config.highSidePriceThreshold - 0.08;
+  const urgencyForceResolution =
+    args.config.botMode === "XUAN" &&
+    args.config.completionUrgencyForceSec > 0 &&
+    args.partialAgeSec >= args.config.completionUrgencyForceSec;
   const delayCandidate =
     args.config.botMode === "XUAN" &&
+    !urgencyForceResolution &&
     !args.exactPriorActive &&
     !args.exceptionalMode &&
     severity.level !== "flat" &&
@@ -410,7 +430,11 @@ export function resolveResidualCompletionDelayProfile(args: {
     args.secsToClose > args.config.finalWindowCompletionOnlySec;
 
   return {
-    shouldDelay: delayCandidate && args.partialAgeSec < waitUntilSec && pricePremium > 0.015 && definitelyNotCheapLate,
+    shouldDelay:
+      delayCandidate &&
+      args.partialAgeSec < waitUntilSec &&
+      pricePremium > args.config.completionUrgencyMaxPricePremium &&
+      definitelyNotCheapLate,
     completionReleaseRole,
     residualSeverityLevel: severity.level,
     calibrationPatienceMultiplier,
@@ -807,4 +831,87 @@ export function completionAllowance(
     negativeEdgeUsdc,
     ...(highLowMismatch ? { highLowMismatch } : {}),
   };
+}
+
+export function highSideCompletionQualitySkipReason(
+  config: XuanStrategyConfig,
+  state: XuanMarketState,
+  args: {
+    costWithFees: number;
+    candidateSize: number;
+    missingSidePrice: number;
+    exactPriorActive: boolean;
+    fairValueAllowed: boolean;
+  },
+): string | undefined {
+  if (config.botMode !== "XUAN") {
+    return undefined;
+  }
+  if (args.exactPriorActive && config.highSideCompletionExactPriorBypass) {
+    return undefined;
+  }
+  if (args.missingSidePrice < config.highSidePriceThreshold) {
+    return undefined;
+  }
+
+  const imbalanceShares = Math.abs(state.upShares - state.downShares);
+  const imbalanceRatio = imbalanceShares / Math.max(state.upShares + state.downShares, 1);
+
+  if (args.candidateSize > config.highSideCompletionMaxQty + 1e-9) {
+    return "high_side_completion_qty_cap";
+  }
+  if (args.costWithFees > config.highSideCompletionMaxCost + 1e-9) {
+    return "high_side_completion_cost_cap";
+  }
+  if (config.highSideCompletionRequiresHardImbalance && imbalanceRatio < config.hardImbalanceRatio) {
+    return "high_side_completion_hard_imbalance";
+  }
+  if (config.highSideCompletionRequiresFairValue && !args.fairValueAllowed) {
+    return "high_side_completion_fair_value";
+  }
+  return undefined;
+}
+
+export function completionQualitySkipReason(
+  config: XuanStrategyConfig,
+  state: XuanMarketState,
+  args: {
+    costWithFees: number;
+    candidateSize: number;
+    partialAgeSec: number;
+    capMode: "strict" | "soft" | "hard" | "emergency";
+    exactPriorActive: boolean;
+    secsToClose: number;
+  },
+): string | undefined {
+  if (config.botMode !== "XUAN" || args.exactPriorActive) {
+    return undefined;
+  }
+  if (args.partialAgeSec < config.completionQualityEnforceAfterSec) {
+    return undefined;
+  }
+
+  const negativeEdgeUsdc = estimateNegativeEdgeUsdc(args.costWithFees, args.candidateSize);
+  if (negativeEdgeUsdc <= 1e-9) {
+    return undefined;
+  }
+
+  const imbalanceShares = Math.abs(state.upShares - state.downShares);
+  const imbalanceRatio = imbalanceShares / Math.max(state.upShares + state.downShares, 1);
+  const finalEmergency =
+    args.secsToClose <= config.finalWindowCompletionOnlySec &&
+    imbalanceRatio >= config.hardImbalanceRatio &&
+    args.candidateSize <= config.finalHardCompletionMaxQty + 1e-9 &&
+    negativeEdgeUsdc <= config.finalHardCompletionMaxNegativeEdgeUsdc + 1e-9;
+  if (finalEmergency) {
+    return undefined;
+  }
+
+  if (args.costWithFees > config.completionQualityMaxEffectiveCost + 1e-9) {
+    return "completion_quality_cost_cap";
+  }
+  if (negativeEdgeUsdc > config.completionQualityMaxNegativeEdgeUsdc + 1e-9) {
+    return "completion_quality_edge_cap";
+  }
+  return undefined;
 }

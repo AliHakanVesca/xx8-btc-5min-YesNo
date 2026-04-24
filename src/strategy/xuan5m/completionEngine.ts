@@ -16,8 +16,10 @@ import { OrderBookState } from "./orderBookState.js";
 import {
   classifyResidualSeverity,
   classifyCompletionReleaseRole,
+  completionQualitySkipReason,
   type CompletionReleaseRole,
   completionAllowance,
+  highSideCompletionQualitySkipReason,
   type FlowPressureBudgetState,
   deriveFlowPressureBudgetState,
   resolvePartialCompletionPhase,
@@ -118,6 +120,19 @@ export function chooseInventoryAdjustment(
   return null;
 }
 
+function borderlineStagedResidualAgeSec(
+  state: XuanMarketState,
+  leadingSide: OutcomeSide,
+  nowTs: number,
+): number | undefined {
+  const lots = leadingSide === "UP" ? state.upLots : state.downLots;
+  const stagedLots = lots.filter((lot) => lot.executionMode === "PAIRGROUP_COVERED_SEED");
+  if (stagedLots.length === 0) {
+    return undefined;
+  }
+  return Math.max(0, nowTs - Math.min(...stagedLots.map((lot) => lot.timestamp)));
+}
+
 function chooseCompletion(
   config: XuanStrategyConfig,
   state: XuanMarketState,
@@ -170,6 +185,16 @@ function chooseCompletion(
     ctx.nowTs !== undefined && residualTimestamp !== undefined
       ? Math.max(0, ctx.nowTs - residualTimestamp)
       : config.partialSoftWindowSec;
+  const stagedResidualAgeSec =
+    ctx.nowTs !== undefined ? borderlineStagedResidualAgeSec(state, leadingSide, ctx.nowTs) : undefined;
+  if (
+    config.borderlinePairStagedEntryEnabled &&
+    stagedResidualAgeSec !== undefined &&
+    stagedResidualAgeSec < config.borderlinePairReevaluateAfterSec &&
+    ctx.secsToClose > config.finalWindowCompletionOnlySec
+  ) {
+    return null;
+  }
   const phase = resolvePartialCompletionPhase({
     config,
     partialAgeSec,
@@ -264,6 +289,8 @@ function chooseCompletion(
     prioritizedExactQty !== undefined && candidateSizes.includes(prioritizedExactQty)
       ? [prioritizedExactQty, ...candidateSizes.filter((size) => Math.abs(size - prioritizedExactQty) > 1e-6)]
       : candidateSizes;
+  let bestCompletion: CompletionDecision | undefined;
+  let bestCompletionScore = Number.POSITIVE_INFINITY;
 
   for (const candidateSize of orderedCandidateSizes) {
     if (
@@ -328,6 +355,34 @@ function chooseCompletion(
           effectiveCost: costWithFees,
           required: fairValueRequired,
         });
+    const strictHighSideFairValueDecision =
+      execution.averagePrice >= config.highSidePriceThreshold
+        ? fairValueGate({
+            config,
+            snapshot: ctx.fairValueSnapshot,
+            side: sideToBuy,
+            sidePrice: execution.averagePrice,
+            mode: allowance.capMode === "emergency" ? "emergency" : "completion",
+            secsToClose: ctx.secsToClose,
+            effectiveCost: costWithFees,
+            required: true,
+          })
+        : { allowed: true as const };
+    const highSideQualitySkipReason = highSideCompletionQualitySkipReason(config, state, {
+      costWithFees,
+      candidateSize,
+      missingSidePrice: execution.averagePrice,
+      exactPriorActive: Boolean(exactCompletionQtyPrior),
+      fairValueAllowed: strictHighSideFairValueDecision.allowed,
+    });
+    const qualitySkipReason = completionQualitySkipReason(config, state, {
+      costWithFees,
+      candidateSize,
+      partialAgeSec,
+      capMode: allowance.capMode,
+      exactPriorActive: Boolean(exactCompletionQtyPrior),
+      secsToClose: ctx.secsToClose,
+    });
     const cheapLateCompletionChase =
       allowance.allowed &&
       shouldUseCheapLateCompletionChase({
@@ -358,6 +413,28 @@ function chooseCompletion(
         : {}),
     });
     if (!allowance.allowed) {
+      continue;
+    }
+    if (highSideQualitySkipReason) {
+      continue;
+    }
+    if (qualitySkipReason) {
+      continue;
+    }
+    if (
+      shouldDeferNibbleCompletionUnderFlowPressure({
+        config,
+        candidateSize,
+        missingShares,
+        residualAfter: projectedGap,
+        secsToClose: ctx.secsToClose,
+        exactPriorActive: Boolean(exactCompletionQtyPrior),
+        exceptionalMode: Boolean(allowance.highLowMismatch) || cheapLateCompletionChase,
+        recentSeedFlowCount,
+        activeIndependentFlowCount,
+        flowPressureState,
+      })
+    ) {
       continue;
     }
     if (!fairValueDecision.allowed && (phase.requiresFairValue || phase.mode === "POST_MERGE_RESIDUAL_COMPLETION")) {
@@ -420,7 +497,7 @@ function chooseCompletion(
           ? "CHEAP_LATE_COMPLETION_CHASE"
           : phase.mode;
 
-    return {
+    const decision: CompletionDecision = {
       sideToBuy,
       missingShares: candidateSize,
       residualAfter: normalizeSize(Math.max(0, missingShares - candidateSize)),
@@ -452,9 +529,27 @@ function chooseCompletion(
         orderType: "FAK",
       }),
     };
+    const score = completionCandidateScore(config, {
+      costWithFees,
+      missingSidePrice: execution.averagePrice,
+      candidateSize,
+      missingShares,
+      partialAgeSec,
+      fairValuePremium: fairValuePremiumForSide(ctx.fairValueSnapshot, sideToBuy, execution.averagePrice),
+      depthCoverageRatio: books.depthAtOrBetter(sideToBuy, execution.limitPrice, "ask") / Math.max(candidateSize, 1e-6),
+      gapImprovement: Math.max(0, oldGap - projectedGap),
+      oldGap,
+      residualAfter: projectedGap,
+      exactQtyMatch:
+        prioritizedExactQty !== undefined && Math.abs(candidateSize - prioritizedExactQty) <= 1e-6,
+    });
+    if (score < bestCompletionScore) {
+      bestCompletion = decision;
+      bestCompletionScore = score;
+    }
   }
 
-  return null;
+  return bestCompletion ?? null;
 }
 
 function shouldHoldLateSmallCompletionResidual(args: {
@@ -520,6 +615,90 @@ function shouldUseCheapLateCompletionChase(args: {
     args.missingSidePrice <= args.config.lowSideMaxForHighCompletion + 0.02 &&
     args.oppositeAveragePrice >= args.config.highSidePriceThreshold - 0.02
   );
+}
+
+function completionCandidateScore(
+  config: XuanStrategyConfig,
+  args: {
+    costWithFees: number;
+    missingSidePrice: number;
+    candidateSize: number;
+    missingShares: number;
+    partialAgeSec: number;
+    fairValuePremium?: number | undefined;
+    depthCoverageRatio?: number | undefined;
+    gapImprovement?: number | undefined;
+    oldGap?: number | undefined;
+    residualAfter?: number | undefined;
+    exactQtyMatch?: boolean | undefined;
+  },
+): number {
+  if (config.botMode !== "XUAN") {
+    return -args.candidateSize;
+  }
+  const sizeRatio = args.candidateSize / Math.max(args.missingShares, 1e-6);
+  const forceSec = Math.max(config.completionUrgencyStrictSec, config.completionUrgencyForceSec);
+  const agePressure = Math.max(0, Math.min(1, args.partialAgeSec / Math.max(forceSec, 1e-6)));
+  const negativeEdgePenalty = Math.max(0, args.costWithFees - 1) * 35;
+  const fairValuePenalty = Math.max(0, args.fairValuePremium ?? 0) * 14;
+  const costPenalty = args.costWithFees * 4 + args.missingSidePrice * 1.25 + negativeEdgePenalty + fairValuePenalty;
+  const resolutionBonus = (0.02 + agePressure * 0.06) * sizeRatio;
+  const depthBonus = Math.min(0.08, Math.max(0, args.depthCoverageRatio ?? 0) * 0.012);
+  const gapImprovementRatio = (args.gapImprovement ?? 0) / Math.max(args.oldGap ?? args.missingShares, 1e-6);
+  const inventoryShapeBonus = Math.min(0.18, Math.max(0, gapImprovementRatio) * 0.18);
+  const cleanupBonus =
+    (args.residualAfter ?? Number.POSITIVE_INFINITY) <= config.residualJanitorMaxShareGap + 1e-9 ? 0.06 : 0;
+  const exactQtyBonus = args.exactQtyMatch ? 0.5 : 0;
+  return Number((costPenalty - resolutionBonus - depthBonus - inventoryShapeBonus - cleanupBonus - exactQtyBonus).toFixed(9));
+}
+
+function shouldDeferNibbleCompletionUnderFlowPressure(args: {
+  config: XuanStrategyConfig;
+  candidateSize: number;
+  missingShares: number;
+  residualAfter: number;
+  secsToClose: number;
+  exactPriorActive: boolean;
+  exceptionalMode: boolean;
+  recentSeedFlowCount: number;
+  activeIndependentFlowCount: number;
+  flowPressureState: {
+    supportive: boolean;
+    remainingBudget: number;
+  };
+}): boolean {
+  if (args.config.botMode !== "XUAN" || args.exactPriorActive || args.exceptionalMode) {
+    return false;
+  }
+  if (args.secsToClose <= Math.max(20, args.config.finalWindowCompletionOnlySec)) {
+    return false;
+  }
+  const denseRecentFlow = args.recentSeedFlowCount >= 2;
+  const independentFlowPressure = args.activeIndependentFlowCount >= 2;
+  if (!denseRecentFlow && !independentFlowPressure) {
+    return false;
+  }
+  if (!args.flowPressureState.supportive || args.flowPressureState.remainingBudget < 0.3) {
+    return false;
+  }
+  const leavesMaterialResidual = args.residualAfter >= args.config.completionMinQty * 2;
+  const isNibble = args.candidateSize <= args.missingShares * 0.5 + 1e-6;
+  return leavesMaterialResidual && isNibble;
+}
+
+function fairValuePremiumForSide(
+  snapshot: FairValueSnapshot | undefined,
+  side: OutcomeSide,
+  price: number,
+): number | undefined {
+  if (!snapshot || snapshot.status !== "valid") {
+    return undefined;
+  }
+  const fairValue = side === "UP" ? snapshot.fairUp : snapshot.fairDown;
+  if (fairValue === undefined) {
+    return undefined;
+  }
+  return Number((price - fairValue).toFixed(9));
 }
 
 function resolveGuidedMinCompletionSize(args: {

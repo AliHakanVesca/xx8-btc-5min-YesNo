@@ -191,6 +191,17 @@ export class Xuan5mBot {
     const recentSeedFlowCount = input.recentSeedFlowCount ?? countRecentSeedFlowCount(state.fillHistory, nowTs);
     const activeIndependentFlowCount =
       input.activeIndependentFlowCount ?? countActiveIndependentFlowCount(state.fillHistory, nowTs);
+    const protectedResidualThreshold = Math.max(config.repairMinQty, config.completionMinQty);
+    const controlledOverlapResidualThreshold = Math.max(
+      protectedResidualThreshold,
+      config.controlledOverlapMinResidualShares,
+    );
+    const hasPartialResidual = shareGap + 1e-9 >= controlledOverlapResidualThreshold;
+    const canOpenControlledOverlap =
+      config.allowControlledOverlap &&
+      hasPartialResidual &&
+      activeIndependentFlowCount < config.maxOpenGroupsPerMarket &&
+      (config.allowOverlapInLast30S || secsToClose > config.finalWindowCompletionOnlySec);
 
     const lot = chooseLot(config, {
       marketSlug: state.market.slug,
@@ -225,9 +236,12 @@ export class Xuan5mBot {
       lot,
       dailyNegativeEdgeSpentUsdc: input.dailyNegativeEdgeSpentUsdc ?? state.negativeEdgeConsumedUsdc,
       fairValueSnapshot: input.fairValueSnapshot,
-      allowControlledOverlap: input.allowControlledOverlap,
-      protectedResidualShares: input.protectedResidualShares,
-      protectedResidualSide: input.protectedResidualSide,
+      allowControlledOverlap: input.allowControlledOverlap ?? canOpenControlledOverlap,
+      protectedResidualShares:
+        input.protectedResidualShares ?? (canOpenControlledOverlap ? shareGap : undefined),
+      protectedResidualSide:
+        input.protectedResidualSide ??
+        (canOpenControlledOverlap ? (state.upShares >= state.downShares ? "UP" : "DOWN") : undefined),
       recentSeedFlowCount,
       activeIndependentFlowCount,
       pairGatePressure,
@@ -258,7 +272,7 @@ export class Xuan5mBot {
         }) ?? undefined
       : undefined;
     const protectedResidualContext =
-      (input.protectedResidualShares ?? 0) > Math.max(config.repairMinQty, config.completionMinQty);
+      (baseEntryContext.protectedResidualShares ?? 0) + 1e-9 >= controlledOverlapResidualThreshold;
     const shouldAttemptFlowRotationRetry =
       risk.allowNewEntries &&
       shouldRetrySameWindowFlowRotation(config, initialEntryEvaluation, inventoryAdjustmentProbe, {

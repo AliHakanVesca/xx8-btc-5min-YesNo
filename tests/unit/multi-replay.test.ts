@@ -16,20 +16,20 @@ describe("multi synthetic replay", () => {
       windowCount: 2,
       scenariosPerWindow: 8,
       totalScenarioCount: 16,
-      entryBuyScenarioCount: 8,
+      entryBuyScenarioCount: 6,
       balancedPairScenarioCount: 6,
-      laggingRebalanceScenarioCount: 2,
+      laggingRebalanceScenarioCount: 0,
       completionScenarioCount: 2,
       unwindScenarioCount: 0,
       mergeScenarioCount: 10,
       completionOnlyScenarioCount: 8,
       hardCancelScenarioCount: 2,
-      totalEntryBuyShares: 80,
+      totalEntryBuyShares: 60,
       totalCompletionShares: 20,
       totalUnwindShares: 0,
-      totalMergeShares: 270,
+      totalMergeShares: 250,
     });
-    expect(report.summary.totalEntryBuyNotional).toBeCloseTo(38.5, 8);
+    expect(report.summary.totalEntryBuyNotional).toBeCloseTo(28.7, 8);
 
     const firstSlug = report.scenarios[0]?.marketSlug ?? "";
     const windowStartTs = Number(firstSlug.split("-").at(-1));
@@ -48,15 +48,12 @@ describe("multi synthetic replay", () => {
     expect(openingPairSeed?.orders.mergeShares).toBe(5);
 
     const rebalanceScenario = report.scenarios.find((scenario) => scenario.scenarioName === "mid-rebalance-buy-only");
-    expect(rebalanceScenario?.orders.entryBuyCount).toBe(1);
-    expect(rebalanceScenario?.orders.laggingRebalanceCount).toBe(1);
+    expect(rebalanceScenario?.orders.entryBuyCount).toBe(0);
+    expect(rebalanceScenario?.orders.laggingRebalanceCount).toBe(0);
     expect(rebalanceScenario?.orders.balancedPairEntryCount).toBe(0);
-    expect(rebalanceScenario?.orders.entryBuys).toHaveLength(1);
-    expect(rebalanceScenario?.orders.entryBuys[0]?.side).toBe("DOWN");
-    expect(rebalanceScenario?.orders.entryBuys[0]?.reason).toBe("lagging_rebalance");
-    expect(rebalanceScenario?.orders.entryBuys[0]?.size).toBe(10);
+    expect(rebalanceScenario?.orders.entryBuys).toHaveLength(0);
     expect(rebalanceScenario?.orders.completion).toBeUndefined();
-    expect(rebalanceScenario?.orders.mergeShares).toBe(20);
+    expect(rebalanceScenario?.orders.mergeShares).toBe(10);
 
     const mergeQueue = report.scenarios.find((scenario) => scenario.scenarioName === "merge-queue");
     expect(mergeQueue?.orders.entryBuyCount).toBe(2);

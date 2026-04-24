@@ -55,6 +55,7 @@ export type OverlapRepairArbitration =
   | "standard_pair_reentry"
   | "favor_independent_overlap"
   | "favor_residual_repair";
+export type CompletionReleaseRole = "neutral" | "mid_pair" | "high_low_setup";
 
 export interface FlowPressureBudgetState {
   budget: number;
@@ -322,7 +323,20 @@ export function resolveResidualBehaviorState(args: {
   };
 }
 
-export function shouldDelayResidualCompletion(args: {
+export interface ResidualCompletionDelayProfile {
+  shouldDelay: boolean;
+  completionReleaseRole: CompletionReleaseRole;
+  residualSeverityLevel: "flat" | "micro" | "small" | "medium" | "aggressive";
+  calibrationPatienceMultiplier: number;
+  rolePatienceMultiplier: number;
+  effectivePatienceMultiplier: number;
+  completionPatienceBias: number;
+  waitUntilSec: number;
+  pricePremium: number;
+  definitelyNotCheapLate: boolean;
+}
+
+export function resolveResidualCompletionDelayProfile(args: {
   config: Pick<
     XuanStrategyConfig,
     | "botMode"
@@ -349,14 +363,7 @@ export function shouldDelayResidualCompletion(args: {
   recentSeedFlowCount?: number;
   activeIndependentFlowCount?: number;
   completionPatienceMultiplier?: number;
-}): boolean {
-  if (args.config.botMode !== "XUAN") {
-    return false;
-  }
-  if (args.exactPriorActive || args.exceptionalMode) {
-    return false;
-  }
-
+}): ResidualCompletionDelayProfile {
   const behaviorState = resolveResidualBehaviorState({
     config: args.config,
     residualShares: args.residualShares,
@@ -365,30 +372,110 @@ export function shouldDelayResidualCompletion(args: {
     ...(args.activeIndependentFlowCount !== undefined ? { activeIndependentFlowCount: args.activeIndependentFlowCount } : {}),
   });
   const severity = behaviorState.severity;
-  if (severity.level === "flat" || severity.level === "aggressive") {
-    return false;
-  }
-  if (args.secsToClose <= args.config.finalWindowCompletionOnlySec) {
-    return false;
-  }
-
   const baseWaitUntilSec =
     severity.level === "micro"
       ? args.config.partialPatientWindowSec
       : severity.level === "small"
         ? args.config.partialSoftWindowSec
         : args.config.partialFastWindowSec;
-  const completionPatienceMultiplier = Math.max(0.65, Math.min(1.35, args.completionPatienceMultiplier ?? 1));
+  const completionReleaseRole = classifyCompletionReleaseRole({
+    config: args.config,
+    oppositeAveragePrice: args.oppositeAveragePrice,
+    missingSidePrice: args.missingSidePrice,
+  });
+  const calibrationPatienceMultiplier = args.completionPatienceMultiplier ?? 1;
+  const rolePatienceMultiplier = completionReleasePatienceMultiplier({
+    role: completionReleaseRole,
+    severity: severity.level,
+    calibrationPatienceMultiplier,
+  });
+  const effectivePatienceMultiplier = Math.max(
+    0.25,
+    Math.min(1.35, calibrationPatienceMultiplier * rolePatienceMultiplier),
+  );
   const waitUntilSec = Math.min(
     args.config.partialPatientWindowSec,
-    baseWaitUntilSec * behaviorState.completionPatienceBias * completionPatienceMultiplier,
+    baseWaitUntilSec * behaviorState.completionPatienceBias * effectivePatienceMultiplier,
   );
   const pricePremium = args.missingSidePrice - args.oppositeAveragePrice;
   const definitelyNotCheapLate =
     args.missingSidePrice > args.config.lowSideMaxForHighCompletion + 0.03 ||
     args.oppositeAveragePrice < args.config.highSidePriceThreshold - 0.08;
+  const delayCandidate =
+    args.config.botMode === "XUAN" &&
+    !args.exactPriorActive &&
+    !args.exceptionalMode &&
+    severity.level !== "flat" &&
+    severity.level !== "aggressive" &&
+    args.secsToClose > args.config.finalWindowCompletionOnlySec;
 
-  return args.partialAgeSec < waitUntilSec && pricePremium > 0.015 && definitelyNotCheapLate;
+  return {
+    shouldDelay: delayCandidate && args.partialAgeSec < waitUntilSec && pricePremium > 0.015 && definitelyNotCheapLate,
+    completionReleaseRole,
+    residualSeverityLevel: severity.level,
+    calibrationPatienceMultiplier,
+    rolePatienceMultiplier,
+    effectivePatienceMultiplier,
+    completionPatienceBias: behaviorState.completionPatienceBias,
+    waitUntilSec,
+    pricePremium,
+    definitelyNotCheapLate,
+  };
+}
+
+export function shouldDelayResidualCompletion(
+  args: Parameters<typeof resolveResidualCompletionDelayProfile>[0],
+): boolean {
+  return resolveResidualCompletionDelayProfile(args).shouldDelay;
+}
+
+export function completionReleasePatienceMultiplier(args: {
+  role: CompletionReleaseRole;
+  severity: "flat" | "micro" | "small" | "medium" | "aggressive";
+  calibrationPatienceMultiplier: number;
+}): number {
+  if (args.calibrationPatienceMultiplier > 1) {
+    return 1;
+  }
+  if (args.role === "high_low_setup") {
+    if (args.severity === "micro") {
+      return 0.78;
+    }
+    if (args.severity === "small") {
+      return 0.86;
+    }
+    return 0.94;
+  }
+  if (args.role === "mid_pair") {
+    return args.severity === "micro" ? 0.96 : 1;
+  }
+  return 1;
+}
+
+export function classifyCompletionReleaseRole(args: {
+  config: Pick<XuanStrategyConfig, "lowSideMaxForHighCompletion" | "highSidePriceThreshold">;
+  oppositeAveragePrice: number;
+  missingSidePrice: number;
+}): CompletionReleaseRole {
+  const lowPrice = Math.min(args.oppositeAveragePrice, args.missingSidePrice);
+  const highPrice = Math.max(args.oppositeAveragePrice, args.missingSidePrice);
+  const spread = highPrice - lowPrice;
+  const highLowVisible =
+    spread >= 0.24 &&
+    lowPrice <= args.config.lowSideMaxForHighCompletion + 0.06 &&
+    highPrice >= args.config.highSidePriceThreshold - 0.12;
+  if (highLowVisible) {
+    return "high_low_setup";
+  }
+  if (
+    args.oppositeAveragePrice >= 0.38 &&
+    args.oppositeAveragePrice <= 0.62 &&
+    args.missingSidePrice >= 0.38 &&
+    args.missingSidePrice <= 0.62
+  ) {
+    return "mid_pair";
+  }
+  return "neutral";
 }
 
 export function resolveOverlapRepairArbitration(args: {

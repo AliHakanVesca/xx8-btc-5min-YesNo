@@ -6,6 +6,7 @@ import { getStrategyPhase } from "./scheduler.js";
 import {
   chooseInventoryAdjustment,
   type CompletionDecision,
+  type InventoryAdjustmentDecision,
   type UnwindDecision,
 } from "./completionEngine.js";
 import {
@@ -54,6 +55,10 @@ export interface BotDecisionTrace {
   pairTakerCost: number;
   selectedMode?: StrategyExecutionMode | undefined;
   fairValue?: FairValueSnapshot | undefined;
+  protectedResidualContext: boolean;
+  flowRotationRetryAttempted: boolean;
+  flowRotationRetrySelected: boolean;
+  sameWindowCompletionAndOverlap: boolean;
   entry: EntryDecisionTrace;
 }
 
@@ -72,6 +77,15 @@ export interface TickInput {
   recentSeedFlowCount?: number | undefined;
   activeIndependentFlowCount?: number | undefined;
   completionPatienceMultiplier?: number | undefined;
+  openingSeedReleaseBias?: "neutral" | "earlier" | "later" | undefined;
+  semanticRoleAlignmentBias?:
+    | "neutral"
+    | "align_high_low_role"
+    | "preserve_raw_side"
+    | "cycle_role_arbitration"
+    | undefined;
+  childOrderMicroTimingBias?: "neutral" | "flow_intent" | undefined;
+  completionRoleReleaseOrderBias?: "neutral" | "role_order" | undefined;
   arbitrationCarry?: {
     recommendation: OverlapRepairArbitration;
     preferredSeedSide?: "UP" | "DOWN" | undefined;
@@ -205,7 +219,7 @@ export class Xuan5mBot {
       pnlTodayPositive: riskContext.dailyLossUsdc <= 0,
     });
 
-    const entryEvaluation = evaluateEntryBuys(config, state, books, {
+    const baseEntryContext = {
       secsFromOpen,
       secsToClose,
       lot,
@@ -222,15 +236,17 @@ export class Xuan5mBot {
       carryFlowConfidence,
       matchedInventoryQuality: carryMatchedInventoryQuality,
       flowPressureState,
-    });
+      openingSeedReleaseBias: input.openingSeedReleaseBias,
+      semanticRoleAlignmentBias: input.semanticRoleAlignmentBias,
+      childOrderMicroTimingBias: input.childOrderMicroTimingBias,
+      completionRoleReleaseOrderBias: input.completionRoleReleaseOrderBias,
+      completionPatienceMultiplier: input.completionPatienceMultiplier,
+    };
 
-    const entryBuys =
-      risk.allowNewEntries
-        ? entryEvaluation.decisions
-        : [];
+    const initialEntryEvaluation = evaluateEntryBuys(config, state, books, baseEntryContext);
 
-    const inventoryAdjustment = risk.tradable && !risk.allowNewEntries
-        ? chooseInventoryAdjustment(config, state, books, {
+    const inventoryAdjustmentProbe = risk.tradable
+      ? chooseInventoryAdjustment(config, state, books, {
           secsToClose,
           usdcBalance: riskContext.usdcBalance,
           nowTs,
@@ -241,6 +257,44 @@ export class Xuan5mBot {
           completionPatienceMultiplier: input.completionPatienceMultiplier,
         }) ?? undefined
       : undefined;
+    const protectedResidualContext =
+      (input.protectedResidualShares ?? 0) > Math.max(config.repairMinQty, config.completionMinQty);
+    const shouldAttemptFlowRotationRetry =
+      risk.allowNewEntries &&
+      shouldRetrySameWindowFlowRotation(config, initialEntryEvaluation, inventoryAdjustmentProbe, {
+        hasProtectedResidualContext: protectedResidualContext,
+      });
+    const flowRotationEntryEvaluation =
+      shouldAttemptFlowRotationRetry
+        ? evaluateEntryBuys(config, state, books, {
+            ...baseEntryContext,
+            allowControlledOverlap: true,
+            protectedResidualShares: input.protectedResidualShares ?? shareGap,
+            protectedResidualSide:
+              input.protectedResidualSide ?? (state.upShares >= state.downShares ? "UP" : "DOWN"),
+            forcedOverlapRepairArbitration: "favor_independent_overlap",
+            preferredOverlapSeedSide: inventoryAdjustmentProbe?.completion?.sideToBuy,
+            carryFlowConfidence: Math.max(carryFlowConfidence, 0.85),
+          })
+        : undefined;
+    const flowRotationRetrySelected = Boolean(
+      flowRotationEntryEvaluation?.decisions.some((entryBuy) => entryBuy.reason === "temporal_single_leg_seed"),
+    );
+    const entryEvaluation =
+      flowRotationRetrySelected && flowRotationEntryEvaluation
+        ? flowRotationEntryEvaluation
+        : initialEntryEvaluation;
+    const entryBuys =
+      risk.allowNewEntries
+        ? entryEvaluation.decisions
+        : [];
+    const sameWindowCompletionAndOverlap =
+      risk.allowNewEntries &&
+      shouldAllowSameWindowCompletionAndOverlap(config, state, entryEvaluation, entryBuys, inventoryAdjustmentProbe);
+    const inventoryAdjustment =
+      !risk.allowNewEntries || sameWindowCompletionAndOverlap
+        ? inventoryAdjustmentProbe
+        : undefined;
     const mergePlan = planMerge(config, projectMergeState(state, entryBuys, inventoryAdjustment?.completion));
 
     return {
@@ -262,6 +316,10 @@ export class Xuan5mBot {
         pairCap,
         pairTakerCost,
         ...(input.fairValueSnapshot ? { fairValue: input.fairValueSnapshot } : {}),
+        protectedResidualContext,
+        flowRotationRetryAttempted: shouldAttemptFlowRotationRetry,
+        flowRotationRetrySelected,
+        sameWindowCompletionAndOverlap,
         selectedMode:
           entryBuys[0]?.mode ??
           inventoryAdjustment?.completion?.mode ??
@@ -277,6 +335,70 @@ export class Xuan5mBot {
       },
     };
   }
+}
+
+function shouldAllowSameWindowCompletionAndOverlap(
+  config: XuanStrategyConfig,
+  state: XuanMarketState,
+  entryEvaluation: { trace: EntryDecisionTrace },
+  entryBuys: EntryBuyDecision[],
+  inventoryAdjustment: InventoryAdjustmentDecision | undefined,
+): boolean {
+  if (config.botMode !== "XUAN" || !config.allowControlledOverlap || !inventoryAdjustment?.completion) {
+    return false;
+  }
+  if (entryBuys.length !== 1 || entryBuys[0]?.reason !== "temporal_single_leg_seed") {
+    return false;
+  }
+  if (entryEvaluation.trace.overlapRepairOutcome !== "overlap_seed") {
+    return false;
+  }
+
+  const shareGap = Math.abs(state.upShares - state.downShares);
+  if (shareGap <= Math.max(config.repairMinQty, config.completionMinQty)) {
+    return false;
+  }
+
+  const completion = inventoryAdjustment.completion;
+  const rotatesResidualIntoNewFlow =
+    entryBuys[0].side === completion.sideToBuy &&
+    entryBuys[0].size <= completion.oldGap + config.maxCompletionOvershootShares + 1e-6;
+  if (completion.residualSeverityLevel === "aggressive" && !rotatesResidualIntoNewFlow) {
+    return false;
+  }
+  if (completion.newGap > completion.oldGap + config.maxCompletionOvershootShares) {
+    return false;
+  }
+  return true;
+}
+
+function shouldRetrySameWindowFlowRotation(
+  config: XuanStrategyConfig,
+  entryEvaluation: { decisions: EntryBuyDecision[]; trace: EntryDecisionTrace },
+  inventoryAdjustment: InventoryAdjustmentDecision | undefined,
+  context: { hasProtectedResidualContext: boolean },
+): boolean {
+  if (config.botMode !== "XUAN" || !config.allowControlledOverlap || !inventoryAdjustment?.completion) {
+    return false;
+  }
+  if (!context.hasProtectedResidualContext) {
+    return false;
+  }
+  if (entryEvaluation.decisions.some((entryBuy) => entryBuy.reason === "temporal_single_leg_seed")) {
+    return false;
+  }
+  if (
+    entryEvaluation.trace.overlapRepairOutcome === "overlap_seed" ||
+    entryEvaluation.trace.overlapRepairOutcome === "pair_reentry"
+  ) {
+    return false;
+  }
+
+  const completion = inventoryAdjustment.completion;
+  if (completion.newGap > completion.oldGap + config.maxCompletionOvershootShares) {
+    return false;
+  }
+  return completion.residualSeverityLevel !== "flat";
 }
 
 function projectMergeState(

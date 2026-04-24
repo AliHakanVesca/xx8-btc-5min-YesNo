@@ -61,6 +61,7 @@ describe("stateful bot session helpers", () => {
         "increase_lineage_preservation",
         "allow_more_parallel_flow_when_budget_supports",
         "tune_completion_patience_and_release",
+        "compress_overlap_seed_rhythm",
       ],
     });
     const passBias = deriveRuntimeFlowCalibrationBias({
@@ -71,21 +72,41 @@ describe("stateful bot session helpers", () => {
         "tune_completion_patience_and_release",
       ],
     });
+    const strongOverlapCompressionBias = deriveRuntimeFlowCalibrationBias({
+      status: "WARN",
+      recommendedFocus: ["compress_overlap_seed_rhythm"],
+      averageSideSequenceMismatchOffsetDeltaSec: 24,
+    });
 
     expect(warnBias).toMatchObject({
       lineageFlowCountBonus: 1,
       activeFlowCountBonus: 1,
+      overlapCadenceCompressionBonus: 1,
       completionPatienceFlowCountBonus: 1,
+      semanticRoleFlowCountBonus: 0,
       completionPatienceMultiplier: 1,
       completionReleaseBias: "neutral",
+      semanticRoleAlignmentBias: "neutral",
+      childOrderMicroTimingBias: "neutral",
+      completionRoleReleaseOrderBias: "neutral",
+      openingSeedReleaseBias: "neutral",
+      openingSeedOffsetShiftSec: 0,
     });
     expect(passBias).toMatchObject({
       lineageFlowCountBonus: 0,
       activeFlowCountBonus: 0,
+      overlapCadenceCompressionBonus: 0,
       completionPatienceFlowCountBonus: 0,
+      semanticRoleFlowCountBonus: 0,
       completionPatienceMultiplier: 1,
       completionReleaseBias: "neutral",
+      semanticRoleAlignmentBias: "neutral",
+      childOrderMicroTimingBias: "neutral",
+      completionRoleReleaseOrderBias: "neutral",
+      openingSeedReleaseBias: "neutral",
+      openingSeedOffsetShiftSec: 0,
     });
+    expect(strongOverlapCompressionBias.overlapCadenceCompressionBonus).toBe(2);
 
     const releaseEarlierBias = deriveRuntimeFlowCalibrationBias({
       status: "FAIL",
@@ -93,17 +114,110 @@ describe("stateful bot session helpers", () => {
       completionLatencyDirection: "candidate_late",
       averageCycleCompletionLatencyDeltaSec: 7,
     });
+    const tailDampedReleaseEarlierBias = deriveRuntimeFlowCalibrationBias({
+      status: "WARN",
+      recommendedFocus: ["release_completion_earlier"],
+      completionLatencyDirection: "candidate_late",
+      averageCycleCompletionLatencyDeltaSec: 2,
+      averageCycleCompletionLatencyDeltaP50Sec: 0,
+      averageCycleCompletionLatencyDeltaP75Sec: 6,
+    });
+    const tailDampedTuneBias = deriveRuntimeFlowCalibrationBias({
+      status: "WARN",
+      recommendedFocus: ["tune_completion_patience_and_release"],
+      completionLatencyDirection: "aligned",
+      averageCycleCompletionLatencyDeltaSec: 0,
+      averageCycleCompletionLatencyDeltaP50Sec: 0,
+      averageCycleCompletionLatencyDeltaP75Sec: 4,
+    });
+    const mildlyShiftedTailDampedTuneBias = deriveRuntimeFlowCalibrationBias({
+      status: "WARN",
+      recommendedFocus: ["tune_completion_patience_and_release"],
+      completionLatencyDirection: "aligned",
+      averageCycleCompletionLatencyDeltaSec: 0,
+      averageCycleCompletionLatencyDeltaP50Sec: 1.5,
+      averageCycleCompletionLatencyDeltaP75Sec: 5,
+    });
     const waitLongerBias = deriveRuntimeFlowCalibrationBias({
       status: "FAIL",
       recommendedFocus: ["increase_completion_patience"],
       completionLatencyDirection: "candidate_early",
       averageCycleCompletionLatencyDeltaSec: -7,
     });
+    const coldStartBias = deriveRuntimeFlowCalibrationBias({
+      status: "WARN",
+      recommendedFocus: ["collect_replay_flow_samples"],
+    });
+    const openingEarlierBias = deriveRuntimeFlowCalibrationBias({
+      status: "WARN",
+      recommendedFocus: ["release_opening_seed_earlier"],
+      openingEntryTimingDirection: "candidate_late",
+      averageFirstEntryOffsetDeltaSec: 6,
+    });
+    const openingEarlierMinimumBias = deriveRuntimeFlowCalibrationBias({
+      status: "WARN",
+      recommendedFocus: ["release_opening_seed_earlier"],
+      openingEntryTimingDirection: "candidate_late",
+      averageFirstEntryOffsetDeltaSec: 4,
+    });
+    const maintainOpeningBias = deriveRuntimeFlowCalibrationBias({
+      status: "WARN",
+      recommendedFocus: ["maintain_opening_seed_early"],
+    });
 
-    expect(releaseEarlierBias.completionPatienceMultiplier).toBe(0.45);
+    expect(releaseEarlierBias.completionPatienceMultiplier).toBe(0.25);
     expect(releaseEarlierBias.completionReleaseBias).toBe("earlier");
+    expect(tailDampedReleaseEarlierBias.completionPatienceMultiplier).toBe(0.63);
+    expect(tailDampedReleaseEarlierBias.completionReleaseBias).toBe("earlier");
+    expect(tailDampedTuneBias.completionPatienceMultiplier).toBe(0.63);
+    expect(tailDampedTuneBias.completionReleaseBias).toBe("neutral");
+    expect(mildlyShiftedTailDampedTuneBias.completionPatienceMultiplier).toBe(0.63);
+    expect(mildlyShiftedTailDampedTuneBias.completionReleaseBias).toBe("neutral");
     expect(waitLongerBias.completionPatienceMultiplier).toBe(1.28);
     expect(waitLongerBias.completionReleaseBias).toBe("later");
+    expect(coldStartBias.completionPatienceMultiplier).toBe(0.63);
+    expect(coldStartBias.completionReleaseBias).toBe("earlier");
+    expect(coldStartBias.openingSeedReleaseBias).toBe("earlier");
+    expect(coldStartBias.openingSeedOffsetShiftSec).toBe(6);
+    expect(openingEarlierBias.openingSeedReleaseBias).toBe("earlier");
+    expect(openingEarlierBias.openingSeedOffsetShiftSec).toBe(6);
+    expect(openingEarlierMinimumBias.openingSeedOffsetShiftSec).toBe(6);
+    expect(maintainOpeningBias.openingSeedReleaseBias).toBe("earlier");
+    expect(maintainOpeningBias.openingSeedOffsetShiftSec).toBe(6);
+
+    const semanticRoleBias = deriveRuntimeFlowCalibrationBias({
+      status: "WARN",
+      recommendedFocus: ["align_high_low_role_sequence"],
+    });
+    const preserveRawSideBias = deriveRuntimeFlowCalibrationBias({
+      status: "WARN",
+      recommendedFocus: ["align_high_low_role_sequence", "preserve_raw_side_before_role_override"],
+    });
+    const guardedRoleBias = deriveRuntimeFlowCalibrationBias({
+      status: "WARN",
+      recommendedFocus: ["align_high_low_role_sequence", "guard_role_alignment_against_side_regression"],
+    });
+    const cycleRoleArbitrationBias = deriveRuntimeFlowCalibrationBias({
+      status: "WARN",
+      recommendedFocus: ["align_high_low_role_sequence", "improve_seed_side_rhythm", "improve_child_order_micro_timing"],
+    });
+    expect(semanticRoleBias.semanticRoleFlowCountBonus).toBe(1);
+    expect(semanticRoleBias.semanticRoleAlignmentBias).toBe("align_high_low_role");
+    expect(preserveRawSideBias.semanticRoleAlignmentBias).toBe("preserve_raw_side");
+    expect(guardedRoleBias.semanticRoleAlignmentBias).toBe("preserve_raw_side");
+    expect(cycleRoleArbitrationBias.semanticRoleAlignmentBias).toBe("cycle_role_arbitration");
+    expect(
+      deriveRuntimeFlowCalibrationBias({
+        status: "WARN",
+        recommendedFocus: ["tune_completion_role_release_order"],
+      }).completionRoleReleaseOrderBias,
+    ).toBe("role_order");
+    expect(
+      deriveRuntimeFlowCalibrationBias({
+        status: "WARN",
+        recommendedFocus: ["improve_child_order_micro_timing"],
+      }).childOrderMicroTimingBias,
+    ).toBe("flow_intent");
   });
 
   it("reserves runtime flow budget for active flows, protected residuals, and pending merge windows", () => {

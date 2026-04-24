@@ -36,6 +36,18 @@ interface ProbeStatus {
   details?: string;
 }
 
+type RuntimeChildOrderDispatchReadinessStatus = "PASS" | "WARN" | "SKIPPED" | "UNKNOWN";
+
+interface RuntimeChildOrderDispatchReadiness {
+  status: RuntimeChildOrderDispatchReadinessStatus;
+  reasons: string[];
+  pairSubmitCount: number;
+  flowIntentPairSubmitCount: number;
+  compressedPairSubmitCount: number;
+  averageInterChildDelayMs: number | null;
+  maxInterChildDelayMs: number | null;
+}
+
 interface LiveCheckReport {
   summary: {
     readyForLiveSmall: boolean;
@@ -102,6 +114,11 @@ interface LiveCheckReport {
     severity: "ok" | "warn" | "block";
     reason?: string;
   };
+  validation: {
+    latestReplayStatus?: string;
+    latestReplayTimestamp?: number;
+    runtimeChildOrderDispatch: RuntimeChildOrderDispatchReadiness;
+  };
   recommendedEnv: Record<string, string>;
 }
 
@@ -152,6 +169,56 @@ function extractComparisonFlowSummary(payload: Record<string, unknown> | undefin
     return undefined;
   }
   return summary as ComparisonFlowSummary;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function asNumber(value: unknown): number {
+  return typeof value === "number" ? value : 0;
+}
+
+function asNullableNumber(value: unknown): number | null {
+  return typeof value === "number" ? value : null;
+}
+
+function isRuntimeChildOrderDispatchReadinessStatus(
+  status: unknown,
+): status is RuntimeChildOrderDispatchReadinessStatus {
+  return status === "PASS" || status === "WARN" || status === "SKIPPED" || status === "UNKNOWN";
+}
+
+function extractRuntimeChildOrderDispatchReadiness(
+  payload: Record<string, unknown> | undefined,
+): RuntimeChildOrderDispatchReadiness {
+  const statusCandidate = isRecord(payload?.runtimeChildOrderDispatchStatus)
+    ? payload.runtimeChildOrderDispatchStatus
+    : undefined;
+  const runtimeDataStatus = isRecord(payload?.runtimeDataStatus) ? payload.runtimeDataStatus : undefined;
+  const diagnostics = isRecord(runtimeDataStatus?.diagnostics) ? runtimeDataStatus.diagnostics : undefined;
+  const summaryCandidate =
+    (isRecord(statusCandidate?.summary) ? statusCandidate.summary : undefined) ??
+    (isRecord(payload?.runtimeChildOrderDispatch) ? payload.runtimeChildOrderDispatch : undefined) ??
+    (isRecord(diagnostics?.childOrderDispatch) ? diagnostics.childOrderDispatch : undefined);
+  const reasons = Array.isArray(statusCandidate?.reasons)
+    ? statusCandidate.reasons.filter((reason): reason is string => typeof reason === "string")
+    : [];
+  const status = isRuntimeChildOrderDispatchReadinessStatus(statusCandidate?.status)
+    ? statusCandidate.status
+    : summaryCandidate
+      ? "UNKNOWN"
+      : "UNKNOWN";
+
+  return {
+    status,
+    reasons: status === "UNKNOWN" && reasons.length === 0 ? ["runtime_child_order_dispatch_status_missing"] : reasons,
+    pairSubmitCount: asNumber(summaryCandidate?.pairSubmitCount),
+    flowIntentPairSubmitCount: asNumber(summaryCandidate?.flowIntentPairSubmitCount),
+    compressedPairSubmitCount: asNumber(summaryCandidate?.compressedPairSubmitCount),
+    averageInterChildDelayMs: asNullableNumber(summaryCandidate?.averageInterChildDelayMs),
+    maxInterChildDelayMs: asNullableNumber(summaryCandidate?.maxInterChildDelayMs),
+  };
 }
 
 function recommendedCanaryEnv(): Record<string, string> {
@@ -358,6 +425,9 @@ export async function runLiveCheck(env: AppEnv): Promise<LiveCheckReport> {
   const blockers: string[] = [];
   const warnings: string[] = [];
   const latestReplayValidation = stateStore.latestValidationRun("replay");
+  const runtimeChildOrderDispatchReadiness = extractRuntimeChildOrderDispatchReadiness(
+    latestReplayValidation?.payload,
+  );
 
   try {
     [
@@ -421,6 +491,11 @@ export async function runLiveCheck(env: AppEnv): Promise<LiveCheckReport> {
         }
       } else {
         warnings.push("Replay validation flowSummary icermiyor. Flow-lineage/active-peak alt skorlari icin compare komutunu tekrar calistir.");
+      }
+      if (runtimeChildOrderDispatchReadiness.status === "WARN") {
+        warnings.push(
+          `Runtime child-order dispatch WARN: ${runtimeChildOrderDispatchReadiness.reasons.join(",")}. Live smoke oncesi child-order mikro-zamanlamasi izlenmeli.`,
+        );
       }
     }
   }
@@ -700,6 +775,11 @@ export async function runLiveCheck(env: AppEnv): Promise<LiveCheckReport> {
       ready: merge.ready,
       severity: merge.severity,
       ...(merge.reason ? { reason: merge.reason } : {}),
+    },
+    validation: {
+      ...(latestReplayValidation ? { latestReplayStatus: latestReplayValidation.status } : {}),
+      ...(latestReplayValidation ? { latestReplayTimestamp: latestReplayValidation.timestamp } : {}),
+      runtimeChildOrderDispatch: runtimeChildOrderDispatchReadiness,
     },
     recommendedEnv: recommendedCanaryEnv(),
   };

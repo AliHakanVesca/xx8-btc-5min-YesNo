@@ -344,7 +344,46 @@ describe("xuan replay comparator", () => {
     expect(collapsed.details.flowLineageSimilarity).toBeLessThan(identical.details.flowLineageSimilarity);
     expect(collapsed.breakdown.cycleCompletionLatencyScore).toBeLessThan(1);
     expect(collapsed.details.averageCycleCompletionLatencyDeltaSec).toBeGreaterThan(0);
+    expect(collapsed.details.cycleCompletionLatencyDeltasSec.length).toBeGreaterThan(0);
+    expect(collapsed.details.cycleCompletionLatencyMaxAbsDeltaSec).toBeGreaterThan(0);
     expect(collapsed.score).toBeLessThan(identical.score);
+  });
+
+  it("tracks opening entry timing separately from flow correctness", () => {
+    const reference = buildReference();
+    const delayedCandidate = buildReference({
+      slug: "candidate-market",
+      orderedClipSequence: reference.orderedClipSequence.map((event) => {
+        if (event.kind !== "BUY") {
+          return event;
+        }
+        return {
+          ...event,
+          tOffsetSec: event.tOffsetSec + 6,
+          tOffsetMs: event.tOffsetMs + 6000,
+        };
+      }),
+    });
+
+    const baseline = compareCanonicalReference(reference, { ...reference, slug: "baseline-candidate" });
+    const delayed = compareCanonicalReference(reference, delayedCandidate);
+    const summary = buildComparisonFlowSummary(delayed);
+    const calibration = buildFlowCalibrationSummary([summary]);
+
+    expect(baseline.details.openingEntryTimingSimilarity).toBe(1);
+    expect(delayed.details.referenceFirstEntryOffsetSec).toBe(4);
+    expect(delayed.details.candidateFirstEntryOffsetSec).toBe(10);
+    expect(delayed.details.firstEntryOffsetDeltaSec).toBe(6);
+    expect(delayed.details.openingEntryTimingSimilarity).toBeLessThan(1);
+    expect(delayed.details.childOrderMicroTimingSimilarity).toBeLessThan(1);
+    expect(delayed.details.childOrderMicroTimingMismatchCount).toBeGreaterThan(0);
+    expect(summary.openingEntryTimingSimilarity).toBe(delayed.details.openingEntryTimingSimilarity);
+    expect(summary.childOrderMicroTimingSimilarity).toBe(delayed.details.childOrderMicroTimingSimilarity);
+    expect(calibration.openingEntryTimingDirection).toBe("candidate_late");
+    expect(calibration.averageChildOrderMicroTimingSimilarity).toBeLessThan(1);
+    expect(calibration.recommendedFocus).toContain("release_opening_seed_earlier");
+    expect(calibration.recommendedFocus).toContain("improve_child_order_micro_timing");
+    expect(delayed.score).toBeLessThan(baseline.score);
   });
 
   it("classifies flow summary status and builds calibration focus from recent summaries", () => {
@@ -366,6 +405,7 @@ describe("xuan replay comparator", () => {
     expect(status.reasons).toContain("flow_lineage_similarity_low");
     expect(calibration.sampleCount).toBe(2);
     expect(calibration.status).toBe("WARN");
+    expect(calibration.averageCycleCompletionLatencyDeltaP75Sec).toBeTypeOf("number");
     expect(calibration.recommendedFocus.length).toBeGreaterThan(0);
   });
 
@@ -392,8 +432,45 @@ describe("xuan replay comparator", () => {
     const shifted = compareCanonicalReference(reference, candidate);
 
     expect(shifted.details.sideSequenceMismatchCount).toBeGreaterThan(0);
+    expect(shifted.details.sideSequenceMismatchDetails[0]).toMatchObject({
+      index: 0,
+      referenceSide: "UP",
+      candidateSide: "DOWN",
+      referencePhase: "ENTRY",
+      candidatePhase: "ENTRY",
+      offsetDeltaSec: 0,
+      mismatchSource: expect.stringContaining("E:"),
+    });
     expect(shifted.details.sideSequenceSimilarity).toBeLessThan(1);
     expect(shifted.score).toBeLessThan(baseline.score);
+  });
+
+  it("separates child-order side mismatches from paired flow-intent preservation", () => {
+    const reference = exact1776253500Reference;
+    const candidate: CanonicalReferenceExtract = {
+      ...reference,
+      slug: "candidate-market",
+      buySequence: reference.buySequence.map((side, index) =>
+        index === 4 ? "UP" : index === 5 ? "DOWN" : side,
+      ),
+      orderedClipSequence: reference.orderedClipSequence.map((event) => {
+        if (event.sequenceIndex === 4) {
+          return { ...event, outcome: "UP" };
+        }
+        if (event.sequenceIndex === 5) {
+          return { ...event, outcome: "DOWN" };
+        }
+        return event;
+      }),
+    };
+
+    const comparison = compareCanonicalReference(reference, candidate);
+    const calibration = buildFlowCalibrationSummary([buildComparisonFlowSummary(comparison)]);
+
+    expect(comparison.details.sideSequenceSimilarity).toBeLessThan(1);
+    expect(comparison.details.flowPairSideSetSimilarity).toBe(1);
+    expect(calibration.averageFlowPairSideSetSimilarity).toBe(1);
+    expect(calibration.recommendedFocus).toContain("improve_child_order_micro_timing");
   });
 
   it("penalizes deviations from the exact 1776253500 late cheap-seed to high-low chase path", () => {
@@ -487,6 +564,40 @@ describe("xuan replay comparator", () => {
     expect(shifted.score).toBeLessThan(baseline.score);
   });
 
+  it("fails the exact 1776253500 lifecycle parity gate when BUY, merge, or redeem path drifts", () => {
+    const reference = exact1776253500Reference;
+    const baseline = compareCanonicalReference(reference, { ...reference, slug: "baseline-candidate" }, {
+      requireExactLifecycleParity: true,
+    });
+    const missingBuy: CanonicalReferenceExtract = {
+      ...reference,
+      slug: "missing-buy-candidate",
+      buySequence: reference.buySequence.slice(0, -1),
+      orderedClipSequence: reference.orderedClipSequence.filter((event) => event.sequenceIndex !== 16),
+    };
+    const missingMerge: CanonicalReferenceExtract = {
+      ...reference,
+      slug: "missing-merge-candidate",
+      mergeCount: reference.mergeCount - 1,
+      orderedClipSequence: reference.orderedClipSequence.filter((event) => event.sequenceIndex !== 17),
+    };
+    const missingRedeem: CanonicalReferenceExtract = {
+      ...reference,
+      slug: "missing-redeem-candidate",
+      redeemCount: reference.redeemCount - 1,
+      orderedClipSequence: reference.orderedClipSequence.filter((event) => event.kind !== "REDEEM"),
+    };
+
+    expect(baseline.verdict).toBe("PASS");
+    expect(compareCanonicalReference(reference, missingBuy, { requireExactLifecycleParity: true }).verdict).toBe("FAIL");
+    expect(compareCanonicalReference(reference, missingMerge, { requireExactLifecycleParity: true }).verdict).toBe("FAIL");
+    expect(compareCanonicalReference(reference, missingRedeem, { requireExactLifecycleParity: true }).verdict).toBe("FAIL");
+    expect(compareCanonicalReference(reference, missingRedeem, { requireExactLifecycleParity: true }).details).toMatchObject({
+      exactLifecycleParityRequired: true,
+      exactLifecycleParityBroken: true,
+    });
+  });
+
   it("penalizes deviations from the exact 1776248100 expensive-first to cheap-late completion path", () => {
     const reference = exact1776248100Reference;
     const baseline = compareCanonicalReference(reference, {
@@ -525,8 +636,56 @@ describe("xuan replay comparator", () => {
     const shifted = compareCanonicalReference(reference, candidate);
 
     expect(shifted.details.sideSequenceMismatchCount).toBeGreaterThan(0);
+    expect(shifted.details.semanticRoleSequenceMismatchCount).toBeGreaterThan(0);
+    expect(shifted.details.semanticRoleSequenceMismatchDetails[0]).toMatchObject({
+      index: 10,
+      referenceRole: "OVERLAP_HIGH",
+      candidateRole: "OVERLAP_LOW",
+      referenceSide: "DOWN",
+      candidateSide: "UP",
+    });
+    expect(shifted.details.semanticRoleSequenceSimilarity).toBeLessThan(
+      baseline.details.semanticRoleSequenceSimilarity,
+    );
     expect(shifted.details.eventQtySimilarity).toBeLessThan(baseline.details.eventQtySimilarity);
     expect(shifted.score).toBeLessThan(baseline.score);
+  });
+
+  it("flags semantic role repair when side preservation is already strong", () => {
+    const reference = exact1776248100Reference;
+    const candidate: CanonicalReferenceExtract = {
+      ...reference,
+      slug: "candidate-market",
+      orderedClipSequence: reference.orderedClipSequence.map((event) => {
+        if (event.sequenceIndex === 10) {
+          return {
+            ...event,
+            price: 0.14,
+            internalLabel: "OVERLAP",
+          };
+        }
+        if (event.sequenceIndex === 11) {
+          return {
+            ...event,
+            price: 0.67,
+            internalLabel: "COMPLETION",
+          };
+        }
+        return event;
+      }),
+    };
+
+    const comparison = compareCanonicalReference(reference, candidate);
+    const calibration = buildFlowCalibrationSummary([buildComparisonFlowSummary(comparison)]);
+
+    expect(comparison.details.sideSequenceSimilarity).toBe(1);
+    expect(comparison.details.semanticRoleSequenceSimilarity).toBeLessThan(1);
+    expect(comparison.details.completionReleaseRoleSimilarity).toBeLessThan(1);
+    expect(calibration.roleSideTradeoffRisk).toBe("side_preservation_blocks_role_alignment");
+    expect(calibration.averageCompletionReleaseRoleSimilarity).toBeLessThan(1);
+    expect(calibration.recommendedFocus).toContain("guard_role_alignment_against_side_regression");
+    expect(calibration.recommendedFocus).toContain("preserve_raw_side_before_role_override");
+    expect(calibration.recommendedFocus).toContain("tune_completion_role_release_order");
   });
 
   it("fails the exact 1776928800 runtime incident against a healthier target footprint", () => {

@@ -57,6 +57,7 @@ import type { FlowPressureBudgetState } from "../strategy/xuan5m/modePolicy.js";
 import { resolveBundledMergeClusterPrior } from "../analytics/xuanExactReference.js";
 import {
   buildFlowCalibrationSummary,
+  XUAN_FLOW_CALIBRATION_VERSION,
   type ComparisonFlowSummary,
   type FlowCalibrationSummary,
 } from "../analytics/xuanReplayComparator.js";
@@ -289,14 +290,56 @@ export interface RuntimeFlowBudgetState extends FlowPressureBudgetState {
 export interface RuntimeFlowCalibrationBias {
   lineageFlowCountBonus: number;
   activeFlowCountBonus: number;
+  semanticRoleFlowCountBonus: number;
   completionPatienceFlowCountBonus: number;
   completionPatienceMultiplier: number;
   completionReleaseBias: "neutral" | "earlier" | "later";
+  semanticRoleAlignmentBias: "neutral" | "align_high_low_role" | "preserve_raw_side" | "cycle_role_arbitration";
+  childOrderMicroTimingBias: "neutral" | "flow_intent";
+  completionRoleReleaseOrderBias: "neutral" | "role_order";
+  openingSeedReleaseBias: "neutral" | "earlier" | "later";
+  openingSeedOffsetShiftSec: number;
+  overlapCadenceCompressionBonus: number;
+  childOrderDispatchDelayCapMs?: number | undefined;
   recommendedFocus: string[];
 }
 
+interface RuntimeChildOrderDispatchSummary {
+  pairSubmitCount: number;
+  sequentialPairSubmitCount: number;
+  flowIntentPairSubmitCount: number;
+  compressedPairSubmitCount: number;
+  averageInterChildDelayMs: number | null;
+  maxInterChildDelayMs: number | null;
+}
+
+const MIN_RUNTIME_CHILD_ORDER_FLOW_INTENT_SAMPLES = 2;
+
 function extractFlowSummariesFromValidationRuns(runs: ValidationRunRecord[]): ComparisonFlowSummary[] {
+  const acceptedByFootprint = new Map<string, number>();
   return runs
+    .filter(
+      (run) => {
+        if (
+          run.payload?.flowCalibrationVersion !== XUAN_FLOW_CALIBRATION_VERSION ||
+          run.payload?.flowCalibrationAccepted === false ||
+          (run.payload?.flowStatus as { status?: unknown } | undefined)?.status === "FAIL"
+        ) {
+          return false;
+        }
+        const footprintKey = [
+          String(run.payload?.command ?? "unknown"),
+          String(run.payload?.variant ?? "runtime"),
+          String(run.payload?.referenceSlug ?? run.payload?.marketSlug ?? "unknown"),
+        ].join(":");
+        const acceptedCount = acceptedByFootprint.get(footprintKey) ?? 0;
+        if (acceptedCount >= 3) {
+          return false;
+        }
+        acceptedByFootprint.set(footprintKey, acceptedCount + 1);
+        return true;
+      },
+    )
     .map((run) => run.payload?.flowSummary)
     .filter((summary): summary is ComparisonFlowSummary => {
       if (!summary || typeof summary !== "object") {
@@ -311,40 +354,198 @@ function extractFlowSummariesFromValidationRuns(runs: ValidationRunRecord[]): Co
     });
 }
 
+function extractRuntimeChildOrderDispatchSummaries(runs: ValidationRunRecord[]): RuntimeChildOrderDispatchSummary[] {
+  const acceptedByFootprint = new Map<string, number>();
+  return runs
+    .filter((run) => run.payload?.flowCalibrationVersion === XUAN_FLOW_CALIBRATION_VERSION)
+    .flatMap((run) => {
+      const payload = run.payload ?? {};
+      const footprintKey = [
+        String(payload.command ?? "unknown"),
+        String(payload.referenceSlug ?? payload.marketSlug ?? "unknown"),
+      ].join(":");
+      const acceptedCount = acceptedByFootprint.get(footprintKey) ?? 0;
+      if (acceptedCount >= 3) {
+        return [];
+      }
+      const candidate =
+        payload.runtimeChildOrderDispatch ??
+        (payload.runtimeDataStatus as { diagnostics?: { childOrderDispatch?: unknown } } | undefined)?.diagnostics
+          ?.childOrderDispatch;
+      if (!candidate || typeof candidate !== "object") {
+        return [];
+      }
+      const summary = candidate as Partial<RuntimeChildOrderDispatchSummary>;
+      if (
+        typeof summary.pairSubmitCount !== "number" ||
+        typeof summary.sequentialPairSubmitCount !== "number" ||
+        typeof summary.flowIntentPairSubmitCount !== "number" ||
+        typeof summary.compressedPairSubmitCount !== "number"
+      ) {
+        return [];
+      }
+      acceptedByFootprint.set(footprintKey, acceptedCount + 1);
+      return [
+        {
+          pairSubmitCount: summary.pairSubmitCount,
+          sequentialPairSubmitCount: summary.sequentialPairSubmitCount,
+          flowIntentPairSubmitCount: summary.flowIntentPairSubmitCount,
+          compressedPairSubmitCount: summary.compressedPairSubmitCount,
+          averageInterChildDelayMs:
+            typeof summary.averageInterChildDelayMs === "number" ? summary.averageInterChildDelayMs : null,
+          maxInterChildDelayMs: typeof summary.maxInterChildDelayMs === "number" ? summary.maxInterChildDelayMs : null,
+        },
+      ];
+    });
+}
+
+function deriveRuntimeChildOrderDispatchDelayCapMs(summaries: RuntimeChildOrderDispatchSummary[]): number | undefined {
+  const flowIntentSummaries = summaries.filter((summary) => summary.flowIntentPairSubmitCount > 0);
+  const flowIntentPairSubmitCount = flowIntentSummaries.reduce(
+    (total, summary) => total + summary.flowIntentPairSubmitCount,
+    0,
+  );
+  if (flowIntentPairSubmitCount < MIN_RUNTIME_CHILD_ORDER_FLOW_INTENT_SAMPLES) {
+    return undefined;
+  }
+  const hasUncompressedFlowIntent = flowIntentSummaries.some(
+    (summary) => summary.compressedPairSubmitCount < summary.flowIntentPairSubmitCount,
+  );
+  const maxObservedDelayMs = Math.max(
+    ...flowIntentSummaries.map((summary) => summary.maxInterChildDelayMs ?? 0),
+  );
+  if (hasUncompressedFlowIntent || maxObservedDelayMs > 40) {
+    return 40;
+  }
+  return undefined;
+}
+
 export function deriveRuntimeFlowCalibrationBias(
   calibration: Pick<FlowCalibrationSummary, "recommendedFocus" | "status"> &
-    Partial<Pick<FlowCalibrationSummary, "completionLatencyDirection" | "averageCycleCompletionLatencyDeltaSec">>,
+    Partial<
+      Pick<
+        FlowCalibrationSummary,
+        | "completionLatencyDirection"
+        | "openingEntryTimingDirection"
+        | "averageFirstEntryOffsetDeltaSec"
+        | "averageSideSequenceMismatchOffsetDeltaSec"
+        | "averageChildOrderGlobalAbsDelayP75Sec"
+        | "averageChildOrderMicroTimingMaxAbsDeltaSec"
+        | "averageChildOrderSideInversionCount"
+        | "averageCycleCompletionLatencyDeltaSec"
+        | "averageCycleCompletionLatencyDeltaP50Sec"
+        | "averageCycleCompletionLatencyDeltaP75Sec"
+      >
+    >,
 ): RuntimeFlowCalibrationBias {
   const focus = new Set(calibration.recommendedFocus);
   const enabled = calibration.status === "WARN" || calibration.status === "FAIL";
+  const coldStartCalibration = enabled && focus.has("collect_replay_flow_samples");
+  const maintainEarlyOpening = enabled && focus.has("maintain_opening_seed_early");
   const releaseEarlier = enabled && (focus.has("release_completion_earlier") || calibration.completionLatencyDirection === "candidate_late");
   const waitLonger = enabled && (focus.has("increase_completion_patience") || calibration.completionLatencyDirection === "candidate_early");
-  const latencyDeltaSec = Math.abs(calibration.averageCycleCompletionLatencyDeltaSec ?? 0);
-  const completionPatienceMultiplier = releaseEarlier
-    ? latencyDeltaSec >= 6
-      ? 0.45
-      : latencyDeltaSec >= 3
-        ? 0.65
-        : 0.78
-    : waitLonger
-      ? latencyDeltaSec >= 6
-        ? 1.28
-        : latencyDeltaSec >= 3
-          ? 1.2
-          : 1.12
-      : 1;
+  const tuneCompletionTail =
+    enabled &&
+    focus.has("tune_completion_patience_and_release") &&
+    calibration.averageCycleCompletionLatencyDeltaP50Sec !== undefined &&
+    Math.abs(calibration.averageCycleCompletionLatencyDeltaP50Sec) <= 2;
+  const alignHighLowRole = enabled && focus.has("align_high_low_role_sequence");
+  const tuneCompletionRoleReleaseOrder = enabled && focus.has("tune_completion_role_release_order");
+  const improveChildOrderMicroTiming =
+    enabled &&
+    (focus.has("improve_child_order_micro_timing") ||
+      focus.has("compress_child_order_timing") ||
+      focus.has("stabilize_child_order_side_rhythm") ||
+      tuneCompletionRoleReleaseOrder);
+  const preserveRawSide =
+    enabled &&
+    (focus.has("preserve_raw_side_before_role_override") ||
+      focus.has("guard_role_alignment_against_side_regression") ||
+      focus.has("improve_seed_side_rhythm"));
+  const cycleRoleArbitration =
+    (alignHighLowRole || tuneCompletionRoleReleaseOrder) && preserveRawSide && improveChildOrderMicroTiming;
+  const releaseOpeningEarlier =
+    enabled &&
+    (focus.has("release_opening_seed_earlier") ||
+      (calibration.openingEntryTimingDirection === "candidate_late" &&
+        Math.abs(calibration.averageFirstEntryOffsetDeltaSec ?? 0) >= 4));
+  const delayOpeningRelease =
+    enabled &&
+    (focus.has("delay_opening_seed_release") ||
+      (calibration.openingEntryTimingDirection === "candidate_early" &&
+        Math.abs(calibration.averageFirstEntryOffsetDeltaSec ?? 0) >= 4));
+  const latencyDeltaSec = Math.abs(
+    calibration.averageCycleCompletionLatencyDeltaP75Sec ?? calibration.averageCycleCompletionLatencyDeltaSec ?? 0,
+  );
+  const openingOffsetDeltaSec = Math.abs(calibration.averageFirstEntryOffsetDeltaSec ?? 0);
+  const sideMismatchOffsetDeltaSec = Math.abs(calibration.averageSideSequenceMismatchOffsetDeltaSec ?? 0);
+  const childOrderCadenceDeltaSec = Math.max(
+    calibration.averageChildOrderGlobalAbsDelayP75Sec ?? 0,
+    (calibration.averageChildOrderMicroTimingMaxAbsDeltaSec ?? 0) * 0.55,
+  );
+  const childOrderSideInversionPressure = (calibration.averageChildOrderSideInversionCount ?? 0) > 0 ? 1 : 0;
+  const openingSeedOffsetShiftSec = coldStartCalibration || maintainEarlyOpening
+    ? 6
+    : releaseOpeningEarlier
+      ? Math.min(8, Math.max(6, Math.round(openingOffsetDeltaSec)))
+      : delayOpeningRelease
+        ? -Math.min(8, Math.max(2, Math.round(openingOffsetDeltaSec)))
+        : 0;
+  let completionPatienceMultiplier = 1;
+  if (coldStartCalibration || (tuneCompletionTail && latencyDeltaSec >= 4)) {
+    completionPatienceMultiplier = 0.63;
+  } else if (releaseEarlier) {
+    const tailDampedRelease =
+      calibration.averageCycleCompletionLatencyDeltaP50Sec !== undefined &&
+      Math.abs(calibration.averageCycleCompletionLatencyDeltaP50Sec) <= 2 &&
+      latencyDeltaSec >= 4;
+    completionPatienceMultiplier = tailDampedRelease
+      ? 0.63
+      : latencyDeltaSec >= 6
+        ? 0.25
+        : latencyDeltaSec >= 2
+          ? 0.55
+          : 0.75;
+  } else if (waitLonger) {
+    completionPatienceMultiplier = latencyDeltaSec >= 6 ? 1.28 : latencyDeltaSec >= 3 ? 1.2 : 1.12;
+  }
   return {
-    lineageFlowCountBonus: enabled && focus.has("increase_lineage_preservation") ? 1 : 0,
+    lineageFlowCountBonus:
+      enabled && focus.has("increase_lineage_preservation") ? 1 + childOrderSideInversionPressure : childOrderSideInversionPressure,
     activeFlowCountBonus: enabled && focus.has("allow_more_parallel_flow_when_budget_supports") ? 1 : 0,
+    semanticRoleFlowCountBonus: alignHighLowRole && !cycleRoleArbitration ? 1 : 0,
+    overlapCadenceCompressionBonus:
+      enabled && (focus.has("compress_overlap_seed_rhythm") || improveChildOrderMicroTiming)
+        ? Math.max(sideMismatchOffsetDeltaSec, childOrderCadenceDeltaSec) >= 20
+          ? 2
+          : 1
+        : 0,
     completionPatienceFlowCountBonus:
       enabled &&
       (focus.has("tune_completion_patience_and_release") ||
         focus.has("release_completion_earlier") ||
-        focus.has("increase_completion_patience"))
+        focus.has("increase_completion_patience") ||
+        coldStartCalibration)
         ? 1
         : 0,
     completionPatienceMultiplier,
-    completionReleaseBias: releaseEarlier ? "earlier" : waitLonger ? "later" : "neutral",
+    completionReleaseBias: coldStartCalibration || releaseEarlier ? "earlier" : waitLonger ? "later" : "neutral",
+    semanticRoleAlignmentBias: cycleRoleArbitration
+      ? "cycle_role_arbitration"
+      : preserveRawSide
+      ? "preserve_raw_side"
+      : alignHighLowRole
+        ? "align_high_low_role"
+        : "neutral",
+    childOrderMicroTimingBias: improveChildOrderMicroTiming ? "flow_intent" : "neutral",
+    completionRoleReleaseOrderBias: tuneCompletionRoleReleaseOrder ? "role_order" : "neutral",
+    openingSeedReleaseBias:
+      coldStartCalibration || maintainEarlyOpening || releaseOpeningEarlier
+        ? "earlier"
+        : delayOpeningRelease
+          ? "later"
+          : "neutral",
+    openingSeedOffsetShiftSec,
     recommendedFocus: calibration.recommendedFocus,
   };
 }
@@ -1218,6 +1419,23 @@ function buildDecisionTraceEvent(
           !["repair", "blocked"].includes(decision.trace.entry.overlapRepairOutcome ?? "")
         ? `favor_residual_repair_but_${decision.trace.entry.overlapRepairOutcome ?? decision.completion?.arbitrationOutcome ?? decision.unwind?.arbitrationOutcome ?? "idle"}`
         : null;
+  const flowBudgetSummary = context.runtimeFlowBudgetState
+    ? `${context.runtimeFlowBudgetState.remainingBudget.toFixed(3)}/${context.runtimeFlowBudgetState.budget.toFixed(3)}`
+    : "none";
+  const stickyCarryActive = Boolean(
+    context.arbitrationCarryRecommendation ?? context.arbitrationCarryPreferredSeedSide,
+  );
+  const stickyCarrySummary = stickyCarryActive
+    ? [
+        context.arbitrationCarryRecommendation ?? "carry",
+        context.arbitrationCarryPreferredSeedSide ?? "any_side",
+      ].join(":")
+    : "off";
+  const flowBehaviorSummary = [
+    `flowBudget=${flowBudgetSummary}`,
+    `overlapRepairArbitration=${decision.trace.entry.overlapRepairArbitration ?? "none"}`,
+    `stickyCarry=${stickyCarrySummary}`,
+  ].join(" ");
   return {
     eventSeq: context.eventSeq,
     decisionLatencyMs: context.decisionLatencyMs,
@@ -1239,6 +1457,10 @@ function buildDecisionTraceEvent(
     pairCap: decision.trace.pairCap,
     pairTakerCost: decision.trace.pairTakerCost,
     selectedMode: decision.trace.selectedMode ?? null,
+    protectedResidualContext: decision.trace.protectedResidualContext,
+    flowRotationRetryAttempted: decision.trace.flowRotationRetryAttempted,
+    flowRotationRetrySelected: decision.trace.flowRotationRetrySelected,
+    sameWindowCompletionAndOverlap: decision.trace.sameWindowCompletionAndOverlap,
     fairValueStatus: decision.trace.fairValue?.status ?? null,
     fairValuePriceToBeat: decision.trace.fairValue?.priceToBeat ?? null,
     fairValueLivePrice: decision.trace.fairValue?.livePrice ?? null,
@@ -1255,6 +1477,7 @@ function buildDecisionTraceEvent(
     entryMode: decision.trace.entry.mode,
     entrySkipReason: decision.trace.entry.skipReason ?? null,
     residualSeverityLevel: decision.trace.entry.residualSeverityLevel ?? null,
+    flowBehaviorSummary,
     overlapRepairArbitration: decision.trace.entry.overlapRepairArbitration ?? null,
     overlapRepairReason: decision.trace.entry.overlapRepairReason ?? null,
     overlapRepairOutcome: decision.trace.entry.overlapRepairOutcome ?? null,
@@ -1278,6 +1501,16 @@ function buildDecisionTraceEvent(
     flowBudgetCarryConfidence: context.runtimeFlowBudgetState?.carryFlowConfidence ?? null,
     flowCalibrationReleaseBias: context.runtimeFlowCalibrationBias?.completionReleaseBias ?? null,
     flowCalibrationPatienceMultiplier: context.runtimeFlowCalibrationBias?.completionPatienceMultiplier ?? null,
+    flowCalibrationSemanticRoleAlignmentBias:
+      context.runtimeFlowCalibrationBias?.semanticRoleAlignmentBias ?? null,
+    flowCalibrationChildOrderMicroTimingBias:
+      context.runtimeFlowCalibrationBias?.childOrderMicroTimingBias ?? null,
+    flowCalibrationCompletionRoleReleaseOrderBias:
+      context.runtimeFlowCalibrationBias?.completionRoleReleaseOrderBias ?? null,
+    flowCalibrationSemanticRoleFlowCountBonus:
+      context.runtimeFlowCalibrationBias?.semanticRoleFlowCountBonus ?? null,
+    flowCalibrationOverlapCadenceCompressionBonus:
+      context.runtimeFlowCalibrationBias?.overlapCadenceCompressionBonus ?? null,
     flowCalibrationRecommendedFocus: context.runtimeFlowCalibrationBias?.recommendedFocus ?? [],
     entryArbitrationActionDelta,
     gatedByRisk: decision.trace.entry.gatedByRisk ?? false,
@@ -1340,6 +1573,10 @@ function decisionTraceSignature(decision: ReturnType<Xuan5mBot["evaluateTick"]>)
     decision.trace.fairValue?.status ?? "",
     decision.trace.fairValue?.fairUp?.toFixed(4) ?? "",
     decision.trace.fairValue?.fairDown?.toFixed(4) ?? "",
+    decision.trace.protectedResidualContext ? "protected_residual" : "no_protected_residual",
+    decision.trace.flowRotationRetryAttempted ? "flow_retry_attempted" : "flow_retry_not_attempted",
+    decision.trace.flowRotationRetrySelected ? "flow_retry_selected" : "flow_retry_not_selected",
+    decision.trace.sameWindowCompletionAndOverlap ? "same_window_completion_overlap" : "single_action_window",
     entry.mode,
     entry.skipReason ?? "",
     entry.residualSeverityLevel ?? "",
@@ -1889,8 +2126,9 @@ async function executePairOrderPlan(args: {
   }
 
   const maxBatchCount = Math.max(args.orderPlanBySide.UP.length, args.orderPlanBySide.DOWN.length);
+  const sideOrder = pairExecutionSideOrder(args.orderedEntries);
   for (let batchIndex = 0; batchIndex < maxBatchCount; batchIndex += 1) {
-    const batch = (["UP", "DOWN"] as OutcomeSide[])
+    const batch = sideOrder
       .map((side) => {
         const order = args.orderPlanBySide[side][batchIndex];
         return order ? { side, order } : undefined;
@@ -1921,6 +2159,38 @@ async function executePairOrderPlan(args: {
   }
 
   return executedBySide;
+}
+
+function pairExecutionSideOrder(orderedEntries: EntryBuyDecision[]): OutcomeSide[] {
+  const sides = orderedEntries
+    .map((entry) => entry.side)
+    .filter((side, index, all): side is OutcomeSide => all.indexOf(side) === index);
+  return sides.length > 0 ? sides : ["UP", "DOWN"];
+}
+
+function orderPairEntriesForPublicFootprint(args: {
+  config: Pick<XuanStrategyConfig, "botMode" | "xuanCloneMode">;
+  state: Pick<XuanMarketState, "upShares" | "downShares">;
+  group: Pick<PairOrderGroup, "selectedMode">;
+  groupedEntries: EntryBuyDecision[];
+  controlledOverlapActive: boolean;
+  missingSide: OutcomeSide;
+}): EntryBuyDecision[] {
+  if (args.group.selectedMode === "PAIRGROUP_COVERED_SEED") {
+    return args.groupedEntries;
+  }
+  const shouldPrioritizeSide =
+    args.controlledOverlapActive ||
+    (args.config.botMode === "XUAN" &&
+      args.config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
+      Math.abs(args.state.upShares - args.state.downShares) > 1e-6);
+  if (!shouldPrioritizeSide) {
+    return args.groupedEntries;
+  }
+  return [...args.groupedEntries].sort((left, right) => {
+    if (left.side === right.side) return 0;
+    return left.side === args.missingSide ? -1 : 1;
+  });
 }
 
 async function logRejectedOrder(args: {
@@ -2143,10 +2413,16 @@ export async function runStatefulBotSession(
   let latestFairValueSnapshot: FairValueSnapshot | undefined;
   const btcPriceFeed = new BtcPriceFeed();
   const fairValueRuntime = new MarketFairValueRuntime(config, market, stateStore, btcPriceFeed);
+  const runtimeValidationRuns = stateStore.recentValidationRuns("replay", 12);
   const runtimeFlowCalibration = buildFlowCalibrationSummary(
-    extractFlowSummariesFromValidationRuns(stateStore.recentValidationRuns("replay", 12)),
+    extractFlowSummariesFromValidationRuns(runtimeValidationRuns),
   );
-  const runtimeFlowCalibrationBias = deriveRuntimeFlowCalibrationBias(runtimeFlowCalibration);
+  const runtimeFlowCalibrationBias = {
+    ...deriveRuntimeFlowCalibrationBias(runtimeFlowCalibration),
+    childOrderDispatchDelayCapMs: deriveRuntimeChildOrderDispatchDelayCapMs(
+      extractRuntimeChildOrderDispatchSummaries(runtimeValidationRuns),
+    ),
+  };
   const persistedSafeHalt = stateStore.loadSafeHalt();
   if (persistedSafeHalt.active && config.requireManualResumeConfirm) {
     stateStore.close();
@@ -3252,7 +3528,9 @@ export async function runStatefulBotSession(
         const calibratedMergeRecentSeedFlowCount =
           mergeRecentSeedFlowCount +
           runtimeFlowCalibrationBias.lineageFlowCountBonus +
-          runtimeFlowCalibrationBias.completionPatienceFlowCountBonus;
+          runtimeFlowCalibrationBias.semanticRoleFlowCountBonus +
+          runtimeFlowCalibrationBias.completionPatienceFlowCountBonus +
+          runtimeFlowCalibrationBias.overlapCadenceCompressionBonus;
         const calibratedMergeActiveIndependentFlowCount =
           mergeActiveIndependentFlowCount + runtimeFlowCalibrationBias.activeFlowCountBonus;
         const mergeResidualBehaviorState = resolveResidualBehaviorState({
@@ -3523,7 +3801,9 @@ export async function runStatefulBotSession(
       const calibratedRecentSeedFlowCount =
         recentSeedFlowCount +
         runtimeFlowCalibrationBias.lineageFlowCountBonus +
-        runtimeFlowCalibrationBias.completionPatienceFlowCountBonus;
+        runtimeFlowCalibrationBias.semanticRoleFlowCountBonus +
+        runtimeFlowCalibrationBias.completionPatienceFlowCountBonus +
+        runtimeFlowCalibrationBias.overlapCadenceCompressionBonus;
       const calibratedActiveIndependentFlowCount =
         activeIndependentFlowCount + runtimeFlowCalibrationBias.activeFlowCountBonus;
       const carryPersistenceKeyBeforeTick = arbitrationCarryPersistenceKey(arbitrationCarry);
@@ -3758,6 +4038,10 @@ export async function runStatefulBotSession(
         recentSeedFlowCount: calibratedRecentSeedFlowCount,
         activeIndependentFlowCount: calibratedActiveIndependentFlowCount,
         completionPatienceMultiplier: runtimeFlowCalibrationBias.completionPatienceMultiplier,
+        openingSeedReleaseBias: runtimeFlowCalibrationBias.openingSeedReleaseBias,
+        semanticRoleAlignmentBias: runtimeFlowCalibrationBias.semanticRoleAlignmentBias,
+        childOrderMicroTimingBias: runtimeFlowCalibrationBias.childOrderMicroTimingBias,
+        completionRoleReleaseOrderBias: runtimeFlowCalibrationBias.completionRoleReleaseOrderBias,
         matchedInventoryQuality: unlockedMatchedInventoryQuality,
         flowPressureState: runtimeFlowBudgetState,
         arbitrationCarry:
@@ -3978,6 +4262,135 @@ export async function runStatefulBotSession(
         continue;
       }
 
+      let completionSubmittedThisTick = false;
+      const submitDecisionCompletion = async (submitContext: "completion_only" | "same_window_completion_first") => {
+        if (!decision.completion || completionSubmittedThisTick) {
+          return false;
+        }
+        completionSubmittedThisTick = true;
+        assertClassifiedBuyMode(decision.completion.mode, config);
+        const liveOrder = withAvailableUsdcBalance(decision.completion.order, cachedUsdcBalance);
+        const result = await completionManager.complete(liveOrder);
+        rememberSubmittedPrices(
+          submittedPrices,
+          market,
+          [
+            {
+              ...decision.completion.order,
+              side: decision.completion.order.side,
+              mode: decision.completion.mode,
+              orderId: result.orderId,
+              expectedShares: expectedSharesForSubmission(liveOrder.shareTarget, result),
+            },
+          ],
+          nowTs,
+        );
+        const accepted = isOrderResultAccepted(result);
+        if (accepted) {
+          applyRuntimeFlowBudgetAction("completion_submit", {
+            quantityShares: runtimeFlowBudgetReleaseQuantityForResidualChange({
+              requestedShares: decision.completion.missingShares,
+              oldGap: decision.completion.oldGap,
+              newGap: decision.completion.newGap,
+            }),
+            lineage: currentRuntimeFlowLineage(decision.completion.sideToBuy),
+          });
+          state = reserveNegativeEdgeBudget(state, decision.completion.negativeEdgeUsdc, "completion");
+          persistDailyBudget(state);
+          state = updateSeedSubmissionState(state, decision.completion.mode, decision.completion.sideToBuy);
+          persistMarketState(submitContext === "same_window_completion_first" ? "same_window_completion_first" : undefined);
+        } else {
+          await logRejectedOrder({
+            traceLogger,
+            phase: "completion",
+            mode: decision.completion.mode,
+            side: decision.completion.sideToBuy,
+            size: decision.completion.missingShares,
+            result,
+            order: liveOrder,
+            negativeEdgeUsdc: decision.completion.negativeEdgeUsdc,
+          });
+        }
+        completionSubmitCount += 1;
+        actionCooldownUntil = Date.now() + config.reentryDelayMs;
+        pushEvent(events, {
+          timestamp: nowTs,
+          type: "completion_submit",
+          outcome: decision.completion.sideToBuy,
+          mode: decision.completion.mode,
+          size: decision.completion.missingShares,
+          price: liveOrder.price,
+          shareTarget: liveOrder.shareTarget ?? null,
+          spendAmount: liveOrder.amount,
+          costWithFees: decision.completion.costWithFees,
+          capMode: decision.completion.capMode,
+          negativeEdgeUsdc: decision.completion.negativeEdgeUsdc,
+          result: summarizeOrderResult(result),
+          submitContext,
+        });
+        await traceLogger.write("orders", {
+          eventType: "completion_submit",
+          normalizedMode: `COMPLETION_${decision.completion.sideToBuy}`,
+          outcome: decision.completion.sideToBuy,
+          size: decision.completion.missingShares,
+          price: liveOrder.price ?? null,
+          shareTarget: liveOrder.shareTarget ?? null,
+          spendAmount: liveOrder.amount,
+          capMode: decision.completion.capMode,
+          negativeEdgeUsdc: decision.completion.negativeEdgeUsdc,
+          orderId: result.orderId,
+          orderStatus: result.status,
+          orderAccepted: accepted,
+          orderResult: summarizeOrderResult(result),
+          oldGap: decision.completion.oldGap,
+          newGapEstimate: decision.completion.newGap,
+          wouldIncreaseImbalance:
+            decision.completion.newGap > decision.completion.oldGap + config.maxCompletionOvershootShares,
+          requestedQty: decision.completion.missingShares,
+          finalQty: decision.completion.missingShares,
+          missingQty: Math.abs(state.upShares - state.downShares),
+          residualOppositeAveragePrice: decision.completion.oppositeAveragePrice,
+          missingSideAveragePrice: decision.completion.missingSideAveragePrice,
+          effectiveCompletionCost: decision.completion.costWithFees,
+          highLowMismatch: decision.completion.highLowMismatch,
+          capUsed: decision.completion.capMode,
+          rejectReason: accepted ? null : "completion_rejected",
+          sameWindowCompletionFirst: submitContext === "same_window_completion_first",
+          correlationId: result.orderId,
+        });
+        emitLiveMirror("completion_submit", {
+          marketSlug: market.slug,
+          normalizedMode: `COMPLETION_${decision.completion.sideToBuy}`,
+          outcome: decision.completion.sideToBuy,
+          size: decision.completion.missingShares,
+          price: liveOrder.price ?? null,
+          shareTarget: liveOrder.shareTarget ?? null,
+          spendAmount: liveOrder.amount,
+          capMode: decision.completion.capMode,
+          negativeEdgeUsdc: decision.completion.negativeEdgeUsdc,
+          orderId: result.orderId ?? null,
+          orderStatus: result.status,
+          orderAccepted: accepted,
+          oldGap: decision.completion.oldGap,
+          newGapEstimate: decision.completion.newGap,
+          missingQty: Math.abs(state.upShares - state.downShares),
+          residualOppositeAveragePrice: decision.completion.oppositeAveragePrice,
+          missingSideAveragePrice: decision.completion.missingSideAveragePrice,
+          effectiveCompletionCost: decision.completion.costWithFees,
+          highLowMismatch: decision.completion.highLowMismatch,
+          sameWindowCompletionFirst: submitContext === "same_window_completion_first",
+          rejectReason: accepted ? null : "completion_rejected",
+        });
+        return accepted;
+      };
+      const sameWindowCompletionFirst =
+        Boolean(decision.completion) &&
+        decision.entryBuys.length > 0 &&
+        decision.trace.entry.overlapRepairOutcome === "overlap_seed";
+      if (sameWindowCompletionFirst) {
+        await submitDecisionCompletion("same_window_completion_first");
+      }
+
       if (decision.entryBuys.length > 0) {
         const submittedAtTs = nowTs;
         const submittedAtMs = Date.now();
@@ -4016,15 +4429,14 @@ export async function runStatefulBotSession(
           const missingSide: OutcomeSide = state.upShares > state.downShares ? "DOWN" : "UP";
           const sequentialPairExecutionActive =
             controlledOverlapActive || group.selectedMode === "PAIRGROUP_COVERED_SEED";
-          const orderedEntries =
-            group.selectedMode === "PAIRGROUP_COVERED_SEED"
-              ? groupedEntries
-              : controlledOverlapActive
-                ? [...groupedEntries].sort((left, right) => {
-                    if (left.side === right.side) return 0;
-                    return left.side === missingSide ? -1 : 1;
-                  })
-                : groupedEntries;
+          const orderedEntries = orderPairEntriesForPublicFootprint({
+            config,
+            state,
+            group,
+            groupedEntries,
+            controlledOverlapActive,
+            missingSide,
+          });
           const groupedEntryBySide = {
             UP: groupedEntries.find((entryBuy) => entryBuy.side === "UP")!,
             DOWN: groupedEntries.find((entryBuy) => entryBuy.side === "DOWN")!,
@@ -4036,6 +4448,11 @@ export async function runStatefulBotSession(
             minOrderSize: state.market.minOrderSize,
             cachedUsdcBalance,
           });
+          const pairChildOrderDelayMs =
+            runtimeFlowCalibrationBias.childOrderMicroTimingBias === "flow_intent" ||
+            decision.trace.entry.childOrderReason === "flow_intent"
+              ? Math.min(config.cloneChildOrderDelayMs, runtimeFlowCalibrationBias.childOrderDispatchDelayCapMs ?? 40)
+              : config.cloneChildOrderDelayMs;
           activePairSubmission = {
             groupId: group.groupId,
             expiresAt: submittedAtTs + submittedIntentMaxAgeSec,
@@ -4051,7 +4468,7 @@ export async function runStatefulBotSession(
             orderPlanBySide,
             orderedEntries,
             sequentialPairExecutionActive,
-            interChildDelayMs: config.cloneChildOrderDelayMs,
+            interChildDelayMs: pairChildOrderDelayMs,
           });
           const upResult = selectRepresentativeResult(executedBySide.UP);
           const downResult = selectRepresentativeResult(executedBySide.DOWN);
@@ -4222,6 +4639,9 @@ export async function runStatefulBotSession(
             orderType: group.orderType,
             controlledOverlap: controlledOverlapActive,
             sequentialPairExecution: sequentialPairExecutionActive,
+            interChildDelayMs: pairChildOrderDelayMs,
+            childOrderReason: decision.trace.entry.childOrderReason ?? null,
+            childOrderMicroTimingBias: runtimeFlowCalibrationBias.childOrderMicroTimingBias,
             upChildOrderCount: executedBySide.UP.length,
             downChildOrderCount: executedBySide.DOWN.length,
             upOrderId: upResult?.orderId ?? null,
@@ -4246,6 +4666,9 @@ export async function runStatefulBotSession(
             negativeEdgeUsdc,
             controlledOverlap: controlledOverlapActive,
             sequentialPairExecution: sequentialPairExecutionActive,
+            interChildDelayMs: pairChildOrderDelayMs,
+            childOrderReason: decision.trace.entry.childOrderReason ?? null,
+            childOrderMicroTimingBias: runtimeFlowCalibrationBias.childOrderMicroTimingBias,
             up: {
               price: group.maxUpPrice ?? null,
               shareTarget: sumOrderShareTargets(orderPlanBySide.UP) ?? null,
@@ -4548,116 +4971,7 @@ export async function runStatefulBotSession(
       }
 
       if (decision.completion) {
-        assertClassifiedBuyMode(decision.completion.mode, config);
-        const liveOrder = withAvailableUsdcBalance(decision.completion.order, cachedUsdcBalance);
-        const result = await completionManager.complete(liveOrder);
-        rememberSubmittedPrices(
-          submittedPrices,
-          market,
-          [
-            {
-              ...decision.completion.order,
-              side: decision.completion.order.side,
-              mode: decision.completion.mode,
-              orderId: result.orderId,
-              expectedShares: expectedSharesForSubmission(liveOrder.shareTarget, result),
-            },
-          ],
-          nowTs,
-        );
-        const accepted = isOrderResultAccepted(result);
-        if (accepted) {
-          applyRuntimeFlowBudgetAction("completion_submit", {
-            quantityShares: runtimeFlowBudgetReleaseQuantityForResidualChange({
-              requestedShares: decision.completion.missingShares,
-              oldGap: decision.completion.oldGap,
-              newGap: decision.completion.newGap,
-            }),
-            lineage: currentRuntimeFlowLineage(decision.completion.sideToBuy),
-          });
-          state = reserveNegativeEdgeBudget(state, decision.completion.negativeEdgeUsdc, "completion");
-          persistDailyBudget(state);
-          state = updateSeedSubmissionState(state, decision.completion.mode, decision.completion.sideToBuy);
-          persistMarketState();
-        } else {
-          await logRejectedOrder({
-            traceLogger,
-            phase: "completion",
-            mode: decision.completion.mode,
-            side: decision.completion.sideToBuy,
-            size: decision.completion.missingShares,
-            result,
-            order: liveOrder,
-            negativeEdgeUsdc: decision.completion.negativeEdgeUsdc,
-          });
-        }
-        completionSubmitCount += 1;
-        actionCooldownUntil = Date.now() + config.reentryDelayMs;
-        pushEvent(events, {
-          timestamp: nowTs,
-          type: "completion_submit",
-          outcome: decision.completion.sideToBuy,
-          mode: decision.completion.mode,
-          size: decision.completion.missingShares,
-          price: liveOrder.price,
-          shareTarget: liveOrder.shareTarget ?? null,
-          spendAmount: liveOrder.amount,
-          costWithFees: decision.completion.costWithFees,
-          capMode: decision.completion.capMode,
-          negativeEdgeUsdc: decision.completion.negativeEdgeUsdc,
-          result: summarizeOrderResult(result),
-        });
-        await traceLogger.write("orders", {
-          eventType: "completion_submit",
-          normalizedMode: `COMPLETION_${decision.completion.sideToBuy}`,
-          outcome: decision.completion.sideToBuy,
-          size: decision.completion.missingShares,
-          price: liveOrder.price ?? null,
-          shareTarget: liveOrder.shareTarget ?? null,
-          spendAmount: liveOrder.amount,
-          capMode: decision.completion.capMode,
-          negativeEdgeUsdc: decision.completion.negativeEdgeUsdc,
-          orderId: result.orderId,
-          orderStatus: result.status,
-          orderAccepted: accepted,
-          orderResult: summarizeOrderResult(result),
-          oldGap: decision.completion.oldGap,
-          newGapEstimate: decision.completion.newGap,
-          wouldIncreaseImbalance:
-            decision.completion.newGap > decision.completion.oldGap + config.maxCompletionOvershootShares,
-          requestedQty: decision.completion.missingShares,
-          finalQty: decision.completion.missingShares,
-          missingQty: Math.abs(state.upShares - state.downShares),
-          residualOppositeAveragePrice: decision.completion.oppositeAveragePrice,
-          missingSideAveragePrice: decision.completion.missingSideAveragePrice,
-          effectiveCompletionCost: decision.completion.costWithFees,
-          highLowMismatch: decision.completion.highLowMismatch,
-          capUsed: decision.completion.capMode,
-          rejectReason: accepted ? null : "completion_rejected",
-          correlationId: result.orderId,
-        });
-        emitLiveMirror("completion_submit", {
-          marketSlug: market.slug,
-          normalizedMode: `COMPLETION_${decision.completion.sideToBuy}`,
-          outcome: decision.completion.sideToBuy,
-          size: decision.completion.missingShares,
-          price: liveOrder.price ?? null,
-          shareTarget: liveOrder.shareTarget ?? null,
-          spendAmount: liveOrder.amount,
-          capMode: decision.completion.capMode,
-          negativeEdgeUsdc: decision.completion.negativeEdgeUsdc,
-          orderId: result.orderId ?? null,
-          orderStatus: result.status,
-          orderAccepted: accepted,
-          oldGap: decision.completion.oldGap,
-          newGapEstimate: decision.completion.newGap,
-          missingQty: Math.abs(state.upShares - state.downShares),
-          residualOppositeAveragePrice: decision.completion.oppositeAveragePrice,
-          missingSideAveragePrice: decision.completion.missingSideAveragePrice,
-          effectiveCompletionCost: decision.completion.costWithFees,
-          highLowMismatch: decision.completion.highLowMismatch,
-          rejectReason: accepted ? null : "completion_rejected",
-        });
+        await submitDecisionCompletion("completion_only");
         await waitForDecisionPulse();
         continue;
       }
@@ -4935,6 +5249,8 @@ export async function runStatefulBotSession(
       resolvedOptions.initialDailyNegativeEdgeSpentUsdc + state.negativeEdgeConsumedUsdc,
     fairValueSnapshot: latestFairValueSnapshot,
     recentSeedFlowCount: computeRecentSeedFlowCount(state, endedAt),
+    semanticRoleAlignmentBias: runtimeFlowCalibrationBias.semanticRoleAlignmentBias,
+    completionRoleReleaseOrderBias: runtimeFlowCalibrationBias.completionRoleReleaseOrderBias,
     arbitrationCarry:
       arbitrationCarry !== undefined
         ? {

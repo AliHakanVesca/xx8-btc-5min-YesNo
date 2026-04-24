@@ -113,7 +113,7 @@ describe("merge coordinator", () => {
     expect(lowCollateralGate.reason).toBe("low_collateral");
   });
 
-  it("keeps clone-mode merges out of the early entry shield unless a forced condition appears", () => {
+  it("keeps clone-mode merges held without an exact public-footprint merge prior", () => {
     const config = buildConfig({
       BOT_MODE: "XUAN",
       XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
@@ -139,12 +139,12 @@ describe("merge coordinator", () => {
     });
 
     expect(shieldedGate.allow).toBe(false);
-    expect(shieldedGate.reason).toBe("entry_shield");
-    expect(releasedGate.allow).toBe(true);
-    expect(releasedGate.reason).toBe("age_target");
+    expect(shieldedGate.reason).toBe("public_footprint_hold");
+    expect(releasedGate.allow).toBe(false);
+    expect(releasedGate.reason).toBe("public_footprint_hold");
   });
 
-  it("waits for five completed windows before clone-mode cycle-target merge opens", () => {
+  it("does not release clone-mode cycle-target merge without an exact merge prior", () => {
     const config = buildConfig({
       BOT_MODE: "XUAN",
       XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
@@ -166,9 +166,9 @@ describe("merge coordinator", () => {
       tracker,
     });
 
-    expect(gate.allow).toBe(true);
+    expect(gate.allow).toBe(false);
     expect(gate.forced).toBe(false);
-    expect(gate.reason).toBe("cycle_target");
+    expect(gate.reason).toBe("public_footprint_hold");
     expect(gate.completedCycles).toBe(5);
   });
 
@@ -206,9 +206,9 @@ describe("merge coordinator", () => {
     });
 
     expect(delayedGate.allow).toBe(false);
-    expect(delayedGate.reason).toBe("not_ready");
-    expect(releasedGate.allow).toBe(true);
-    expect(releasedGate.reason).toBe("age_target");
+    expect(delayedGate.reason).toBe("public_footprint_hold");
+    expect(releasedGate.allow).toBe(false);
+    expect(releasedGate.reason).toBe("public_footprint_hold");
   });
 
   it("coalesces nearby matched windows when strong multi-flow pressure is still active", () => {
@@ -275,7 +275,7 @@ describe("merge coordinator", () => {
     });
 
     expect(delayedGate.allow).toBe(false);
-    expect(delayedGate.reason).toBe("not_ready");
+    expect(delayedGate.reason).toBe("public_footprint_hold");
   });
 
   it("uses the exact 1776253500 first merge cluster timing and qty envelope", () => {

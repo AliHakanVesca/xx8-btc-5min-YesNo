@@ -811,6 +811,13 @@ export function buildCanonicalReferenceFromPaperSession(report: PaperSessionRepo
         qty: step.execution.mergeShares,
       });
     }
+    if (step.execution.redeemShares > 0) {
+      lifecycleEvents.push({
+        type: "REDEEM",
+        timestamp: step.timestamp,
+        qty: step.execution.redeemShares,
+      });
+    }
   }
 
   return buildCanonicalFromInputs({

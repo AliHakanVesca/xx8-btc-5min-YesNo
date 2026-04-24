@@ -12,6 +12,8 @@ import type { XuanMarketState } from "./marketState.js";
 import {
   classifyResidualSeverity,
   completionAllowance,
+  classifyCompletionReleaseRole,
+  type CompletionReleaseRole,
   deriveFlowPressureBudgetState,
   residualSeverityPressure,
   resolveResidualBehaviorState,
@@ -20,7 +22,7 @@ import {
   pairEntryCap,
   pairSweepAllowance,
   resolvePartialCompletionPhase,
-  shouldDelayResidualCompletion,
+  resolveResidualCompletionDelayProfile,
 } from "./modePolicy.js";
 import { OrderBookState } from "./orderBookState.js";
 import type { StrategyExecutionMode } from "./executionModes.js";
@@ -89,9 +91,14 @@ export interface SingleLegSeedCandidateTrace {
   side: OutcomeSide;
   requestedSize: number;
   filledSize: number;
+  sizingMode?: "standard" | "rhythm_micro" | undefined;
+  semanticRoleTarget?: "neutral" | "mid_pair" | "high_low_setup" | "raw_side_preserve" | undefined;
   oppositeFilledSize?: number | undefined;
   oppositeCoverageRatio?: number | undefined;
   classifierScore?: number | undefined;
+  priorityScore?: number | undefined;
+  priorityScoreDelta?: number | undefined;
+  completionRoleOrderScore?: number | undefined;
   averagePrice: number;
   limitPrice: number;
   effectivePricePerShare: number;
@@ -130,10 +137,34 @@ export interface EntryDecisionTrace {
   repairMissingQty?: number;
   repairOppositeAveragePrice?: number;
   repairHighLowMismatch?: boolean;
+  repairSizingMode?: "standard" | "micro_fallback" | undefined;
+  completionReleaseRole?: CompletionReleaseRole | undefined;
+  completionCalibrationPatienceMultiplier?: number | undefined;
+  completionRolePatienceMultiplier?: number | undefined;
+  completionEffectivePatienceMultiplier?: number | undefined;
+  completionWaitUntilSec?: number | undefined;
+  repairCandidateCount?: number | undefined;
   residualSeverityLevel?: "flat" | "micro" | "small" | "medium" | "aggressive";
   overlapRepairArbitration?: OverlapRepairArbitration;
   overlapRepairReason?: string;
   overlapRepairOutcome?: "overlap_seed" | "pair_reentry" | "repair" | "wait" | "blocked";
+  sideRhythmIntendedSide?: OutcomeSide | undefined;
+  sideRhythmSelectedSide?: OutcomeSide | undefined;
+  sideRhythmRejectedSide?: OutcomeSide | undefined;
+  sideRhythmScoreDelta?: number | undefined;
+  sideRhythmDecision?: "kept_priority" | "rhythm_override" | "rhythm_micro_fallback" | "no_viable_rhythm_side" | undefined;
+  childOrderIntendedSide?: OutcomeSide | undefined;
+  childOrderSelectedSide?: OutcomeSide | undefined;
+  childOrderReason?:
+    | "default"
+    | "flow_intent"
+    | "high_low_price"
+    | "recent_completion"
+    | "temporal_priority"
+    | "covered_seed_priority"
+    | undefined;
+  semanticRoleTarget?: "neutral" | "mid_pair" | "high_low_setup" | "raw_side_preserve" | undefined;
+  completionRoleReleaseOrderBias?: "neutral" | "role_order" | undefined;
 }
 
 export interface EntryEvaluation {
@@ -158,6 +189,16 @@ export interface EntryLadderContext {
   carryFlowConfidence?: number | undefined;
   matchedInventoryQuality?: number | undefined;
   flowPressureState?: FlowPressureBudgetState | undefined;
+  openingSeedReleaseBias?: "neutral" | "earlier" | "later" | undefined;
+  semanticRoleAlignmentBias?:
+    | "neutral"
+    | "align_high_low_role"
+    | "preserve_raw_side"
+    | "cycle_role_arbitration"
+    | undefined;
+  completionPatienceMultiplier?: number | undefined;
+  childOrderMicroTimingBias?: "neutral" | "flow_intent" | undefined;
+  completionRoleReleaseOrderBias?: "neutral" | "role_order" | undefined;
 }
 
 interface BalancedPairCandidate {
@@ -171,6 +212,24 @@ interface BalancedPairCandidate {
   negativeEdgeUsdc: number;
   upExecution: ExecutionQuote;
   downExecution: ExecutionQuote;
+}
+
+interface TemporalSeedCandidate {
+  side: OutcomeSide;
+  requestedSize: number;
+  sizingMode: "standard" | "rhythm_micro";
+  seedQuote: ExecutionQuote;
+  oppositeQuote: ExecutionQuote;
+  executableSize: number;
+  oppositeFilledSize: number;
+  oppositeCoverageRatio: number;
+  effectivePricePerShare: number;
+  referencePairCost: number;
+  negativeEdgeUsdc: number;
+  orphanRisk: OrphanRiskTrace;
+  fairValueDecision: { allowed: boolean; reason?: string | undefined };
+  classifierScore: number;
+  skipReason?: string | undefined;
 }
 
 export function chooseEntryBuys(
@@ -227,6 +286,21 @@ export function evaluateEntryBuys(
   }
 
   if (shareGap === 0) {
+    const cycleDensitySkipReason = shouldThrottleNewCycleDensity(config, state, ctx);
+    if (cycleDensitySkipReason) {
+      return {
+        decisions: [],
+        trace: {
+          mode: "balanced_pair",
+          requestedLot: ctx.lot,
+          totalShares,
+          shareGap,
+          pairCap,
+          skipReason: cycleDensitySkipReason,
+          candidates: [],
+        },
+      };
+    }
     const inspected = inspectBalancedPairCandidates(
       config,
       state,
@@ -273,7 +347,10 @@ export function evaluateEntryBuys(
     if (inspected.bestCandidate && !preferTemporalCloneCycle) {
       return {
         decisions: buildBalancedPairEntryBuys(
+          config,
           state,
+          ctx.secsFromOpen,
+          ctx.childOrderMicroTimingBias,
           inspected.bestCandidate,
           config.cryptoTakerFeeRate,
           totalShares === 0 ? "balanced_pair_seed" : "balanced_pair_reentry",
@@ -281,6 +358,8 @@ export function evaluateEntryBuys(
         trace: {
           ...trace,
           selectedMode: inspected.bestCandidate.mode,
+          ...balancedPairChildOrderTrace(config, state, ctx.secsFromOpen, ctx.childOrderMicroTimingBias, inspected.bestCandidate),
+          semanticRoleTarget: semanticRoleTargetForPair(inspected.bestCandidate.upExecution.averagePrice, inspected.bestCandidate.downExecution.averagePrice, ctx.semanticRoleAlignmentBias),
         },
       };
     }
@@ -293,6 +372,15 @@ export function evaluateEntryBuys(
           mode: "temporal_pair_cycle",
           selectedMode: temporalSeedEvaluation.decision.mode,
           seedCandidates: temporalSeedEvaluation.trace,
+          sideRhythmIntendedSide: temporalSeedEvaluation.rhythmArbitration?.intendedSide,
+          sideRhythmSelectedSide: temporalSeedEvaluation.rhythmArbitration?.selectedSide,
+          sideRhythmRejectedSide: temporalSeedEvaluation.rhythmArbitration?.rejectedSide,
+          sideRhythmScoreDelta: temporalSeedEvaluation.rhythmArbitration?.scoreDelta,
+          sideRhythmDecision: temporalSeedEvaluation.rhythmArbitration?.decision,
+          childOrderIntendedSide: temporalSeedEvaluation.childOrder?.intendedSide,
+          childOrderSelectedSide: temporalSeedEvaluation.childOrder?.selectedSide,
+          childOrderReason: temporalSeedEvaluation.childOrder?.reason,
+          semanticRoleTarget: temporalSeedEvaluation.semanticRoleTarget,
           skipReason:
             preferTemporalCloneCycle
               ? "clone_temporal_priority_over_pair_reentry"
@@ -304,7 +392,10 @@ export function evaluateEntryBuys(
     if (inspected.bestCandidate) {
       return {
         decisions: buildBalancedPairEntryBuys(
+          config,
           state,
+          ctx.secsFromOpen,
+          ctx.childOrderMicroTimingBias,
           inspected.bestCandidate,
           config.cryptoTakerFeeRate,
           totalShares === 0 ? "balanced_pair_seed" : "balanced_pair_reentry",
@@ -312,6 +403,8 @@ export function evaluateEntryBuys(
         trace: {
           ...trace,
           selectedMode: inspected.bestCandidate.mode,
+          ...balancedPairChildOrderTrace(config, state, ctx.secsFromOpen, ctx.childOrderMicroTimingBias, inspected.bestCandidate),
+          semanticRoleTarget: semanticRoleTargetForPair(inspected.bestCandidate.upExecution.averagePrice, inspected.bestCandidate.downExecution.averagePrice, ctx.semanticRoleAlignmentBias),
         },
       };
     }
@@ -331,6 +424,10 @@ export function evaluateEntryBuys(
           ...trace,
           selectedMode: seedEvaluation.decisions[0]!.mode,
           seedCandidates: [...temporalSeedEvaluation.trace, ...seedEvaluation.trace],
+          childOrderIntendedSide: seedEvaluation.childOrder?.intendedSide,
+          childOrderSelectedSide: seedEvaluation.childOrder?.selectedSide,
+          childOrderReason: seedEvaluation.childOrder?.reason,
+          semanticRoleTarget: seedEvaluation.semanticRoleTarget,
           skipReason: determineBalancedPairSkipReason(inspected.maxCandidateSize, inspected.traces),
         },
       };
@@ -409,7 +506,10 @@ export function evaluateEntryBuys(
     overlapInspection?.bestCandidate
       ? {
           decisions: buildBalancedPairEntryBuys(
+            config,
             state,
+            ctx.secsFromOpen,
+            ctx.childOrderMicroTimingBias,
             overlapInspection.bestCandidate,
             config.cryptoTakerFeeRate,
             "balanced_pair_reentry",
@@ -421,6 +521,12 @@ export function evaluateEntryBuys(
             shareGap,
             pairCap,
             selectedMode: overlapInspection.bestCandidate.mode,
+            ...balancedPairChildOrderTrace(config, state, ctx.secsFromOpen, ctx.childOrderMicroTimingBias, overlapInspection.bestCandidate),
+            semanticRoleTarget: semanticRoleTargetForPair(
+              overlapInspection.bestCandidate.upExecution.averagePrice,
+              overlapInspection.bestCandidate.downExecution.averagePrice,
+              ctx.semanticRoleAlignmentBias,
+            ),
             laggingSide,
             residualSeverityLevel: residualSeverity.level,
             overlapRepairArbitration,
@@ -451,6 +557,15 @@ export function evaluateEntryBuys(
             overlapRepairArbitration,
             overlapRepairReason,
             overlapRepairOutcome: "overlap_seed",
+            sideRhythmIntendedSide: overlapTemporalSeed.rhythmArbitration?.intendedSide,
+            sideRhythmSelectedSide: overlapTemporalSeed.rhythmArbitration?.selectedSide,
+            sideRhythmRejectedSide: overlapTemporalSeed.rhythmArbitration?.rejectedSide,
+            sideRhythmScoreDelta: overlapTemporalSeed.rhythmArbitration?.scoreDelta,
+            sideRhythmDecision: overlapTemporalSeed.rhythmArbitration?.decision,
+            childOrderIntendedSide: overlapTemporalSeed.childOrder?.intendedSide,
+            childOrderSelectedSide: overlapTemporalSeed.childOrder?.selectedSide,
+            childOrderReason: overlapTemporalSeed.childOrder?.reason,
+            semanticRoleTarget: overlapTemporalSeed.semanticRoleTarget,
             candidates: overlapInspection?.traces ?? [],
             seedCandidates: overlapTemporalSeed.trace,
             skipReason: "protected_residual_overlap_seed",
@@ -490,9 +605,21 @@ export function evaluateEntryBuys(
       ? resolveBundledCompletionSequencePrior(state.market.slug, ctx.secsFromOpen, laggingSide)
       : undefined;
   const exactCompletionQtyPrior = completionQtyPrior?.scope === "exact" ? completionQtyPrior : undefined;
+  const highLowRepairOvershootQty = buildHighLowRepairOvershootQty({
+    config,
+    sideToBuy: laggingSide,
+    books,
+    existingAverage: averageCost(state, leadingSide),
+    shareGap,
+    exactPriorActive: Boolean(exactCompletionQtyPrior),
+  });
+  const repairLotCap =
+    highLowRepairOvershootQty !== undefined
+      ? Math.max(ctx.lot * config.rebalanceMaxLaggingMultiplier, highLowRepairOvershootQty)
+      : ctx.lot * config.rebalanceMaxLaggingMultiplier;
   const repairRequestedQty = Math.min(
-    exactCompletionQtyPrior?.qty ?? Math.max(ctx.lot, shareGap),
-    ctx.lot * config.rebalanceMaxLaggingMultiplier,
+    Math.max(exactCompletionQtyPrior?.qty ?? Math.max(ctx.lot, shareGap), highLowRepairOvershootQty ?? 0),
+    repairLotCap,
     Math.max(0, config.maxMarketSharesPerSide - (laggingSide === "UP" ? state.upShares : state.downShares)),
     Math.max(0, config.maxOneSidedExposureShares),
   );
@@ -500,7 +627,11 @@ export function evaluateEntryBuys(
     config.completionQtyMode === "ALLOW_OVERSHOOT"
       ? shareGap + config.maxCompletionOvershootShares
       : shareGap;
-  const repairEffectiveQtyCap = exactCompletionQtyPrior ? Math.max(repairQtyCap, exactCompletionQtyPrior.qty) : repairQtyCap;
+  const repairEffectiveQtyCap = exactCompletionQtyPrior
+    ? Math.max(repairQtyCap, exactCompletionQtyPrior.qty)
+    : highLowRepairOvershootQty !== undefined
+      ? Math.max(repairQtyCap, highLowRepairOvershootQty)
+      : repairQtyCap;
   const repairSize = normalizeOrderSize(
     Math.min(repairRequestedQty, repairEffectiveQtyCap),
     config.repairMinQty,
@@ -521,6 +652,46 @@ export function evaluateEntryBuys(
     repairRequestedQty,
     repairMissingQty: shareGap,
   };
+
+  if (
+    shouldHoldHighLowOvershootResidual({
+      config,
+      state,
+      leadingSide,
+      shareGap,
+      secsFromOpen: ctx.secsFromOpen,
+      exactPriorActive: Boolean(exactCompletionQtyPrior),
+    })
+  ) {
+    return withCloneOverlapFallback({
+      decisions: [],
+      trace: {
+        ...trace,
+        overlapRepairOutcome: "wait",
+        skipReason: "high_low_residual_redeem_hold",
+      },
+    });
+  }
+
+  if (
+    shouldHoldLateSmallResidual({
+      config,
+      shareGap,
+      secsFromOpen: ctx.secsFromOpen,
+      secsToClose: ctx.secsToClose,
+      residualSeverityLevel: residualSeverity.level,
+      exactPriorActive: Boolean(exactCompletionQtyPrior),
+    })
+  ) {
+    return withCloneOverlapFallback({
+      decisions: [],
+      trace: {
+        ...trace,
+        overlapRepairOutcome: "wait",
+        skipReason: "late_small_residual_hold",
+      },
+    });
+  }
 
   if (repairSize <= 0) {
     return {
@@ -554,6 +725,8 @@ export function evaluateEntryBuys(
   const phaseMaxQty =
     exactCompletionQtyPrior && Number.isFinite(phase.maxQty)
       ? Math.max(phase.maxQty, exactCompletionQtyPrior.qty)
+      : highLowRepairOvershootQty !== undefined && Number.isFinite(phase.maxQty)
+        ? Math.max(phase.maxQty, highLowRepairOvershootQty)
       : phase.maxQty;
   const phasedRepairSize = normalizeOrderSize(
     Math.min(repairSize, Number.isFinite(phaseMaxQty) ? phaseMaxQty : repairSize),
@@ -568,27 +741,60 @@ export function evaluateEntryBuys(
       },
     });
   }
-  const execution = books.quoteForSize(laggingSide, "ask", phasedRepairSize);
-  const executableSize = normalizeOrderSize(execution.filledSize, config.repairMinQty);
-  if (executableSize <= 0) {
-    return withCloneOverlapFallback({
+  const residualCarryQty = completionResidualCarryQty({
+    config,
+    shareGap,
+    repairSize: phasedRepairSize,
+    secsFromOpen: ctx.secsFromOpen,
+    secsToClose: ctx.secsToClose,
+    residualSeverityLevel: residualSeverity.level,
+    exactPriorActive: Boolean(exactCompletionQtyPrior),
+    overlapRepairArbitration,
+  });
+  const residualAwareRepairSize = normalizeOrderSize(
+    Math.max(config.repairMinQty, phasedRepairSize - residualCarryQty),
+    config.repairMinQty,
+  );
+  const effectiveRepairSize =
+    residualCarryQty > 0 && residualAwareRepairSize > 0 ? Math.min(phasedRepairSize, residualAwareRepairSize) : phasedRepairSize;
+  const repairCandidateSizes = buildResidualRepairCandidateSizes({
+    config,
+    standardSize: effectiveRepairSize,
+    shareGap,
+    exactPriorActive: Boolean(exactCompletionQtyPrior),
+  });
+  let lastBlockedRepairEvaluation: EntryEvaluation | undefined;
+
+  for (const repairCandidateSize of repairCandidateSizes) {
+    const repairSizingMode = Math.abs(repairCandidateSize - effectiveRepairSize) <= 1e-6
+      ? "standard"
+      : "micro_fallback";
+    const execution = books.quoteForSize(laggingSide, "ask", repairCandidateSize);
+    const executableSize = normalizeOrderSize(execution.filledSize, config.repairMinQty);
+    if (executableSize <= 0) {
+      lastBlockedRepairEvaluation = {
       decisions: [],
       trace: {
         ...trace,
+          repairSizingMode,
+          repairCandidateCount: repairCandidateSizes.length,
         repairFilledSize: executableSize,
         skipReason: "lagging_depth",
       },
-    });
-  }
+      };
+      continue;
+    }
 
-  const oldGap = absoluteShareGap(state);
-  const newGap = projectedShareGapAfterBuy(state, laggingSide, executableSize);
-  const wouldIncreaseImbalance = newGap > oldGap + config.maxCompletionOvershootShares;
-  if ((config.forbidBuyThatIncreasesImbalance || config.partialCompletionRequiresImbalanceReduction) && wouldIncreaseImbalance) {
-    return withCloneOverlapFallback({
+    const oldGap = absoluteShareGap(state);
+    const newGap = projectedShareGapAfterBuy(state, laggingSide, executableSize);
+    const wouldIncreaseImbalance = newGap > oldGap + config.maxCompletionOvershootShares;
+    if ((config.forbidBuyThatIncreasesImbalance || config.partialCompletionRequiresImbalanceReduction) && wouldIncreaseImbalance) {
+      lastBlockedRepairEvaluation = {
       decisions: [],
       trace: {
         ...trace,
+          repairSizingMode,
+          repairCandidateCount: repairCandidateSizes.length,
         repairFilledSize: executableSize,
         repairFinalQty: executableSize,
         repairOldGap: oldGap,
@@ -596,28 +802,31 @@ export function evaluateEntryBuys(
         repairWouldIncreaseImbalance: wouldIncreaseImbalance,
         skipReason: "repair_increases_imbalance",
       },
-    });
-  }
+      };
+      continue;
+    }
 
-  const oppositeAveragePrice = averageCost(state, leadingSide);
-  const repairCost = completionCost(
-    oppositeAveragePrice,
-    execution.averagePrice,
-    config.cryptoTakerFeeRate,
-  );
-  const allowance = completionAllowance(config, state, {
-    costWithFees: repairCost,
-    candidateSize: executableSize,
-    oppositeAveragePrice,
-    missingSidePrice: execution.averagePrice,
-    partialAgeSec,
-  });
-  const highLowPhaseCapOverride = Boolean(allowance.highLowMismatch && allowance.allowed);
-  if ((repairCost > phaseCap && !highLowPhaseCapOverride) || executableSize > phaseMaxQty) {
-    return withCloneOverlapFallback({
+    const oppositeAveragePrice = averageCost(state, leadingSide);
+    const repairCost = completionCost(
+      oppositeAveragePrice,
+      execution.averagePrice,
+      config.cryptoTakerFeeRate,
+    );
+    const allowance = completionAllowance(config, state, {
+      costWithFees: repairCost,
+      candidateSize: executableSize,
+      oppositeAveragePrice,
+      missingSidePrice: execution.averagePrice,
+      partialAgeSec,
+    });
+    const highLowPhaseCapOverride = Boolean(allowance.highLowMismatch && allowance.allowed);
+    if ((repairCost > phaseCap && !highLowPhaseCapOverride) || executableSize > phaseMaxQty) {
+      lastBlockedRepairEvaluation = {
       decisions: [],
       trace: {
         ...trace,
+          repairSizingMode,
+          repairCandidateCount: repairCandidateSizes.length,
         repairFilledSize: executableSize,
         repairFinalQty: executableSize,
         repairCost,
@@ -630,90 +839,57 @@ export function evaluateEntryBuys(
         repairHighLowMismatch: allowance.highLowMismatch ?? false,
         skipReason: executableSize > phaseMaxQty ? "repair_phase_qty_cap" : "repair_phase_cap",
       },
-    });
-  }
-  const ultraFastCloneFairValueFallback =
-    config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
-    partialAgeSec <= config.temporalRepairUltraFastWindowSec &&
-    isCloneRepairFairValueFallbackSnapshot(ctx.fairValueSnapshot) &&
-    repairCost <= config.temporalRepairUltraFastMissingFairValueCap &&
-    allowance.allowed;
-  const fairValueRequired =
-    ultraFastCloneFairValueFallback
-      ? false
-      : allowance.highLowMismatch && allowance.allowed && !allowance.requiresFairValue
+      };
+      continue;
+    }
+    const ultraFastCloneFairValueFallback =
+      config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
+      partialAgeSec <= config.temporalRepairUltraFastWindowSec &&
+      isCloneRepairFairValueFallbackSnapshot(ctx.fairValueSnapshot) &&
+      repairCost <= config.temporalRepairUltraFastMissingFairValueCap &&
+      allowance.allowed;
+    const fairValueRequired =
+      ultraFastCloneFairValueFallback
         ? false
-        : !(
-            config.allowStrictResidualCompletionWithoutFairValue &&
-            repairCost <= config.strictResidualCompletionCap
-          ) || Boolean(allowance.requiresFairValue);
-  const fairValueDecision = ultraFastCloneFairValueFallback
-    ? { allowed: true as const }
-    : fairValueGate({
+        : allowance.highLowMismatch && allowance.allowed && !allowance.requiresFairValue
+          ? false
+          : !(
+              config.allowStrictResidualCompletionWithoutFairValue &&
+              repairCost <= config.strictResidualCompletionCap
+            ) || Boolean(allowance.requiresFairValue);
+    const fairValueDecision = ultraFastCloneFairValueFallback
+      ? { allowed: true as const }
+      : fairValueGate({
+          config,
+          snapshot: ctx.fairValueSnapshot,
+          side: laggingSide,
+          sidePrice: execution.averagePrice,
+          mode: phase.mode === "PARTIAL_EMERGENCY_COMPLETION" ? "emergency" : "completion",
+          secsToClose: ctx.secsToClose,
+          effectiveCost: repairCost,
+          required: fairValueRequired,
+        });
+    const cheapLateCompletionChase =
+      allowance.allowed &&
+      shouldUseCheapLateCompletionChase({
         config,
-        snapshot: ctx.fairValueSnapshot,
-        side: laggingSide,
-        sidePrice: execution.averagePrice,
-        mode: phase.mode === "PARTIAL_EMERGENCY_COMPLETION" ? "emergency" : "completion",
-        secsToClose: ctx.secsToClose,
-        effectiveCost: repairCost,
-        required: fairValueRequired,
+        completionQtyPrior,
+        oppositeAveragePrice,
+        missingSidePrice: execution.averagePrice,
+        partialAgeSec,
       });
-  const cheapLateCompletionChase =
-    allowance.allowed &&
-    shouldUseCheapLateCompletionChase({
+    const repairMode: StrategyExecutionMode =
+      allowance.highLowMismatch && allowance.allowed
+        ? "HIGH_LOW_COMPLETION_CHASE"
+        : cheapLateCompletionChase
+          ? "CHEAP_LATE_COMPLETION_CHASE"
+          : phase.mode;
+    const completionReleaseRole = classifyCompletionReleaseRole({
       config,
-      completionQtyPrior,
       oppositeAveragePrice,
       missingSidePrice: execution.averagePrice,
-      partialAgeSec,
     });
-  const repairMode: StrategyExecutionMode =
-    allowance.highLowMismatch && allowance.allowed
-      ? "HIGH_LOW_COMPLETION_CHASE"
-      : cheapLateCompletionChase
-        ? "CHEAP_LATE_COMPLETION_CHASE"
-        : phase.mode;
-  const detailedTrace: EntryDecisionTrace = {
-    ...trace,
-    selectedMode: repairMode,
-    repairFilledSize: executableSize,
-    repairFinalQty: executableSize,
-    repairCost,
-    repairAllowed: allowance.allowed,
-    repairCapMode: allowance.capMode,
-    repairOldGap: oldGap,
-    repairNewGap: newGap,
-    repairWouldIncreaseImbalance: wouldIncreaseImbalance,
-    repairOppositeAveragePrice: oppositeAveragePrice,
-    repairHighLowMismatch: allowance.highLowMismatch ?? false,
-  };
-  if (
-    ctx.secsToClose <= config.partialNoChaseLastSec &&
-    !config.allowAnyNewBuyInLast10S &&
-    allowance.capMode !== "strict"
-  ) {
-    return withCloneOverlapFallback({
-      decisions: [],
-      trace: {
-        ...detailedTrace,
-        overlapRepairOutcome: "blocked",
-        skipReason: "repair_last10_strict_only",
-      },
-    });
-  }
-  if (!allowance.allowed || !fairValueDecision.allowed) {
-    return withCloneOverlapFallback({
-      decisions: [],
-      trace: {
-        ...detailedTrace,
-        overlapRepairOutcome: "blocked",
-        skipReason: !allowance.allowed ? "repair_cap" : fairValueDecision.reason ?? "repair_fair_value",
-      },
-    });
-  }
-  if (
-    shouldDelayResidualCompletion({
+    const completionDelayProfile = resolveResidualCompletionDelayProfile({
       config,
       residualShares: shareGap,
       partialAgeSec,
@@ -723,38 +899,100 @@ export function evaluateEntryBuys(
       exactPriorActive: Boolean(exactCompletionQtyPrior),
       exceptionalMode: Boolean(allowance.highLowMismatch) || cheapLateCompletionChase,
       ...(ctx.recentSeedFlowCount !== undefined ? { recentSeedFlowCount: ctx.recentSeedFlowCount } : {}),
-    })
-  ) {
-    return withCloneOverlapFallback({
+      ...(ctx.activeIndependentFlowCount !== undefined ? { activeIndependentFlowCount: ctx.activeIndependentFlowCount } : {}),
+      ...(ctx.completionPatienceMultiplier !== undefined
+        ? { completionPatienceMultiplier: ctx.completionPatienceMultiplier }
+        : {}),
+    });
+    const detailedTrace: EntryDecisionTrace = {
+      ...trace,
+      selectedMode: repairMode,
+      repairSizingMode,
+      repairCandidateCount: repairCandidateSizes.length,
+      repairFilledSize: executableSize,
+      repairFinalQty: executableSize,
+      repairCost,
+      repairAllowed: allowance.allowed,
+      repairCapMode: allowance.capMode,
+      repairOldGap: oldGap,
+      repairNewGap: newGap,
+      repairWouldIncreaseImbalance: wouldIncreaseImbalance,
+      repairOppositeAveragePrice: oppositeAveragePrice,
+      repairHighLowMismatch: allowance.highLowMismatch ?? false,
+      completionReleaseRole,
+      completionCalibrationPatienceMultiplier: completionDelayProfile.calibrationPatienceMultiplier,
+      completionRolePatienceMultiplier: completionDelayProfile.rolePatienceMultiplier,
+      completionEffectivePatienceMultiplier: completionDelayProfile.effectivePatienceMultiplier,
+      completionWaitUntilSec: completionDelayProfile.waitUntilSec,
+    };
+    if (
+      ctx.secsToClose <= config.partialNoChaseLastSec &&
+      !config.allowAnyNewBuyInLast10S &&
+      allowance.capMode !== "strict"
+    ) {
+      lastBlockedRepairEvaluation = {
+      decisions: [],
+      trace: {
+        ...detailedTrace,
+        overlapRepairOutcome: "blocked",
+        skipReason: "repair_last10_strict_only",
+      },
+      };
+      continue;
+    }
+    if (!allowance.allowed || !fairValueDecision.allowed) {
+      lastBlockedRepairEvaluation = {
+      decisions: [],
+      trace: {
+        ...detailedTrace,
+        overlapRepairOutcome: "blocked",
+        skipReason: !allowance.allowed ? "repair_cap" : fairValueDecision.reason ?? "repair_fair_value",
+      },
+      };
+      continue;
+    }
+    if (completionDelayProfile.shouldDelay) {
+      lastBlockedRepairEvaluation = {
       decisions: [],
       trace: {
         ...detailedTrace,
         overlapRepairOutcome: "wait",
         skipReason: "repair_patience_wait",
       },
-    });
+      };
+      continue;
+    }
+
+    return {
+      decisions: [
+        buildEntryBuy(
+          state,
+          laggingSide,
+          {
+            ...execution,
+            requestedSize: executableSize,
+            filledSize: executableSize,
+            fullyFilled: execution.filledSize + 1e-9 >= executableSize,
+          },
+          "lagging_rebalance",
+          repairMode,
+          config.cryptoTakerFeeRate,
+          repairCost,
+          allowance.negativeEdgeUsdc,
+        ),
+      ],
+      trace: detailedTrace,
+    };
   }
 
-  return {
-    decisions: [
-      buildEntryBuy(
-        state,
-        laggingSide,
-        {
-          ...execution,
-          requestedSize: executableSize,
-          filledSize: executableSize,
-          fullyFilled: execution.filledSize + 1e-9 >= executableSize,
-        },
-        "lagging_rebalance",
-        repairMode,
-        config.cryptoTakerFeeRate,
-        repairCost,
-        allowance.negativeEdgeUsdc,
-      ),
-    ],
-    trace: detailedTrace,
-  };
+  return withCloneOverlapFallback(lastBlockedRepairEvaluation ?? {
+    decisions: [],
+    trace: {
+      ...trace,
+      repairCandidateCount: repairCandidateSizes.length,
+      skipReason: "repair_no_viable_candidate",
+    },
+  });
 }
 
 function fairValueForOrphanSide(snapshot: FairValueSnapshot | undefined, side: OutcomeSide): number | undefined {
@@ -986,7 +1224,19 @@ function shouldPreferTemporalCloneCycleOverBalancedPair(args: {
   if (args.config.botMode !== "XUAN") {
     return false;
   }
-  if (args.bestCandidate.mode === "STRICT_PAIR_SWEEP") {
+  const openPrior = resolveBundledOpenSequencePrior(args.state.market.slug);
+  const openPriorActive =
+    args.config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
+    args.state.fillHistory.every((fill) => fill.side !== "BUY") &&
+    openPrior !== undefined &&
+    args.ctx.secsFromOpen <= openPrior.activeUntilSec + 1e-9;
+  const prior = resolveBundledSeedSequencePrior(args.state.market.slug, args.ctx.secsFromOpen);
+  const referencePriorActive =
+    prior !== undefined &&
+    !(prior.scope === "family" && args.ctx.fairValueSnapshot?.status === "valid") &&
+    args.ctx.secsFromOpen >= prior.activeFromSec - 1e-9 &&
+    args.ctx.secsFromOpen <= prior.activeUntilSec + 1e-9;
+  if (args.bestCandidate.mode === "STRICT_PAIR_SWEEP" && !openPriorActive && !referencePriorActive) {
     return false;
   }
   const recentFlowDensity = args.ctx.recentSeedFlowCount ?? 0;
@@ -1001,14 +1251,30 @@ function shouldPreferTemporalCloneCycleOverBalancedPair(args: {
   }
   const residualOverlapBias =
     (args.ctx.protectedResidualShares ?? 0) > Math.max(args.config.repairMinQty, args.config.completionMinQty);
-  const prior = resolveBundledSeedSequencePrior(args.state.market.slug, args.ctx.secsFromOpen);
-  const referencePriorActive =
-    prior !== undefined &&
-    !(prior.scope === "family" && args.ctx.fairValueSnapshot?.status === "valid") &&
-    args.ctx.secsFromOpen >= prior.activeFromSec - 1e-9 &&
-    args.ctx.secsFromOpen <= prior.activeUntilSec + 1e-9;
+  if (openPriorActive) {
+    return true;
+  }
   if (args.config.xuanCloneMode === "PUBLIC_FOOTPRINT" && referencePriorActive) {
     return true;
+  }
+  if (
+    args.ctx.childOrderMicroTimingBias === "flow_intent" &&
+    args.ctx.semanticRoleAlignmentBias === "cycle_role_arbitration" &&
+    shouldPreferFlowIntentTemporalSeedChildOrder(args.ctx) &&
+    recentFlowDensity >= 1
+  ) {
+    const pairFirstSide = preferredBalancedPairFirstSide(
+      args.config,
+      args.state,
+      args.ctx.secsFromOpen,
+      args.ctx.childOrderMicroTimingBias,
+      args.bestCandidate,
+    );
+    const temporalRhythmSide = preferredTemporalSeedRhythmSide(args.state);
+    const spread = Math.abs(args.bestCandidate.upExecution.averagePrice - args.bestCandidate.downExecution.averagePrice);
+    if (pairFirstSide !== temporalRhythmSide && spread < 0.55) {
+      return true;
+    }
   }
   return (
     recentFlowDensity >= 2 ||
@@ -1058,6 +1324,9 @@ function scoreTemporalSeedCycle(args: {
   orphanRisk: OrphanRiskTrace;
   protectedResidualShares?: number | undefined;
   fairValueSnapshot?: FairValueSnapshot | undefined;
+  openingSeedReleaseBias?: "neutral" | "earlier" | "later" | undefined;
+  semanticRoleAlignmentBias?: EntryLadderContext["semanticRoleAlignmentBias"];
+  completionRoleReleaseOrderBias?: EntryLadderContext["completionRoleReleaseOrderBias"];
 }): number {
   const oppositeSide: OutcomeSide = args.side === "UP" ? "DOWN" : "UP";
   const timedSequencePrior = bundledSeedSequencePriorBias({
@@ -1089,6 +1358,8 @@ function scoreTemporalSeedCycle(args: {
   const depthRatio = args.candidateSize > 0 ? args.executableSize / args.candidateSize : 0;
   const orphanPenalty = orphanRiskSortValue(args.orphanRisk);
   const sequenceBias = recentTemporalSequenceBias(args.state, args.side);
+  const seedRhythmSide = preferredTemporalSeedRhythmSide(args.state);
+  const seedRhythmBias = seedRhythmSide === args.side ? 1 : -0.65;
   const sequenceBiasBoost =
     (args.state.upShares + args.state.downShares <= 1e-6 ? 1.25 : 1) *
     (args.fairValueSnapshot?.status === "valid" || args.fairValueSnapshot?.status === "disabled" ? 1 : 1.15);
@@ -1103,6 +1374,38 @@ function scoreTemporalSeedCycle(args: {
     side: args.side,
     secsFromOpen: args.secsFromOpen,
   });
+  const lateAsymmetricSetupBias = lateAsymmetricCompletionSetupBias({
+    config: args.config,
+    state: args.state,
+    side: args.side,
+    secsFromOpen: args.secsFromOpen,
+    seedPrice: args.seedQuote.averagePrice,
+    oppositePrice: args.oppositeQuote.averagePrice,
+    referencePairCost: args.referencePairCost,
+    oppositeCoverageRatio: args.oppositeCoverageRatio,
+    protectedResidualShares,
+    semanticRoleAlignmentBias: args.semanticRoleAlignmentBias,
+  });
+  const completionRoleOrderScore = completionReleaseRoleOrderScore({
+    config: args.config,
+    side: args.side,
+    secsFromOpen: args.secsFromOpen,
+    seedPrice: args.seedQuote.averagePrice,
+    oppositePrice: args.oppositeQuote.averagePrice,
+    oppositeCoverageRatio: args.oppositeCoverageRatio,
+    referencePairCost: args.referencePairCost,
+    completionRoleReleaseOrderBias: args.completionRoleReleaseOrderBias,
+  });
+  const openingReleaseBias =
+    args.state.upShares + args.state.downShares <= 1e-6 &&
+    !args.state.fillHistory.some((fill) => fill.side === "BUY") &&
+    args.secsFromOpen <= 20
+      ? args.openingSeedReleaseBias === "earlier"
+        ? 0.45
+        : args.openingSeedReleaseBias === "later"
+          ? -0.45
+          : 0
+      : 0;
 
   return Number(
     (
@@ -1113,12 +1416,344 @@ function scoreTemporalSeedCycle(args: {
       depthRatio * args.config.temporalSeedDepthWeight +
       sequenceBias * args.config.temporalSeedSequenceBiasWeight * sequenceBiasBoost * recentSequenceScale -
       orphanPenalty * args.config.temporalSeedOrphanPenaltyWeight +
+      seedRhythmBias * args.config.temporalSeedSequenceBiasWeight * 0.85 +
       (openSequencePriorBias + timedSequencePrior.bias) *
         args.config.temporalSeedSequenceBiasWeight *
         sequenceBiasBoost *
-        timedPriorBoost
+        timedPriorBoost +
+      lateAsymmetricSetupBias * args.config.temporalSeedSequenceBiasWeight +
+      completionRoleOrderScore * args.config.temporalSeedSequenceBiasWeight +
+      openingReleaseBias * args.config.temporalSeedSequenceBiasWeight
     ).toFixed(6),
   );
+}
+
+function completionReleaseRoleOrderScore(args: {
+  config: XuanStrategyConfig;
+  side: OutcomeSide;
+  secsFromOpen: number;
+  seedPrice: number;
+  oppositePrice: number;
+  oppositeCoverageRatio: number;
+  referencePairCost: number;
+  completionRoleReleaseOrderBias?: EntryLadderContext["completionRoleReleaseOrderBias"];
+}): number {
+  if (args.config.botMode !== "XUAN" || args.completionRoleReleaseOrderBias !== "role_order") {
+    return 0;
+  }
+  if (args.oppositeCoverageRatio < args.config.temporalSingleLegMinOppositeDepthRatio) {
+    return 0;
+  }
+  if (!Number.isFinite(args.referencePairCost) || args.referencePairCost > args.config.xuanBehaviorCap + 1e-9) {
+    return 0;
+  }
+  const spread = Math.abs(args.seedPrice - args.oppositePrice);
+  const projectedCompletionRole =
+    args.oppositePrice - args.seedPrice >= 0.08
+      ? "expensive"
+      : args.oppositePrice - args.seedPrice <= -0.08
+        ? "cheap"
+        : "mid";
+  if (spread >= 0.3 && args.secsFromOpen >= 50) {
+    return projectedCompletionRole === "cheap" ? 0.75 : projectedCompletionRole === "expensive" ? -0.45 : -0.2;
+  }
+  if (spread <= 0.12) {
+    return projectedCompletionRole === "mid" ? 0.45 : -0.35;
+  }
+  if (spread < 0.25) {
+    return projectedCompletionRole === "mid" ? 0.25 : projectedCompletionRole === "cheap" ? -0.12 : -0.2;
+  }
+  return projectedCompletionRole === "cheap" ? 0.25 : 0;
+}
+
+function lateAsymmetricCompletionSetupBias(args: {
+  config: XuanStrategyConfig;
+  state: XuanMarketState;
+  side: OutcomeSide;
+  secsFromOpen: number;
+  seedPrice: number;
+  oppositePrice: number;
+  referencePairCost: number;
+  oppositeCoverageRatio: number;
+  protectedResidualShares: number;
+  semanticRoleAlignmentBias?: EntryLadderContext["semanticRoleAlignmentBias"];
+}): number {
+  if (args.config.botMode !== "XUAN") {
+    return 0;
+  }
+  if (args.secsFromOpen < 50 || args.oppositeCoverageRatio < args.config.temporalSingleLegMinOppositeDepthRatio) {
+    return 0;
+  }
+  if (!Number.isFinite(args.referencePairCost) || args.referencePairCost > args.config.xuanBehaviorCap + 1e-9) {
+    return 0;
+  }
+  const exactSeedPrior = args.config.xuanCloneMode === "PUBLIC_FOOTPRINT"
+    ? resolveBundledSeedSequencePrior(args.state.market.slug, args.secsFromOpen)?.scope === "exact"
+    : false;
+  if (exactSeedPrior) {
+    return 0;
+  }
+
+  const lowPrice = Math.min(args.seedPrice, args.oppositePrice);
+  const highPrice = Math.max(args.seedPrice, args.oppositePrice);
+  const spread = highPrice - lowPrice;
+  const cheapLegVisible = lowPrice <= args.config.lowSideMaxForHighCompletion + 0.04;
+  const expensiveButBoundedLeg =
+    highPrice >= Math.max(0.58, args.config.highSidePriceThreshold - 0.18) &&
+    highPrice <= args.config.singleLegOrphanCap + 0.04;
+  if (!cheapLegVisible || !expensiveButBoundedLeg || spread < 0.3) {
+    return 0;
+  }
+
+  const seedIsHighSide = args.seedPrice >= args.oppositePrice;
+  const matchedInventory = Math.min(args.state.upShares, args.state.downShares);
+  const matchedInventoryQuality = matchedInventory / Math.max(args.config.liveSmallLotLadder[0] ?? args.config.defaultLot, 1e-6);
+  const residualPressure = args.protectedResidualShares > 0 ? residualSeverityPressure(args.config, args.protectedResidualShares) : 0;
+  const alignmentMultiplier =
+    args.semanticRoleAlignmentBias === "align_high_low_role"
+      ? 1.28
+      : args.semanticRoleAlignmentBias === "cycle_role_arbitration"
+        ? 1.05
+      : 1;
+  const setupStrength = Math.min(
+    1.65,
+    (spread * 2 + Math.min(0.5, matchedInventoryQuality * 0.25) + residualPressure * 0.25) *
+      alignmentMultiplier,
+  );
+
+  return Number((seedIsHighSide ? setupStrength : -setupStrength * 0.85).toFixed(6));
+}
+
+function shouldBlockCheapSeedExpensiveCompletionSetup(args: {
+  config: XuanStrategyConfig;
+  state: XuanMarketState;
+  side: OutcomeSide;
+  secsFromOpen: number;
+  seedPrice: number;
+  oppositePrice: number;
+  referencePairCost: number;
+  oppositeCoverageRatio: number;
+  semanticRoleAlignmentBias?: EntryLadderContext["semanticRoleAlignmentBias"];
+}): boolean {
+  if (args.config.botMode !== "XUAN") {
+    return false;
+  }
+  if (args.secsFromOpen < 50 || args.oppositeCoverageRatio < args.config.temporalSingleLegMinOppositeDepthRatio) {
+    return false;
+  }
+  if (!Number.isFinite(args.referencePairCost) || args.referencePairCost > args.config.xuanBehaviorCap + 1e-9) {
+    return false;
+  }
+  if (args.semanticRoleAlignmentBias !== "align_high_low_role") {
+    return false;
+  }
+  const exactSeedPrior = args.config.xuanCloneMode === "PUBLIC_FOOTPRINT"
+    ? resolveBundledSeedSequencePrior(args.state.market.slug, args.secsFromOpen)?.scope === "exact"
+    : false;
+  if (exactSeedPrior) {
+    return false;
+  }
+
+  const seedIsCheap = args.seedPrice <= args.config.lowSideMaxForHighCompletion + 0.04;
+  const oppositeIsExpensive =
+    args.oppositePrice >= Math.max(0.58, args.config.highSidePriceThreshold - 0.18);
+  const spread = args.oppositePrice - args.seedPrice;
+  return seedIsCheap && oppositeIsExpensive && spread >= 0.3;
+}
+
+function preferredTemporalSeedRhythmSide(state: XuanMarketState): OutcomeSide {
+  const seedLikeBuys = state.fillHistory.filter(
+    (fill) =>
+      fill.side === "BUY" &&
+      (
+        fill.executionMode === "STRICT_PAIR_SWEEP" ||
+        fill.executionMode === "XUAN_SOFT_PAIR_SWEEP" ||
+        fill.executionMode === "XUAN_HARD_PAIR_SWEEP" ||
+        fill.executionMode === "TEMPORAL_SINGLE_LEG_SEED" ||
+        fill.executionMode === "PAIRGROUP_COVERED_SEED"
+      ),
+  );
+  const lastSeed = seedLikeBuys.at(-1);
+  if (!lastSeed) {
+    return "UP";
+  }
+  return lastSeed.outcome === "UP" ? "DOWN" : "UP";
+}
+
+function completionCarrySideRhythmBoost(args: {
+  config: XuanStrategyConfig;
+  state: XuanMarketState;
+  side: OutcomeSide;
+  activeIndependentFlowCount?: number | undefined;
+  recentSeedFlowCount?: number | undefined;
+  matchedInventoryQuality?: number | undefined;
+  protectedResidualShares?: number | undefined;
+}): number {
+  if (args.config.botMode !== "XUAN") {
+    return 0;
+  }
+  const completionModes: StrategyExecutionMode[] = [
+    "PARTIAL_FAST_COMPLETION",
+    "PARTIAL_SOFT_COMPLETION",
+    "PARTIAL_EMERGENCY_COMPLETION",
+    "POST_MERGE_RESIDUAL_COMPLETION",
+    "HIGH_LOW_COMPLETION_CHASE",
+    "CHEAP_LATE_COMPLETION_CHASE",
+  ];
+  if (
+    args.state.lastFilledSide === undefined ||
+    args.state.lastExecutionMode === undefined ||
+    !completionModes.includes(args.state.lastExecutionMode)
+  ) {
+    return 0;
+  }
+  const overlapContextActive =
+    (args.activeIndependentFlowCount ?? 0) >= 1 ||
+    (args.recentSeedFlowCount ?? 0) >= 1 ||
+    (args.matchedInventoryQuality ?? 0) >= 0.75 ||
+    (args.protectedResidualShares ?? 0) > Math.max(args.config.repairMinQty, args.config.completionMinQty);
+  if (!overlapContextActive) {
+    return 0;
+  }
+  const denseFlow =
+    (args.activeIndependentFlowCount ?? 0) >= 2 ||
+    (args.recentSeedFlowCount ?? 0) >= 2 ||
+    (args.matchedInventoryQuality ?? 0) >= 1;
+  return args.state.lastFilledSide === args.side
+    ? denseFlow
+      ? 2.15
+      : 1.15
+    : denseFlow
+      ? -0.95
+      : -0.45;
+}
+
+function completionResidualCarryQty(args: {
+  config: XuanStrategyConfig;
+  shareGap: number;
+  repairSize: number;
+  secsFromOpen: number;
+  secsToClose: number;
+  residualSeverityLevel: "flat" | "micro" | "small" | "medium" | "aggressive";
+  exactPriorActive: boolean;
+  overlapRepairArbitration: OverlapRepairArbitration;
+}): number {
+  if (args.config.botMode !== "XUAN" || args.exactPriorActive) {
+    return 0;
+  }
+  if (args.residualSeverityLevel === "aggressive" || args.shareGap <= args.config.repairMinQty * 2) {
+    return 0;
+  }
+  if (args.secsFromOpen < 150 || args.secsToClose <= args.config.finalWindowCompletionOnlySec) {
+    return 0;
+  }
+  if (args.overlapRepairArbitration === "favor_residual_repair" && args.secsFromOpen < 220) {
+    return 0;
+  }
+
+  const carryQty = Math.min(5, Math.max(0.75, args.shareGap * 0.08));
+  const maxCarryWithoutBlockingOrder = Math.max(0, args.repairSize - args.config.repairMinQty);
+  return Number(Math.min(carryQty, maxCarryWithoutBlockingOrder).toFixed(6));
+}
+
+function buildResidualRepairCandidateSizes(args: {
+  config: XuanStrategyConfig;
+  standardSize: number;
+  shareGap: number;
+  exactPriorActive: boolean;
+}): number[] {
+  if (args.standardSize <= 0) {
+    return [];
+  }
+  if (args.config.botMode !== "XUAN" || args.exactPriorActive) {
+    return [args.standardSize];
+  }
+  const baseLot = args.config.liveSmallLotLadder[0] ?? args.config.defaultLot;
+  const microFloor = args.config.repairMinQty;
+  const sizes = [
+    args.standardSize,
+    args.standardSize * 0.7,
+    args.standardSize * 0.5,
+    Math.min(args.standardSize, args.shareGap * 0.5),
+    Math.min(args.standardSize, baseLot * 0.5),
+  ]
+    .map((size) => normalizeOrderSize(size, microFloor))
+    .filter((size) => size > 0);
+  return [...new Set(sizes)].sort((left, right) => right - left);
+}
+
+function buildHighLowRepairOvershootQty(args: {
+  config: XuanStrategyConfig;
+  sideToBuy: OutcomeSide;
+  books: OrderBookState;
+  existingAverage: number;
+  shareGap: number;
+  exactPriorActive: boolean;
+}): number | undefined {
+  if (args.config.botMode !== "XUAN" || args.exactPriorActive || args.shareGap <= 0) {
+    return undefined;
+  }
+  const missingSidePrice = args.books.bestAsk(args.sideToBuy);
+  const priceSpikeDelta = missingSidePrice - args.existingAverage;
+  const priceSpikeRatio = missingSidePrice / Math.max(args.existingAverage, 0.01);
+  const strongHighLowSpike =
+    missingSidePrice >= args.config.highSidePriceThreshold - 0.02 &&
+    priceSpikeDelta >= 0.45 &&
+    priceSpikeRatio >= 2.25;
+  const classicHighLow =
+    missingSidePrice >= Math.max(0.58, args.config.highSidePriceThreshold - 0.18) &&
+    args.existingAverage <= args.config.lowSideMaxForHighCompletion + 0.08;
+  if (!classicHighLow && !strongHighLowSpike) {
+    return undefined;
+  }
+  const overshootRatio = missingSidePrice >= args.config.highSidePriceThreshold ? 0.055 : 0.035;
+  const overshootQty = normalizeOrderSize(args.shareGap * (1 + overshootRatio), args.config.repairMinQty);
+  if (overshootQty <= args.shareGap + 1e-6) {
+    return undefined;
+  }
+  return overshootQty;
+}
+
+function shouldHoldLateSmallResidual(args: {
+  config: XuanStrategyConfig;
+  shareGap: number;
+  secsFromOpen: number;
+  secsToClose: number;
+  residualSeverityLevel: "flat" | "micro" | "small" | "medium" | "aggressive";
+  exactPriorActive: boolean;
+}): boolean {
+  if (args.config.botMode !== "XUAN" || args.exactPriorActive) {
+    return false;
+  }
+  const holdableSeverity =
+    args.residualSeverityLevel === "micro" ||
+    args.residualSeverityLevel === "small" ||
+    (args.residualSeverityLevel === "flat" && args.shareGap > 0.5);
+  if (!holdableSeverity) {
+    return false;
+  }
+  if (args.shareGap > 5 + 1e-6) {
+    return false;
+  }
+  return args.secsFromOpen >= 240 || args.secsToClose <= args.config.finalWindowSoftStartSec;
+}
+
+function shouldHoldHighLowOvershootResidual(args: {
+  config: XuanStrategyConfig;
+  state: XuanMarketState;
+  leadingSide: OutcomeSide;
+  shareGap: number;
+  secsFromOpen: number;
+  exactPriorActive: boolean;
+}): boolean {
+  if (args.config.botMode !== "XUAN" || args.exactPriorActive || args.secsFromOpen < 150) {
+    return false;
+  }
+  if (args.shareGap <= 0 || args.shareGap > Math.max(5, args.config.maxCompletionOvershootShares)) {
+    return false;
+  }
+  const residualLots = args.leadingSide === "UP" ? args.state.upLots : args.state.downLots;
+  return residualLots.some((lot) => lot.executionMode === "HIGH_LOW_COMPLETION_CHASE");
 }
 
 function evaluateTemporalSingleLegSeed(
@@ -1130,6 +1765,19 @@ function evaluateTemporalSingleLegSeed(
 ): {
   decision?: EntryBuyDecision;
   trace: SingleLegSeedCandidateTrace[];
+  rhythmArbitration?: {
+    intendedSide?: OutcomeSide | undefined;
+    selectedSide?: OutcomeSide | undefined;
+    rejectedSide?: OutcomeSide | undefined;
+    scoreDelta?: number | undefined;
+    decision: "kept_priority" | "rhythm_override" | "rhythm_micro_fallback" | "no_viable_rhythm_side";
+  } | undefined;
+  childOrder?: {
+    intendedSide?: OutcomeSide | undefined;
+    selectedSide?: OutcomeSide | undefined;
+    reason: "flow_intent" | "temporal_priority";
+  } | undefined;
+  semanticRoleTarget?: EntryDecisionTrace["semanticRoleTarget"] | undefined;
 } {
   if (
     config.botMode !== "XUAN" ||
@@ -1155,7 +1803,7 @@ function evaluateTemporalSingleLegSeed(
   }
 
   const selectedMode: StrategyExecutionMode = "TEMPORAL_SINGLE_LEG_SEED";
-  const denseCycleThrottle = shouldThrottleTemporalCycleDensity(config, state, ctx);
+  const denseCycleThrottle = shouldThrottleNewCycleDensity(config, state, ctx);
   const stickyOverlapCarryActive =
     ctx.forcedOverlapRepairArbitration === "favor_independent_overlap" &&
     (ctx.protectedResidualShares ?? 0) > 0;
@@ -1168,17 +1816,70 @@ function evaluateTemporalSingleLegSeed(
   const preferredOverlapSeedSide =
     ctx.allowControlledOverlap || stickyOverlapCarryActive ? ctx.preferredOverlapSeedSide : undefined;
   const preferredOverlapSeedBoost = preferredOverlapSeedSide ? 1.4 : 0;
-  const candidates = (["UP", "DOWN"] as OutcomeSide[]).map((side) => {
+  const overlapMatchedInventoryQuality =
+    ctx.matchedInventoryQuality ??
+    Number(
+      Math.min(
+        1.25,
+        Math.min(state.upShares, state.downShares) /
+          Math.max(config.liveSmallLotLadder[0] ?? config.defaultLot, 1e-6),
+      ).toFixed(6),
+    );
+  const completionCarrySideBoost = (side: OutcomeSide): number =>
+    completionCarrySideRhythmBoost({
+      config,
+      state,
+      side,
+      activeIndependentFlowCount: ctx.activeIndependentFlowCount,
+      recentSeedFlowCount: ctx.recentSeedFlowCount,
+      matchedInventoryQuality: overlapMatchedInventoryQuality,
+      protectedResidualShares: ctx.protectedResidualShares,
+    });
+  const flowIntentSeedSide =
+    ctx.childOrderMicroTimingBias === "flow_intent" && shouldPreferFlowIntentTemporalSeedChildOrder(ctx)
+      ? preferredFlowIntentChildOrderSide(state)
+      : undefined;
+  const flowIntentSeedBoost = flowIntentSeedSide ? 0.55 : 0;
+  const rawSideRhythmSide = preferredTemporalSeedRhythmSide(state);
+  const rawSideRhythmBoost =
+    ctx.childOrderMicroTimingBias === "flow_intent"
+      ? ctx.semanticRoleAlignmentBias === "cycle_role_arbitration"
+        ? 0.9
+        : 0.65
+      : 0;
+  const priorityScore = (candidate: {
+    side: OutcomeSide;
+    classifierScore: number;
+  }): number =>
+    Number(
+      (
+        candidate.classifierScore +
+        (overlapSequencePrior?.side === candidate.side ? overlapPriorBoost : 0) +
+        (preferredOverlapSeedSide === candidate.side ? preferredOverlapSeedBoost : 0) +
+        (flowIntentSeedSide === candidate.side ? flowIntentSeedBoost : 0) +
+        (rawSideRhythmBoost > 0
+          ? candidate.side === rawSideRhythmSide
+            ? rawSideRhythmBoost
+            : -rawSideRhythmBoost * 0.35
+          : 0) +
+        completionCarrySideBoost(candidate.side)
+      ).toFixed(6),
+    );
+  const buildTemporalSeedCandidate = (
+    side: OutcomeSide,
+    requestedSize: number,
+    sizingMode: TemporalSeedCandidate["sizingMode"],
+  ): TemporalSeedCandidate => {
     const oppositeSide: OutcomeSide = side === "UP" ? "DOWN" : "UP";
     const currentSideShares = side === "UP" ? state.upShares : state.downShares;
     const oppositeShares = oppositeSide === "UP" ? state.upShares : state.downShares;
-    const initialSeedQuote = books.quoteForSize(side, "ask", candidateSize);
+    const initialSeedQuote = books.quoteForSize(side, "ask", requestedSize);
     const initialSeedFilledSize = normalizeOrderSize(initialSeedQuote.filledSize, state.market.minOrderSize);
-    const initialOppositeQuote = books.quoteForSize(oppositeSide, "ask", candidateSize);
+    const initialOppositeQuote = books.quoteForSize(oppositeSide, "ask", requestedSize);
     const initialOppositeFilledSize = normalizeOrderSize(initialOppositeQuote.filledSize, state.market.minOrderSize);
     const maxSeedByOppositeDepth = initialOppositeFilledSize / Math.max(config.temporalSingleLegMinOppositeDepthRatio, 1e-6);
     const executableSize = normalizeOrderSize(
-      Math.min(candidateSize, initialSeedFilledSize, maxSeedByOppositeDepth),
+      Math.min(requestedSize, initialSeedFilledSize, maxSeedByOppositeDepth),
       state.market.minOrderSize,
     );
     const seedQuote =
@@ -1201,10 +1902,23 @@ function evaluateTemporalSingleLegSeed(
     const negativeEdgeUsdc = executableSize > 0 ? Math.max(0, referencePairCost - 1) * executableSize : 0;
     const projectedGap = Math.abs(currentSideShares + executableSize - oppositeShares);
     const effectiveProjectedGap = Math.max(0, projectedGap - protectedResidualAllowance(config, ctx, side));
+    const cheapSeedExpensiveCompletionBlocked = shouldBlockCheapSeedExpensiveCompletionSetup({
+      config,
+      state,
+      side,
+      secsFromOpen: ctx.secsFromOpen,
+      seedPrice: seedQuote.averagePrice,
+      oppositePrice: oppositeQuote.averagePrice,
+      referencePairCost,
+      oppositeCoverageRatio,
+      semanticRoleAlignmentBias: ctx.semanticRoleAlignmentBias,
+    });
     let skipReason: string | undefined;
 
     if (denseCycleThrottle) {
       skipReason = denseCycleThrottle;
+    } else if (cheapSeedExpensiveCompletionBlocked) {
+      skipReason = "cheap_seed_expensive_completion_guard";
     } else if (state.consecutiveSeedSide === side && state.consecutiveSeedCount >= config.maxConsecutiveSingleLegSeedsPerSide) {
       skipReason = "temporal_seed_side_limit";
     } else if (initialSeedFilledSize <= 0 || executableSize <= 0) {
@@ -1238,7 +1952,7 @@ function evaluateTemporalSingleLegSeed(
       state,
       side,
       execution: seedQuote,
-      candidateSize: executableSize > 0 ? executableSize : candidateSize,
+      candidateSize: executableSize > 0 ? executableSize : requestedSize,
       fairValueSnapshot: ctx.fairValueSnapshot,
     });
     const classifierScore = scoreTemporalSeedCycle({
@@ -1249,17 +1963,22 @@ function evaluateTemporalSingleLegSeed(
       secsFromOpen: ctx.secsFromOpen,
       seedQuote,
       oppositeQuote,
-      candidateSize,
+      candidateSize: requestedSize,
       executableSize,
       oppositeCoverageRatio,
       referencePairCost,
       orphanRisk,
       protectedResidualShares: ctx.protectedResidualShares,
       fairValueSnapshot: ctx.fairValueSnapshot,
+      openingSeedReleaseBias: ctx.openingSeedReleaseBias,
+      semanticRoleAlignmentBias: ctx.semanticRoleAlignmentBias,
+      completionRoleReleaseOrderBias: ctx.completionRoleReleaseOrderBias,
     });
 
     return {
       side,
+      requestedSize,
+      sizingMode,
       seedQuote,
       oppositeQuote,
       executableSize,
@@ -1273,20 +1992,45 @@ function evaluateTemporalSingleLegSeed(
       classifierScore,
       skipReason,
     };
-  }).sort((left, right) => {
-    const rightPriorityScore =
-      right.classifierScore +
-      (overlapSequencePrior?.side === right.side ? overlapPriorBoost : 0) +
-      (preferredOverlapSeedSide === right.side ? preferredOverlapSeedBoost : 0);
-    const leftPriorityScore =
-      left.classifierScore +
-      (overlapSequencePrior?.side === left.side ? overlapPriorBoost : 0) +
-      (preferredOverlapSeedSide === left.side ? preferredOverlapSeedBoost : 0);
+  };
+  const standardCandidates = (["UP", "DOWN"] as OutcomeSide[]).map((side) =>
+    buildTemporalSeedCandidate(side, candidateSize, "standard"),
+  );
+  const candidates = [
+    ...standardCandidates,
+    ...standardCandidates.flatMap((candidate) =>
+      buildTemporalSeedMicroFallbackCandidates({
+        config,
+        state,
+        candidateSize,
+        side: candidate.side,
+        standardCandidate: candidate,
+        buildTemporalSeedCandidate,
+      }),
+    ),
+  ].sort((left, right) => {
+    const rightPriorityScore = priorityScore(right);
+    const leftPriorityScore = priorityScore(left);
     if (rightPriorityScore !== leftPriorityScore) {
       return rightPriorityScore - leftPriorityScore;
     }
     return orphanRiskSortValue(left.orphanRisk) - orphanRiskSortValue(right.orphanRisk);
   });
+  const rhythmArbitration = resolveTemporalSeedSideRhythmArbitration({
+    config,
+    state,
+    ctx,
+    candidates,
+    priorityScore,
+    overlapSequencePriorScope: overlapSequencePrior?.scope,
+    overlapSequencePriorSide: overlapSequencePrior?.side,
+  });
+  if (rhythmArbitration.overrideIndex > 0) {
+    const [rhythmCandidate] = candidates.splice(rhythmArbitration.overrideIndex, 1);
+    if (rhythmCandidate) {
+      candidates.unshift(rhythmCandidate);
+    }
+  }
   if (preferredOverlapSeedSide) {
     const preferredIndex = candidates.findIndex(
       (candidate) =>
@@ -1302,19 +2046,56 @@ function evaluateTemporalSingleLegSeed(
       }
     }
   }
+  if (
+    candidates[0]?.sizingMode === "rhythm_micro" &&
+    rhythmArbitration.intendedSide === candidates[0].side
+  ) {
+    rhythmArbitration.selectedSide = candidates[0].side;
+    rhythmArbitration.rejectedSide = candidates.find((candidate) => candidate.sizingMode === "standard")?.side;
+    rhythmArbitration.scoreDelta = Number(
+      (
+        (candidates.find((candidate) => candidate.sizingMode === "standard")
+          ? priorityScore(candidates.find((candidate) => candidate.sizingMode === "standard")!)
+          : priorityScore(candidates[0])) - priorityScore(candidates[0])
+      ).toFixed(6),
+    );
+    rhythmArbitration.decision = "rhythm_micro_fallback";
+  }
 
   const traces: SingleLegSeedCandidateTrace[] = [];
   let decision: EntryBuyDecision | undefined;
+  const selectedPriorityScore = candidates[0] ? priorityScore(candidates[0]) : undefined;
 
   for (const candidate of candidates) {
     const traceSkipReason = candidate.skipReason ?? candidate.fairValueDecision.reason ?? candidate.orphanRisk.reason;
+    const candidatePriorityScore = priorityScore(candidate);
     traces.push({
       side: candidate.side,
-      requestedSize: candidateSize,
+      requestedSize: candidate.requestedSize,
       filledSize: candidate.executableSize,
+      sizingMode: candidate.sizingMode,
+      semanticRoleTarget: semanticRoleTargetForPair(
+        candidate.side === "UP" ? candidate.seedQuote.averagePrice : candidate.oppositeQuote.averagePrice,
+        candidate.side === "DOWN" ? candidate.seedQuote.averagePrice : candidate.oppositeQuote.averagePrice,
+        ctx.semanticRoleAlignmentBias,
+      ),
       oppositeFilledSize: candidate.oppositeFilledSize,
       oppositeCoverageRatio: candidate.oppositeCoverageRatio,
       classifierScore: candidate.classifierScore,
+      priorityScore: candidatePriorityScore,
+      ...(selectedPriorityScore !== undefined
+        ? { priorityScoreDelta: Number((selectedPriorityScore - candidatePriorityScore).toFixed(6)) }
+        : {}),
+      completionRoleOrderScore: completionReleaseRoleOrderScore({
+        config,
+        side: candidate.side,
+        secsFromOpen: ctx.secsFromOpen,
+        seedPrice: candidate.seedQuote.averagePrice,
+        oppositePrice: candidate.oppositeQuote.averagePrice,
+        oppositeCoverageRatio: candidate.oppositeCoverageRatio,
+        referencePairCost: candidate.referencePairCost,
+        completionRoleReleaseOrderBias: ctx.completionRoleReleaseOrderBias,
+      }),
       averagePrice: candidate.seedQuote.averagePrice,
       limitPrice: candidate.seedQuote.limitPrice,
       effectivePricePerShare: candidate.effectivePricePerShare,
@@ -1351,10 +2132,169 @@ function evaluateTemporalSingleLegSeed(
   return {
     ...(decision ? { decision } : {}),
     trace: traces,
+    rhythmArbitration,
+    childOrder: {
+      ...(flowIntentSeedSide ? { intendedSide: flowIntentSeedSide } : {}),
+      ...(decision ? { selectedSide: decision.side } : {}),
+      reason: flowIntentSeedSide ? "flow_intent" : "temporal_priority",
+    },
+    semanticRoleTarget: decision
+      ? traces.find((trace) => trace.allowed && trace.side === decision.side)?.semanticRoleTarget
+      : undefined,
   };
 }
 
-function shouldThrottleTemporalCycleDensity(
+function buildTemporalSeedMicroFallbackCandidates(args: {
+  config: XuanStrategyConfig;
+  state: XuanMarketState;
+  candidateSize: number;
+  side: OutcomeSide;
+  standardCandidate: TemporalSeedCandidate;
+  buildTemporalSeedCandidate: (
+    side: OutcomeSide,
+    requestedSize: number,
+    sizingMode: TemporalSeedCandidate["sizingMode"],
+  ) => TemporalSeedCandidate;
+}): TemporalSeedCandidate[] {
+  if (!shouldTryTemporalSeedMicroFallback(args.standardCandidate)) {
+    return [];
+  }
+  const baseLot = args.config.liveSmallLotLadder[0] ?? args.config.defaultLot;
+  const sizes = Array.from(
+    new Set(
+      [
+        args.candidateSize * 0.7,
+        args.candidateSize * 0.5,
+        Math.min(args.candidateSize, baseLot * 0.5),
+      ]
+        .map((size) => normalizeOrderSize(size, args.state.market.minOrderSize))
+        .filter((size) => size > 0 && size < args.candidateSize),
+    ),
+  ).sort((left, right) => right - left);
+
+  const candidates: TemporalSeedCandidate[] = [];
+  for (const size of sizes) {
+    const candidate = args.buildTemporalSeedCandidate(args.side, size, "rhythm_micro");
+    if (
+      candidate.skipReason === undefined &&
+      candidate.fairValueDecision.allowed &&
+      candidate.orphanRisk.allowed
+    ) {
+      candidates.push(candidate);
+    }
+  }
+  return candidates;
+}
+
+function shouldTryTemporalSeedMicroFallback(candidate: TemporalSeedCandidate): boolean {
+  if (
+    candidate.skipReason === undefined &&
+    candidate.fairValueDecision.allowed &&
+    candidate.orphanRisk.allowed
+  ) {
+    return false;
+  }
+  const sizeSensitiveSkipReasons = new Set<string>([
+    "temporal_seed_depth",
+    "temporal_seed_opposite_depth",
+    "temporal_seed_one_sided_exposure",
+    "temporal_cycle_budget",
+    "temporal_market_budget",
+    "temporal_daily_budget",
+  ]);
+  const sizeSensitiveOrphanReasons = new Set<string>([
+    "orphan_qty",
+    "orphan_notional",
+    "market_orphan_budget",
+  ]);
+  return (
+    (candidate.skipReason !== undefined && sizeSensitiveSkipReasons.has(candidate.skipReason)) ||
+    (candidate.orphanRisk.reason !== undefined && sizeSensitiveOrphanReasons.has(candidate.orphanRisk.reason))
+  );
+}
+
+function resolveTemporalSeedSideRhythmArbitration(args: {
+  config: XuanStrategyConfig;
+  state: XuanMarketState;
+  ctx: EntryLadderContext;
+  candidates: TemporalSeedCandidate[];
+  priorityScore: (candidate: { side: OutcomeSide; classifierScore: number }) => number;
+  overlapSequencePriorScope?: "exact" | "family" | undefined;
+  overlapSequencePriorSide?: OutcomeSide | undefined;
+}): {
+  intendedSide?: OutcomeSide | undefined;
+  selectedSide?: OutcomeSide | undefined;
+  rejectedSide?: OutcomeSide | undefined;
+  scoreDelta?: number | undefined;
+  decision: "kept_priority" | "rhythm_override" | "rhythm_micro_fallback" | "no_viable_rhythm_side";
+  overrideIndex: number;
+} {
+  const selected = args.candidates[0];
+  if (args.config.botMode !== "XUAN" || !selected) {
+    return { decision: "kept_priority", overrideIndex: -1 };
+  }
+
+  const intendedSide = preferredTemporalSeedRhythmSide(args.state);
+  const rhythmIndex = args.candidates.findIndex(
+    (candidate) =>
+      candidate.side === intendedSide &&
+      candidate.skipReason === undefined &&
+      candidate.fairValueDecision.allowed &&
+      candidate.orphanRisk.allowed,
+  );
+  if (rhythmIndex < 0) {
+    return {
+      intendedSide,
+      selectedSide: selected.side,
+      decision: "no_viable_rhythm_side",
+      overrideIndex: -1,
+    };
+  }
+
+  const rhythmCandidate = args.candidates[rhythmIndex]!;
+  const selectedPriorityScore = args.priorityScore(selected);
+  const rhythmPriorityScore = args.priorityScore(rhythmCandidate);
+  const scoreDelta = Number((selectedPriorityScore - rhythmPriorityScore).toFixed(6));
+  const protectedResidualShares = Math.max(0, args.ctx.protectedResidualShares ?? 0);
+  const residualPressure =
+    protectedResidualShares > 0 ? residualSeverityPressure(args.config, protectedResidualShares) : 0;
+  const denseFlow =
+    (args.ctx.activeIndependentFlowCount ?? 0) >= 1 ||
+    (args.ctx.recentSeedFlowCount ?? 0) >= 2 ||
+    (args.ctx.matchedInventoryQuality ?? 0) >= 0.75;
+  const priorConflictPenalty =
+    args.overlapSequencePriorScope === "exact" && args.overlapSequencePriorSide !== intendedSide ? 0.45 : 0;
+  const preserveRawSideBoost =
+    args.ctx.semanticRoleAlignmentBias === "preserve_raw_side"
+      ? 0.35
+      : args.ctx.semanticRoleAlignmentBias === "cycle_role_arbitration"
+        ? args.ctx.childOrderMicroTimingBias === "flow_intent"
+          ? 0.42
+          : 0.16
+        : 0;
+  const tolerance = Number(
+    Math.max(
+      0.35,
+      0.65 +
+        (denseFlow ? 0.4 : 0) +
+        Math.min(0.35, residualPressure * 0.35) +
+        preserveRawSideBoost -
+        priorConflictPenalty,
+    ).toFixed(6),
+  );
+  const shouldOverride = rhythmIndex > 0 && scoreDelta <= tolerance + 1e-9;
+
+  return {
+    intendedSide,
+    selectedSide: shouldOverride ? rhythmCandidate.side : selected.side,
+    rejectedSide: shouldOverride ? selected.side : rhythmCandidate.side,
+    scoreDelta,
+    decision: shouldOverride ? "rhythm_override" : "kept_priority",
+    overrideIndex: shouldOverride ? rhythmIndex : -1,
+  };
+}
+
+function shouldThrottleNewCycleDensity(
   config: XuanStrategyConfig,
   state: XuanMarketState,
   ctx: EntryLadderContext,
@@ -1362,21 +2302,41 @@ function shouldThrottleTemporalCycleDensity(
   if (config.botMode !== "XUAN") {
     return undefined;
   }
-  const recentSeedFlowCount = Math.max(0, ctx.recentSeedFlowCount ?? 0);
-  const activeIndependentFlowCount = Math.max(0, ctx.activeIndependentFlowCount ?? 0);
   const protectedResidualShares = Math.max(0, ctx.protectedResidualShares ?? 0);
   const protectedResidualActive = protectedResidualShares > Math.max(config.repairMinQty, config.completionMinQty);
   const exactSeedPrior = config.xuanCloneMode === "PUBLIC_FOOTPRINT"
     ? resolveBundledSeedSequencePrior(state.market.slug, ctx.secsFromOpen)?.scope === "exact"
     : false;
+  const recentCycleOpeners = state.fillHistory.filter(
+    (fill) =>
+      fill.side === "BUY" &&
+      ctx.secsFromOpen - Math.max(0, fill.timestamp - state.market.startTs) <= 120 &&
+      (
+        fill.executionMode === "STRICT_PAIR_SWEEP" ||
+        fill.executionMode === "XUAN_SOFT_PAIR_SWEEP" ||
+        fill.executionMode === "XUAN_HARD_PAIR_SWEEP" ||
+        fill.executionMode === "TEMPORAL_SINGLE_LEG_SEED" ||
+        fill.executionMode === "PAIRGROUP_COVERED_SEED"
+      ),
+  ).length;
 
   if (protectedResidualActive || exactSeedPrior) {
+    return undefined;
+  }
+  if (ctx.secsFromOpen < 120) {
     return undefined;
   }
   if (ctx.secsToClose <= Math.max(config.finalWindowCompletionOnlySec, config.temporalSingleLegTtlSec)) {
     return undefined;
   }
-  if (recentSeedFlowCount >= 3 || activeIndependentFlowCount >= 3) {
+  if (
+    ctx.secsFromOpen >= 150 &&
+    ctx.flowPressureState?.confirmed &&
+    ctx.flowPressureState.remainingBudget >= 0.55
+  ) {
+    return undefined;
+  }
+  if (recentCycleOpeners >= 3) {
     return "temporal_cycle_density";
   }
   return undefined;
@@ -1590,6 +2550,12 @@ function evaluateSingleLegSeed(
 ): {
   decisions?: EntryBuyDecision[];
   trace: SingleLegSeedCandidateTrace[];
+  childOrder?: {
+    intendedSide?: OutcomeSide | undefined;
+    selectedSide?: OutcomeSide | undefined;
+    reason: "flow_intent" | "covered_seed_priority";
+  } | undefined;
+  semanticRoleTarget?: EntryDecisionTrace["semanticRoleTarget"] | undefined;
 } {
   if (
     config.botMode !== "XUAN" ||
@@ -1614,6 +2580,10 @@ function evaluateSingleLegSeed(
     return { trace: [] };
   }
 
+  const flowIntentCoveredSeedSide =
+    ctx.childOrderMicroTimingBias === "flow_intent" && shouldPreferFlowIntentTemporalSeedChildOrder(ctx)
+      ? preferredFlowIntentChildOrderSide(state)
+      : undefined;
   const sideOrder = (["UP", "DOWN"] as OutcomeSide[]).sort((left, right) => {
     const leftQuote = books.quoteForSize(left, "ask", candidateSize);
     const rightQuote = books.quoteForSize(right, "ask", candidateSize);
@@ -1635,7 +2605,17 @@ function evaluateSingleLegSeed(
       candidateSize: rightSize > 0 ? rightSize : candidateSize,
       fairValueSnapshot: ctx.fairValueSnapshot,
     });
-    return orphanRiskSortValue(leftRisk) - orphanRiskSortValue(rightRisk);
+    const riskDelta = orphanRiskSortValue(leftRisk) - orphanRiskSortValue(rightRisk);
+    if (riskDelta !== 0) {
+      return riskDelta;
+    }
+    if (flowIntentCoveredSeedSide === left && flowIntentCoveredSeedSide !== right) {
+      return -1;
+    }
+    if (flowIntentCoveredSeedSide === right && flowIntentCoveredSeedSide !== left) {
+      return 1;
+    }
+    return 0;
   });
   const traces: SingleLegSeedCandidateTrace[] = [];
   let decisions: EntryBuyDecision[] | undefined;
@@ -1667,6 +2647,19 @@ function evaluateSingleLegSeed(
       pairExecutableSize > 0
         ? Math.max(0, referencePairCost - 1) * Math.max(pairExecutableSize, candidateSize)
         : 0;
+    const cheapSeedExpensiveCompletionBlocked = shouldBlockCheapSeedExpensiveCompletionSetup({
+      config,
+      state,
+      side,
+      secsFromOpen: ctx.secsFromOpen,
+      seedPrice: seedQuote.averagePrice,
+      oppositePrice: oppositeQuote.averagePrice,
+      referencePairCost,
+      oppositeCoverageRatio: pairExecutableSize > 0
+        ? Number((oppositeExecutableSize / pairExecutableSize).toFixed(6))
+        : 0,
+      semanticRoleAlignmentBias: ctx.semanticRoleAlignmentBias,
+    });
     let skipReason: string | undefined;
 
     const hasOppositeInventoryCover =
@@ -1686,6 +2679,8 @@ function evaluateSingleLegSeed(
 
     if (!config.coveredSeedAllowSamePairgroupOppositeOrder && !canUseInventoryCover && !config.allowNakedSingleLegSeed) {
       skipReason = "seed_requires_same_pairgroup_opposite_order";
+    } else if (cheapSeedExpensiveCompletionBlocked) {
+      skipReason = "cheap_seed_expensive_completion_guard";
     } else if (!config.allowNakedSingleLegSeed && !canUseInventoryCover && !requiresSamePairgroupOppositeOrder) {
       skipReason = "seed_missing_opposite_inventory";
     } else if (state.consecutiveSeedSide === side && state.consecutiveSeedCount >= config.maxConsecutiveSingleLegSeedsPerSide) {
@@ -1733,6 +2728,11 @@ function evaluateSingleLegSeed(
       side,
       requestedSize: candidateSize,
       filledSize: pairExecutableSize,
+      semanticRoleTarget: semanticRoleTargetForPair(
+        side === "UP" ? seedQuote.averagePrice : oppositeQuote.averagePrice,
+        side === "DOWN" ? seedQuote.averagePrice : oppositeQuote.averagePrice,
+        ctx.semanticRoleAlignmentBias,
+      ),
       averagePrice: seedQuote.averagePrice,
       limitPrice: seedQuote.limitPrice,
       effectivePricePerShare,
@@ -1787,6 +2787,14 @@ function evaluateSingleLegSeed(
   return {
     ...(decisions ? { decisions } : {}),
     trace: traces,
+    childOrder: {
+      ...(flowIntentCoveredSeedSide ? { intendedSide: flowIntentCoveredSeedSide } : {}),
+      ...(decisions?.[0] ? { selectedSide: decisions[0].side } : {}),
+      reason: flowIntentCoveredSeedSide ? "flow_intent" : "covered_seed_priority",
+    },
+    semanticRoleTarget: decisions?.[0]
+      ? traces.find((trace) => trace.allowed && trace.side === decisions?.[0]?.side)?.semanticRoleTarget
+      : undefined,
   };
 }
 
@@ -1851,16 +2859,21 @@ function determineBalancedPairSkipReason(
 }
 
 function buildBalancedPairEntryBuys(
+  config: Pick<XuanStrategyConfig, "botMode">,
   state: XuanMarketState,
+  secsFromOpen: number,
+  childOrderMicroTimingBias: EntryLadderContext["childOrderMicroTimingBias"],
   candidate: BalancedPairCandidate,
   feeRate: number,
   reason: EntryBuyReason,
 ): EntryBuyDecision[] {
-  return [
+  const firstSide = preferredBalancedPairFirstSide(config, state, secsFromOpen, childOrderMicroTimingBias, candidate);
+  const sideOrder: OutcomeSide[] = [firstSide, firstSide === "UP" ? "DOWN" : "UP"];
+  return sideOrder.map((side) =>
     buildEntryBuy(
       state,
-      "UP",
-      candidate.upExecution,
+      side,
+      side === "UP" ? candidate.upExecution : candidate.downExecution,
       reason,
       candidate.mode,
       feeRate,
@@ -1868,18 +2881,165 @@ function buildBalancedPairEntryBuys(
       candidate.negativeEdgeUsdc,
       candidate.rawPairCost,
     ),
-    buildEntryBuy(
-      state,
-      "DOWN",
-      candidate.downExecution,
-      reason,
-      candidate.mode,
-      feeRate,
-      candidate.pairCost,
-      candidate.negativeEdgeUsdc,
-      candidate.rawPairCost,
-    ),
+  );
+}
+
+function preferredBalancedPairFirstSide(
+  config: Pick<XuanStrategyConfig, "botMode">,
+  state: XuanMarketState,
+  secsFromOpen: number,
+  childOrderMicroTimingBias: EntryLadderContext["childOrderMicroTimingBias"],
+  candidate: BalancedPairCandidate,
+): OutcomeSide {
+  if (config.botMode !== "XUAN") {
+    return "UP";
+  }
+  const highLowFirstSide = preferredHighLowBalancedPairFirstSide(candidate);
+  const flowIntentFirstSide =
+    childOrderMicroTimingBias === "flow_intent" ? preferredFlowIntentChildOrderSide(state) : undefined;
+  if (
+    flowIntentFirstSide &&
+    shouldPreferFlowIntentBalancedPairChildOrder({
+      secsFromOpen,
+      candidate,
+    })
+  ) {
+    return flowIntentFirstSide;
+  }
+  if (secsFromOpen >= 70) {
+    return highLowFirstSide ?? "UP";
+  }
+  const lastBuy = [...state.fillHistory].reverse().find((fill) => fill.side === "BUY");
+  if (!lastBuy?.executionMode) {
+    return highLowFirstSide ?? "UP";
+  }
+  if (
+    [
+      "PARTIAL_FAST_COMPLETION",
+      "PARTIAL_SOFT_COMPLETION",
+      "PARTIAL_EMERGENCY_COMPLETION",
+      "POST_MERGE_RESIDUAL_COMPLETION",
+      "HIGH_LOW_COMPLETION_CHASE",
+      "CHEAP_LATE_COMPLETION_CHASE",
+    ].includes(lastBuy.executionMode)
+  ) {
+    return lastBuy.outcome;
+  }
+  return highLowFirstSide ?? "UP";
+}
+
+function balancedPairChildOrderTrace(
+  config: Pick<XuanStrategyConfig, "botMode">,
+  state: XuanMarketState,
+  secsFromOpen: number,
+  childOrderMicroTimingBias: EntryLadderContext["childOrderMicroTimingBias"],
+  candidate: BalancedPairCandidate,
+): Pick<EntryDecisionTrace, "childOrderIntendedSide" | "childOrderSelectedSide" | "childOrderReason"> {
+  const selectedSide = preferredBalancedPairFirstSide(config, state, secsFromOpen, childOrderMicroTimingBias, candidate);
+  if (config.botMode !== "XUAN") {
+    return {
+      childOrderSelectedSide: selectedSide,
+      childOrderReason: "default",
+    };
+  }
+  const flowIntentSide =
+    childOrderMicroTimingBias === "flow_intent" ? preferredFlowIntentChildOrderSide(state) : undefined;
+  if (
+    flowIntentSide &&
+    selectedSide === flowIntentSide &&
+    shouldPreferFlowIntentBalancedPairChildOrder({ secsFromOpen, candidate })
+  ) {
+    return {
+      childOrderIntendedSide: flowIntentSide,
+      childOrderSelectedSide: selectedSide,
+      childOrderReason: "flow_intent",
+    };
+  }
+  if (preferredHighLowBalancedPairFirstSide(candidate) === selectedSide) {
+    return {
+      ...(flowIntentSide ? { childOrderIntendedSide: flowIntentSide } : {}),
+      childOrderSelectedSide: selectedSide,
+      childOrderReason: "high_low_price",
+    };
+  }
+  return {
+    ...(flowIntentSide ? { childOrderIntendedSide: flowIntentSide } : {}),
+    childOrderSelectedSide: selectedSide,
+    childOrderReason: selectedSide === preferredRecentCompletionSide(state) ? "recent_completion" : "default",
+  };
+}
+
+function preferredFlowIntentChildOrderSide(state: XuanMarketState): OutcomeSide | undefined {
+  const completionModes: StrategyExecutionMode[] = [
+    "PARTIAL_FAST_COMPLETION",
+    "PARTIAL_SOFT_COMPLETION",
+    "PARTIAL_EMERGENCY_COMPLETION",
+    "POST_MERGE_RESIDUAL_COMPLETION",
+    "HIGH_LOW_COMPLETION_CHASE",
+    "CHEAP_LATE_COMPLETION_CHASE",
   ];
+  const recentCompletion = [...state.fillHistory]
+    .reverse()
+    .find((fill) => fill.side === "BUY" && fill.executionMode !== undefined && completionModes.includes(fill.executionMode));
+  return recentCompletion?.outcome;
+}
+
+function preferredRecentCompletionSide(state: XuanMarketState): OutcomeSide | undefined {
+  const lastBuy = [...state.fillHistory].reverse().find((fill) => fill.side === "BUY");
+  if (!lastBuy?.executionMode) {
+    return undefined;
+  }
+  return [
+    "PARTIAL_FAST_COMPLETION",
+    "PARTIAL_SOFT_COMPLETION",
+    "PARTIAL_EMERGENCY_COMPLETION",
+    "POST_MERGE_RESIDUAL_COMPLETION",
+    "HIGH_LOW_COMPLETION_CHASE",
+    "CHEAP_LATE_COMPLETION_CHASE",
+  ].includes(lastBuy.executionMode)
+    ? lastBuy.outcome
+    : undefined;
+}
+
+function shouldPreferFlowIntentBalancedPairChildOrder(args: {
+  secsFromOpen: number;
+  candidate: BalancedPairCandidate;
+}): boolean {
+  const spread = Math.abs(args.candidate.upExecution.averagePrice - args.candidate.downExecution.averagePrice);
+  if (spread >= 0.55) {
+    return false;
+  }
+  return args.secsFromOpen >= 24 && args.secsFromOpen <= 210;
+}
+
+function preferredHighLowBalancedPairFirstSide(candidate: BalancedPairCandidate): OutcomeSide | undefined {
+  const spread = Math.abs(candidate.upExecution.averagePrice - candidate.downExecution.averagePrice);
+  if (spread < 0.25) {
+    return undefined;
+  }
+  return candidate.upExecution.averagePrice >= candidate.downExecution.averagePrice ? "UP" : "DOWN";
+}
+
+function shouldPreferFlowIntentTemporalSeedChildOrder(ctx: EntryLadderContext): boolean {
+  return ctx.secsFromOpen >= 24 && ctx.secsFromOpen <= 210;
+}
+
+function semanticRoleTargetForPair(
+  upPrice: number,
+  downPrice: number,
+  semanticRoleAlignmentBias: EntryLadderContext["semanticRoleAlignmentBias"],
+): EntryDecisionTrace["semanticRoleTarget"] {
+  if (semanticRoleAlignmentBias === "preserve_raw_side") {
+    return "raw_side_preserve";
+  }
+  const spread = Math.abs(upPrice - downPrice);
+  if (spread >= 0.25) {
+    return "high_low_setup";
+  }
+  if (upPrice >= 0.42 && upPrice <= 0.58 && downPrice >= 0.42 && downPrice <= 0.58) {
+    return "mid_pair";
+  }
+  return "neutral";
 }
 
 function buildEntryBuy(

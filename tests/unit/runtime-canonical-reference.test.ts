@@ -108,6 +108,35 @@ function createRuntimeDb(path: string): DatabaseSync {
 }
 
 describe("runtime canonical reference extraction", () => {
+  it("marks a requested market with no local runtime fills as no_runtime_fills instead of a broken strategy footprint", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "runtime-canonical-empty-"));
+    cleanupDirs.push(dir);
+    const dbPath = join(dir, "runtime.sqlite");
+    const logsDir = join(dir, "logs");
+    await mkdir(logsDir, { recursive: true });
+
+    const db = createRuntimeDb(dbPath);
+    db.close();
+    await writeJsonl(join(logsDir, "decision_trace.jsonl"), []);
+    await writeJsonl(join(logsDir, "orders.jsonl"), []);
+    await writeJsonl(join(logsDir, "risk_events.jsonl"), []);
+
+    const slug = "btc-updown-5m-1777000300";
+    const bundle = await buildRuntimeCanonicalExtractBundle({
+      stateDbPath: dbPath,
+      logsDir,
+      marketSlugs: [slug],
+    });
+
+    expect(bundle.references).toHaveLength(1);
+    expect(bundle.references[0]?.authority.totalBuyCount).toBe(0);
+    expect(bundle.diagnosticsBySlug[slug]).toMatchObject({
+      buyCount: 0,
+      lifecycleEventCount: 0,
+      runtimeDataStatus: "no_runtime_fills",
+    });
+  });
+
   it("extracts a healthy group-primary runtime footprint with normalized clip tiers", async () => {
     const dir = await mkdtemp(join(tmpdir(), "runtime-canonical-"));
     cleanupDirs.push(dir);
@@ -170,6 +199,26 @@ describe("runtime canonical reference extraction", () => {
     db.close();
 
     await writeJsonl(join(logsDir, "decision_trace.jsonl"), []);
+    await writeJsonl(join(logsDir, "orders.jsonl"), [
+      {
+        ts: 1777000004,
+        marketSlug: slug,
+        eventType: "pair_orders_submit",
+        sequentialPairExecution: true,
+        interChildDelayMs: 40,
+        childOrderReason: "flow_intent",
+        childOrderMicroTimingBias: "flow_intent",
+      },
+      {
+        ts: 1777000010,
+        marketSlug: slug,
+        eventType: "pair_orders_submit",
+        sequentialPairExecution: false,
+        interChildDelayMs: 120,
+        childOrderReason: "default",
+        childOrderMicroTimingBias: "neutral",
+      },
+    ]);
     await writeJsonl(join(logsDir, "risk_events.jsonl"), []);
 
     const bundle = await buildRuntimeCanonicalExtractBundle({
@@ -194,6 +243,14 @@ describe("runtime canonical reference extraction", () => {
       grouplessBotFill: 0,
       repairSizeZeroWithGap: 0,
       mergeMissWithValidQty: 0,
+    });
+    expect(bundle.diagnosticsBySlug[slug]?.childOrderDispatch).toEqual({
+      pairSubmitCount: 2,
+      sequentialPairSubmitCount: 1,
+      flowIntentPairSubmitCount: 1,
+      compressedPairSubmitCount: 1,
+      averageInterChildDelayMs: 80,
+      maxInterChildDelayMs: 120,
     });
   });
 

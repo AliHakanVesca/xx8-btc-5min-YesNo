@@ -115,7 +115,16 @@ export function chooseLot(config: XuanStrategyConfig, ctx: LotContext): number {
         ctx.secsFromOpen <= sequencePrior.activeUntilSec + 1e-9 &&
         ctx.bookDepthGood
       ) {
-        return Number((sequencePrior.scope === "exact" ? sequencePrior.qty : Math.max(cloneBase, sequencePrior.qty)).toFixed(6));
+        if (sequencePrior.scope === "exact") {
+          return Number(sequencePrior.qty.toFixed(6));
+        }
+        return familySequencePriorLot({
+          secsFromOpen: ctx.secsFromOpen,
+          priorQty: sequencePrior.qty,
+          cloneBase,
+          cloneHigh,
+          cloneMax,
+        });
       }
       if (ctx.secsFromOpen < 20) {
         if (!ctx.bookDepthGood) {
@@ -232,4 +241,23 @@ export function chooseLot(config: XuanStrategyConfig, ctx: LotContext): number {
     return baseLots[2] ?? config.defaultLot;
   }
   return config.defaultLot;
+}
+
+function familySequencePriorLot(args: {
+  secsFromOpen: number;
+  priorQty: number;
+  cloneBase: number;
+  cloneHigh: number;
+  cloneMax: number;
+}): number {
+  if (args.secsFromOpen < 18) {
+    return Number((args.priorQty * 0.25 + args.cloneMax * 0.75).toFixed(6));
+  }
+  if (args.secsFromOpen < 40) {
+    return Number((args.priorQty * 0.6 + args.cloneHigh * 0.4).toFixed(6));
+  }
+  if (args.secsFromOpen >= 40) {
+    return Number(args.priorQty.toFixed(6));
+  }
+  return Number(Math.max(args.cloneBase, args.priorQty).toFixed(6));
 }

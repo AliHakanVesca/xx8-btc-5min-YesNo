@@ -9,7 +9,13 @@ import { analyzeXuanFile, writeXuanMarkdownReport } from "./infra/dataApi/xuanAn
 import { runSyntheticReplay } from "./analytics/replaySimulator.js";
 import { runMultiSyntheticReplay } from "./analytics/multiReplay.js";
 import { runLivePaperSession } from "./analytics/livePaper.js";
-import { runPaperSession, type PaperSessionVariant } from "./analytics/paperSession.js";
+import {
+  isPaperSessionVariant,
+  paperSessionVariants,
+  runPaperSession,
+  type PaperSessionReport,
+  type PaperSessionVariant,
+} from "./analytics/paperSession.js";
 import {
   buildCanonicalReferenceBundle,
   buildCanonicalReferenceFromPaperSession,
@@ -22,6 +28,7 @@ import {
   buildFlowCalibrationSummary,
   classifyComparisonFlowSummary,
   compareCanonicalReference,
+  XUAN_FLOW_CALIBRATION_VERSION,
   type ComparisonFlowSummary,
   type FlowCalibrationSummary,
 } from "./analytics/xuanReplayComparator.js";
@@ -69,7 +76,30 @@ async function fileExists(path: string): Promise<boolean> {
 function extractFlowSummariesFromValidationRuns(
   runs: ReturnType<PersistentStateStore["recentValidationRuns"]>,
 ): ComparisonFlowSummary[] {
+  const acceptedByFootprint = new Map<string, number>();
   return runs
+    .filter(
+      (run) => {
+        if (
+          run.payload?.flowCalibrationVersion !== XUAN_FLOW_CALIBRATION_VERSION ||
+          run.payload?.flowCalibrationAccepted === false ||
+          (run.payload?.flowStatus as { status?: unknown } | undefined)?.status === "FAIL"
+        ) {
+          return false;
+        }
+        const footprintKey = [
+          String(run.payload?.command ?? "unknown"),
+          String(run.payload?.variant ?? "runtime"),
+          String(run.payload?.referenceSlug ?? run.payload?.marketSlug ?? "unknown"),
+        ].join(":");
+        const acceptedCount = acceptedByFootprint.get(footprintKey) ?? 0;
+        if (acceptedCount >= 3) {
+          return false;
+        }
+        acceptedByFootprint.set(footprintKey, acceptedCount + 1);
+        return true;
+      },
+    )
     .map((run) => run.payload?.flowSummary)
     .filter((summary): summary is ComparisonFlowSummary => {
       if (!summary || typeof summary !== "object") {
@@ -87,21 +117,410 @@ function extractFlowSummariesFromValidationRuns(
 function completionPatienceMultiplierFromCalibration(
   calibration: Pick<
     FlowCalibrationSummary,
-    "status" | "recommendedFocus" | "completionLatencyDirection" | "averageCycleCompletionLatencyDeltaSec"
+    | "status"
+    | "recommendedFocus"
+    | "completionLatencyDirection"
+    | "averageCycleCompletionLatencyDeltaSec"
+    | "averageCycleCompletionLatencyDeltaP50Sec"
+    | "averageCycleCompletionLatencyDeltaP75Sec"
   >,
 ): number {
   if (calibration.status !== "WARN" && calibration.status !== "FAIL") {
     return 1;
   }
   const focus = new Set(calibration.recommendedFocus);
-  const latencyDeltaSec = Math.abs(calibration.averageCycleCompletionLatencyDeltaSec);
+  const latencyDeltaSec = Math.abs(
+    calibration.averageCycleCompletionLatencyDeltaP75Sec || calibration.averageCycleCompletionLatencyDeltaSec,
+  );
+  if (focus.has("collect_replay_flow_samples")) {
+    return 0.63;
+  }
+  if (
+    focus.has("tune_completion_patience_and_release") &&
+    calibration.averageCycleCompletionLatencyDeltaP50Sec !== undefined &&
+    Math.abs(calibration.averageCycleCompletionLatencyDeltaP50Sec) <= 2 &&
+    latencyDeltaSec >= 4
+  ) {
+    return 0.63;
+  }
   if (focus.has("release_completion_earlier") || calibration.completionLatencyDirection === "candidate_late") {
-    return latencyDeltaSec >= 6 ? 0.45 : latencyDeltaSec >= 3 ? 0.65 : 0.78;
+    if (
+      calibration.averageCycleCompletionLatencyDeltaP50Sec !== undefined &&
+      Math.abs(calibration.averageCycleCompletionLatencyDeltaP50Sec) <= 2 &&
+      latencyDeltaSec >= 4
+    ) {
+      return 0.63;
+    }
+    return latencyDeltaSec >= 6 ? 0.25 : latencyDeltaSec >= 2 ? 0.55 : 0.75;
   }
   if (focus.has("increase_completion_patience") || calibration.completionLatencyDirection === "candidate_early") {
     return latencyDeltaSec >= 6 ? 1.28 : latencyDeltaSec >= 3 ? 1.2 : 1.12;
   }
   return 1;
+}
+
+function openingSeedTimingFromCalibration(
+  calibration: Pick<
+    FlowCalibrationSummary,
+    | "status"
+    | "recommendedFocus"
+    | "openingEntryTimingDirection"
+    | "averageFirstEntryOffsetDeltaSec"
+  >,
+): {
+  openingSeedOffsetShiftSec: number;
+  openingSeedReleaseBias: "neutral" | "earlier" | "later";
+} {
+  if (calibration.status !== "WARN" && calibration.status !== "FAIL") {
+    return { openingSeedOffsetShiftSec: 0, openingSeedReleaseBias: "neutral" };
+  }
+  const focus = new Set(calibration.recommendedFocus);
+  const coldStartCalibration = focus.has("collect_replay_flow_samples");
+  const maintainEarlyOpening = focus.has("maintain_opening_seed_early");
+  const releaseEarlier =
+    focus.has("release_opening_seed_earlier") ||
+    (calibration.openingEntryTimingDirection === "candidate_late" &&
+      Math.abs(calibration.averageFirstEntryOffsetDeltaSec ?? 0) >= 4);
+  const delayRelease =
+    focus.has("delay_opening_seed_release") ||
+    (calibration.openingEntryTimingDirection === "candidate_early" &&
+      Math.abs(calibration.averageFirstEntryOffsetDeltaSec ?? 0) >= 4);
+  const absoluteDeltaSec = Math.abs(calibration.averageFirstEntryOffsetDeltaSec ?? 0);
+  if (coldStartCalibration || maintainEarlyOpening) {
+    return { openingSeedOffsetShiftSec: 6, openingSeedReleaseBias: "earlier" };
+  }
+  if (releaseEarlier) {
+    return {
+      openingSeedOffsetShiftSec: Math.min(8, Math.max(6, Math.round(absoluteDeltaSec))),
+      openingSeedReleaseBias: "earlier",
+    };
+  }
+  if (delayRelease) {
+    return {
+      openingSeedOffsetShiftSec: -Math.min(8, Math.max(2, Math.round(absoluteDeltaSec))),
+      openingSeedReleaseBias: "later",
+    };
+  }
+  return { openingSeedOffsetShiftSec: 0, openingSeedReleaseBias: "neutral" };
+}
+
+function replayFlowCountBiasFromCalibration(
+  calibration: Pick<
+    FlowCalibrationSummary,
+    | "status"
+    | "recommendedFocus"
+    | "averageSideSequenceMismatchOffsetDeltaSec"
+    | "averageChildOrderGlobalAbsDelayP75Sec"
+    | "averageChildOrderMicroTimingMaxAbsDeltaSec"
+    | "averageChildOrderSideInversionCount"
+  >,
+): {
+  recentSeedFlowCountBonus: number;
+  activeIndependentFlowCountBonus: number;
+  overlapSeedOffsetShiftSec: number;
+  semanticRoleAlignmentBias: "neutral" | "align_high_low_role" | "preserve_raw_side" | "cycle_role_arbitration";
+  childOrderMicroTimingBias: "neutral" | "flow_intent";
+  completionRoleReleaseOrderBias: "neutral" | "role_order";
+} {
+  if (calibration.status !== "WARN" && calibration.status !== "FAIL") {
+    return {
+      recentSeedFlowCountBonus: 0,
+      activeIndependentFlowCountBonus: 0,
+      overlapSeedOffsetShiftSec: 0,
+      semanticRoleAlignmentBias: "neutral",
+      childOrderMicroTimingBias: "neutral",
+      completionRoleReleaseOrderBias: "neutral",
+    };
+  }
+
+  const focus = new Set(calibration.recommendedFocus);
+  if (focus.has("collect_replay_flow_samples")) {
+    return {
+      recentSeedFlowCountBonus: 0,
+      activeIndependentFlowCountBonus: 0,
+      overlapSeedOffsetShiftSec: 0,
+      semanticRoleAlignmentBias: "preserve_raw_side",
+      childOrderMicroTimingBias: "neutral",
+      completionRoleReleaseOrderBias: "neutral",
+    };
+  }
+  const preserveRawSide =
+    focus.has("preserve_raw_side_before_role_override") ||
+    focus.has("guard_role_alignment_against_side_regression") ||
+    focus.has("improve_seed_side_rhythm");
+  const highLowRoleRequested =
+    focus.has("align_high_low_role_sequence") ||
+    focus.has("compress_high_low_role_rhythm") ||
+    focus.has("tune_completion_role_release_order") ||
+    focus.has("align_completion_release_role_sequence");
+  const childOrderRequested =
+    focus.has("improve_child_order_micro_timing") ||
+    focus.has("compress_child_order_timing") ||
+    focus.has("stabilize_child_order_side_rhythm") ||
+    focus.has("tune_completion_role_release_order");
+  const roleArbitration = preserveRawSide && highLowRoleRequested && childOrderRequested;
+  const highLowRoleCompression = !preserveRawSide && highLowRoleRequested;
+  const sideCadenceShiftSec = focus.has("compress_overlap_seed_rhythm")
+    ? Math.ceil((calibration.averageSideSequenceMismatchOffsetDeltaSec ?? 0) * 0.4)
+    : 0;
+  const childOrderCadenceShiftSec = childOrderRequested
+    ? Math.min(
+        10,
+        Math.ceil(
+          Math.max(
+            calibration.averageChildOrderGlobalAbsDelayP75Sec ?? 0,
+            (calibration.averageChildOrderMicroTimingMaxAbsDeltaSec ?? 0) * 0.25,
+          ),
+        ),
+      )
+    : 0;
+  const sideInversionPressure = (calibration.averageChildOrderSideInversionCount ?? 0) > 0 ? 1 : 0;
+
+  return {
+    recentSeedFlowCountBonus:
+      (focus.has("increase_lineage_preservation") ? 1 : 0) +
+      (focus.has("compress_overlap_seed_rhythm") ? 1 : 0) +
+      (highLowRoleCompression ? 1 : 0) +
+      sideInversionPressure,
+    activeIndependentFlowCountBonus:
+      focus.has("allow_more_parallel_flow_when_budget_supports") || highLowRoleCompression ? 1 : 0,
+    overlapSeedOffsetShiftSec: Math.min(10, Math.max(0, sideCadenceShiftSec, childOrderCadenceShiftSec)),
+    semanticRoleAlignmentBias: roleArbitration
+      ? "cycle_role_arbitration"
+      : preserveRawSide
+      ? "preserve_raw_side"
+      : highLowRoleCompression
+        ? "align_high_low_role"
+        : "neutral",
+    childOrderMicroTimingBias: childOrderRequested ? "flow_intent" : "neutral",
+    completionRoleReleaseOrderBias: focus.has("tune_completion_role_release_order") ? "role_order" : "neutral",
+  };
+}
+
+function countBy(values: Array<string | null | undefined>): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const value of values) {
+    const key = value && value.length > 0 ? value : "none";
+    counts[key] = (counts[key] ?? 0) + 1;
+  }
+  return counts;
+}
+
+function buildPaperStrategyTraceSummary(
+  replay: PaperSessionReport,
+  replayFlowCountBias: ReturnType<typeof replayFlowCountBiasFromCalibration>,
+): {
+  residualSeverity: Record<string, number>;
+  overlapRepairArbitration: Record<string, number>;
+  overlapRepairOutcome: Record<string, number>;
+  sideRhythm: {
+    decision: Record<string, number>;
+    intendedSide: Record<string, number>;
+    selectedSide: Record<string, number>;
+    averageScoreDelta: number | null;
+  };
+  childOrder: {
+    reason: Record<string, number>;
+    intendedSide: Record<string, number>;
+    selectedSide: Record<string, number>;
+  };
+  semanticRoleTarget: Record<string, number>;
+  completionReleaseRole: Record<string, number>;
+  completionPatience: {
+    calibration: Record<string, number>;
+    roleMultiplier: Record<string, number>;
+    effectiveMultiplier: Record<string, number>;
+    waitUntilSec: Record<string, number>;
+  };
+  seedSizingMode: Record<string, number>;
+  repairSizingMode: Record<string, number>;
+  flowBudget: {
+    recentSeedFlowCountBonus: number;
+    activeIndependentFlowCountBonus: number;
+    overlapSeedOffsetShiftSec: number;
+    semanticRoleAlignmentBias: string;
+    childOrderMicroTimingBias: string;
+    completionRoleReleaseOrderBias: string;
+  };
+  stickyCarry: {
+    observable: boolean;
+    reason: string;
+  };
+} {
+  const traces = replay.steps.map((step) => step.decision.entryTrace).filter((trace) => trace !== undefined);
+  const seedCandidates = traces.flatMap((trace) => trace.seedCandidates ?? []);
+  const sideRhythmDeltas = traces
+    .map((trace) => trace.sideRhythmScoreDelta)
+    .filter((value): value is number => value !== undefined && Number.isFinite(value));
+  return {
+    residualSeverity: countBy(traces.map((trace) => trace.residualSeverityLevel)),
+    overlapRepairArbitration: countBy(traces.map((trace) => trace.overlapRepairArbitration)),
+    overlapRepairOutcome: countBy(traces.map((trace) => trace.overlapRepairOutcome)),
+    sideRhythm: {
+      decision: countBy(traces.map((trace) => trace.sideRhythmDecision)),
+      intendedSide: countBy(traces.map((trace) => trace.sideRhythmIntendedSide)),
+      selectedSide: countBy(traces.map((trace) => trace.sideRhythmSelectedSide)),
+      averageScoreDelta:
+        sideRhythmDeltas.length > 0
+          ? Number(
+              (
+                sideRhythmDeltas.reduce((sum, value) => sum + value, 0) / sideRhythmDeltas.length
+              ).toFixed(6),
+            )
+          : null,
+    },
+    childOrder: {
+      reason: countBy(traces.map((trace) => trace.childOrderReason)),
+      intendedSide: countBy(traces.map((trace) => trace.childOrderIntendedSide)),
+      selectedSide: countBy(traces.map((trace) => trace.childOrderSelectedSide)),
+    },
+    semanticRoleTarget: countBy(traces.map((trace) => trace.semanticRoleTarget)),
+    completionReleaseRole: countBy([
+      ...traces.map((trace) => trace.completionReleaseRole),
+      ...replay.steps.map((step) => step.decision.completionReleaseRole),
+    ]),
+    completionPatience: {
+      calibration: countBy([
+        ...traces.map((trace) => trace.completionCalibrationPatienceMultiplier?.toFixed(2)),
+        ...replay.steps.map((step) => step.decision.completionCalibrationPatienceMultiplier?.toFixed(2)),
+      ]),
+      roleMultiplier: countBy([
+        ...traces.map((trace) => trace.completionRolePatienceMultiplier?.toFixed(2)),
+        ...replay.steps.map((step) => step.decision.completionRolePatienceMultiplier?.toFixed(2)),
+      ]),
+      effectiveMultiplier: countBy([
+        ...traces.map((trace) => trace.completionEffectivePatienceMultiplier?.toFixed(2)),
+        ...replay.steps.map((step) => step.decision.completionEffectivePatienceMultiplier?.toFixed(2)),
+      ]),
+      waitUntilSec: countBy([
+        ...traces.map((trace) => trace.completionWaitUntilSec?.toFixed(1)),
+        ...replay.steps.map((step) => step.decision.completionWaitUntilSec?.toFixed(1)),
+      ]),
+    },
+    seedSizingMode: countBy(seedCandidates.map((candidate) => candidate.sizingMode)),
+    repairSizingMode: countBy(traces.map((trace) => trace.repairSizingMode)),
+    flowBudget: {
+      recentSeedFlowCountBonus: replayFlowCountBias.recentSeedFlowCountBonus,
+      activeIndependentFlowCountBonus: replayFlowCountBias.activeIndependentFlowCountBonus,
+      overlapSeedOffsetShiftSec: replayFlowCountBias.overlapSeedOffsetShiftSec,
+      semanticRoleAlignmentBias: replayFlowCountBias.semanticRoleAlignmentBias,
+      childOrderMicroTimingBias: replayFlowCountBias.childOrderMicroTimingBias,
+      completionRoleReleaseOrderBias: replayFlowCountBias.completionRoleReleaseOrderBias,
+    },
+    stickyCarry: {
+      observable: false,
+      reason: "paper_session_trace_runtime_carry_persisted_state_disinda",
+    },
+  };
+}
+
+function isNoRuntimeFillStatus(
+  diagnostics: {
+    buyCount: number;
+    lifecycleEventCount: number;
+    runtimeDataStatus: string;
+  } | undefined,
+): boolean {
+  return (
+    diagnostics?.runtimeDataStatus === "no_runtime_fills" ||
+    ((diagnostics?.buyCount ?? 0) === 0 && (diagnostics?.lifecycleEventCount ?? 0) === 0)
+  );
+}
+
+function buildNoRuntimeFillsReportSummary(
+  runtimeDataStatus: Record<string, unknown>,
+  runtimeChildOrderDispatchStatus?: RuntimeChildOrderDispatchStatus | undefined,
+): Record<string, unknown> {
+  return {
+    status: "NO_RUNTIME_FILLS",
+    severity: "DATA_ABSENCE",
+    finalVerdict: "WARN",
+    operatorMessage:
+      "Local runtime store has no BUY, merge, or redeem activity for this market; this is not a strategy failure.",
+    runtimeDataStatus,
+    ...(runtimeChildOrderDispatchStatus
+      ? { runtimeChildOrderDispatch: runtimeChildOrderDispatchStatus }
+      : {}),
+  };
+}
+
+type RuntimeChildOrderDispatchStatus = {
+  status: "PASS" | "WARN" | "SKIPPED";
+  reasons: string[];
+  summary: Record<string, unknown> | null;
+};
+
+function buildRuntimeChildOrderDispatchStatus(
+  dispatch: Record<string, unknown> | undefined,
+  options: { runtimeDataAbsent?: boolean; paperReplay?: boolean } = {},
+): RuntimeChildOrderDispatchStatus {
+  if (options.paperReplay) {
+    return {
+      status: "SKIPPED",
+      reasons: ["paper_replay_has_no_runtime_child_order_dispatch"],
+      summary: null,
+    };
+  }
+  if (!dispatch) {
+    return {
+      status: "WARN",
+      reasons: ["runtime_child_order_dispatch_missing"],
+      summary: null,
+    };
+  }
+  const pairSubmitCount = typeof dispatch.pairSubmitCount === "number" ? dispatch.pairSubmitCount : 0;
+  const flowIntentPairSubmitCount =
+    typeof dispatch.flowIntentPairSubmitCount === "number" ? dispatch.flowIntentPairSubmitCount : 0;
+  const compressedPairSubmitCount =
+    typeof dispatch.compressedPairSubmitCount === "number" ? dispatch.compressedPairSubmitCount : 0;
+  const maxInterChildDelayMs =
+    typeof dispatch.maxInterChildDelayMs === "number" ? dispatch.maxInterChildDelayMs : null;
+  const reasons: string[] = [];
+  if (pairSubmitCount === 0) {
+    if (options.runtimeDataAbsent) {
+      return {
+        status: "SKIPPED",
+        reasons: ["runtime_child_order_dispatch_not_applicable_no_runtime_fills"],
+        summary: dispatch,
+      };
+    }
+    reasons.push("runtime_child_order_dispatch_no_pair_submits");
+  }
+  if (flowIntentPairSubmitCount > 0 && compressedPairSubmitCount < flowIntentPairSubmitCount) {
+    reasons.push("runtime_child_order_flow_intent_not_compressed");
+  }
+  if (maxInterChildDelayMs !== null && maxInterChildDelayMs > 40) {
+    reasons.push("runtime_child_order_delay_above_xuan_cap");
+  }
+  return {
+    status: reasons.length > 0 ? "WARN" : "PASS",
+    reasons,
+    summary: dispatch,
+  };
+}
+
+function buildComparisonReportSummary(args: {
+  verdict: string;
+  score?: number | undefined;
+  flowStatus: { status: string; reasons: string[] };
+  exactLifecycleParityRequired?: boolean | undefined;
+  exactLifecycleParityBroken?: boolean | undefined;
+  runtimeChildOrderDispatchStatus?: RuntimeChildOrderDispatchStatus | undefined;
+}): Record<string, unknown> {
+  return {
+    status: args.verdict,
+    score: args.score ?? null,
+    flowStatus: args.flowStatus.status,
+    flowReasons: args.flowStatus.reasons,
+    exactLifecycleParity: {
+      required: Boolean(args.exactLifecycleParityRequired),
+      broken: Boolean(args.exactLifecycleParityBroken),
+      gate: args.exactLifecycleParityRequired ? "BUY_MERGE_REDEEM_CI_GATE" : "not_required",
+    },
+    ...(args.runtimeChildOrderDispatchStatus
+      ? { runtimeChildOrderDispatch: args.runtimeChildOrderDispatchStatus }
+      : {}),
+  };
 }
 
 async function runAnalyzeXuan(): Promise<void> {
@@ -123,6 +542,8 @@ async function runAnalyzeXuan(): Promise<void> {
 
 const defaultXuanReferenceSlugs = [
   "btc-updown-5m-1776253500",
+  "btc-updown-5m-1776248100",
+  "btc-updown-5m-1776928800",
   "btc-updown-5m-1776253200",
   "btc-updown-5m-1776252300",
   "btc-updown-5m-1776247200",
@@ -211,13 +632,17 @@ async function runXuanExtractCommand(options: {
 }
 
 async function runXuanComparePaperCommand(options: {
-  variant: PaperSessionVariant;
+  variant: PaperSessionVariant | string;
   referenceSlug: string;
   jsonPath?: string;
   sqlitePath?: string;
   wallet?: string;
   out?: string;
+  isolatedCalibration?: boolean;
 }): Promise<void> {
+  if (!isPaperSessionVariant(options.variant)) {
+    throw new Error(`Gecersiz paper replay variant: ${options.variant}. Desteklenenler: ${paperSessionVariants.join(", ")}`);
+  }
   const env = loadEnv();
   const config = buildStrategyConfig(env);
   const bundle = await resolveCanonicalReferenceBundleForSlug({
@@ -231,36 +656,54 @@ async function runXuanComparePaperCommand(options: {
     throw new Error(`Canonical reference bulunamadi: ${options.referenceSlug}`);
   }
 
-  const stateStore = new PersistentStateStore(config.stateStorePath);
+  const isolatedCalibration = Boolean(options.isolatedCalibration);
+  const stateStore = isolatedCalibration ? undefined : new PersistentStateStore(config.stateStorePath);
   const preReplayFlowCalibration = buildFlowCalibrationSummary(
-    extractFlowSummariesFromValidationRuns(stateStore.recentValidationRuns("replay", 12)),
+    stateStore ? extractFlowSummariesFromValidationRuns(stateStore.recentValidationRuns("replay", 12)) : [],
   );
+  const openingSeedTiming = openingSeedTimingFromCalibration(preReplayFlowCalibration);
+  const replayFlowCountBias = replayFlowCountBiasFromCalibration(preReplayFlowCalibration);
   const replay = runPaperSession(env, options.variant, {
     completionPatienceMultiplier: completionPatienceMultiplierFromCalibration(preReplayFlowCalibration),
+    ...openingSeedTiming,
+    ...replayFlowCountBias,
+    mergeCohortCompression: preReplayFlowCalibration.status === "WARN" || preReplayFlowCalibration.status === "FAIL",
+    orderPriorityAwareFill: replayFlowCountBias.semanticRoleAlignmentBias === "align_high_low_role",
   });
+  const strategyTraceSummary = buildPaperStrategyTraceSummary(replay, replayFlowCountBias);
   const candidate = buildCanonicalReferenceFromPaperSession(replay);
   const comparison = compareCanonicalReference(reference, { ...candidate, slug: reference.slug });
   const flowSummary = buildComparisonFlowSummary(comparison);
   const flowStatus = classifyComparisonFlowSummary(flowSummary);
-  stateStore.recordValidationRun({
-    kind: "replay",
-    status: comparison.verdict.toLowerCase(),
-    timestamp: Math.floor(Date.now() / 1000),
-    payload: {
-      command: "xuan:compare-paper",
-      variant: options.variant,
-      referenceSlug: options.referenceSlug,
-      score: comparison.score,
-      verdict: comparison.verdict,
-      preReplayFlowCalibration,
-      flowSummary,
-      flowStatus,
-    },
-  });
-  const flowCalibration = buildFlowCalibrationSummary(
-    extractFlowSummariesFromValidationRuns(stateStore.recentValidationRuns("replay", 12)),
-  );
-  stateStore.close();
+  const runtimeChildOrderDispatchStatus = buildRuntimeChildOrderDispatchStatus(undefined, { paperReplay: true });
+  const flowCalibrationAccepted = comparison.verdict !== "FAIL" && flowStatus.status !== "FAIL";
+  if (stateStore) {
+    stateStore.recordValidationRun({
+      kind: "replay",
+      status: comparison.verdict.toLowerCase(),
+      timestamp: Math.floor(Date.now() / 1000),
+      payload: {
+        command: "xuan:compare-paper",
+        variant: options.variant,
+        referenceSlug: options.referenceSlug,
+        score: comparison.score,
+        verdict: comparison.verdict,
+        flowCalibrationVersion: XUAN_FLOW_CALIBRATION_VERSION,
+        flowCalibrationAccepted,
+        preReplayFlowCalibration,
+        strategyTraceSummary,
+        flowSummary,
+        flowStatus,
+        runtimeChildOrderDispatchStatus,
+      },
+    });
+  }
+  const flowCalibration = stateStore
+    ? buildFlowCalibrationSummary(
+        extractFlowSummariesFromValidationRuns(stateStore.recentValidationRuns("replay", 12)),
+      )
+    : buildFlowCalibrationSummary([flowSummary]);
+  stateStore?.close();
 
   const output = {
     reference,
@@ -268,8 +711,19 @@ async function runXuanComparePaperCommand(options: {
     comparison,
     flowSummary,
     flowStatus,
+    runtimeChildOrderDispatchStatus,
     flowCalibration,
     preReplayFlowCalibration,
+    strategyTraceSummary,
+    reportSummary: buildComparisonReportSummary({
+      verdict: comparison.verdict,
+      score: comparison.score,
+      flowStatus,
+      runtimeChildOrderDispatchStatus,
+      exactLifecycleParityRequired: comparison.details.exactLifecycleParityRequired,
+      exactLifecycleParityBroken: comparison.details.exactLifecycleParityBroken,
+    }),
+    isolatedCalibration,
     sources: bundle.sources,
   };
   const outputPath = options.out && options.out.length > 0 ? options.out : `reports/xuan_compare_${options.variant}_${options.referenceSlug}.json`;
@@ -281,8 +735,12 @@ async function runXuanComparePaperCommand(options: {
     score: comparison.score,
     flowSummary,
     flowStatus,
+    runtimeChildOrderDispatchStatus,
     flowCalibration,
     preReplayFlowCalibration,
+    strategyTraceSummary,
+    reportSummary: output.reportSummary,
+    isolatedCalibration,
   });
   await writeJson(outputPath, output);
   console.log(JSON.stringify({ outputPath, output }, null, 2));
@@ -358,12 +816,84 @@ async function runXuanCompareRuntimeCommand(options: {
   if (!candidate) {
     throw new Error(`Runtime canonical candidate bulunamadi: ${options.marketSlug}`);
   }
+  const runtimeDiagnostics = runtimeBundle.diagnosticsBySlug[options.marketSlug];
+  const runtimeChildOrderDispatch =
+    runtimeDiagnostics?.childOrderDispatch as Record<string, unknown> | undefined;
+  const runtimeDataAbsent = isNoRuntimeFillStatus(runtimeDiagnostics);
+  const runtimeChildOrderDispatchStatus = buildRuntimeChildOrderDispatchStatus(runtimeChildOrderDispatch, {
+    runtimeDataAbsent,
+  });
+  if (runtimeDataAbsent) {
+    const runtimeDataStatus = {
+      status: "NO_RUNTIME_FILLS",
+      reason: "local_sqlite_has_no_buy_merge_or_redeem_activity_for_market",
+      marketSlug: options.marketSlug,
+      diagnostics: runtimeDiagnostics,
+    };
+    const stateStore = new PersistentStateStore(config.stateStorePath);
+    stateStore.recordValidationRun({
+      kind: "replay",
+      status: "no_runtime_fills",
+      timestamp: Math.floor(Date.now() / 1000),
+      payload: {
+        command: "xuan:compare-runtime",
+        referenceSlug: options.referenceSlug,
+        marketSlug: options.marketSlug,
+        verdict: "NO_RUNTIME_FILLS",
+        flowCalibrationVersion: XUAN_FLOW_CALIBRATION_VERSION,
+        flowCalibrationAccepted: false,
+        runtimeDataStatus,
+        runtimeChildOrderDispatch,
+        runtimeChildOrderDispatchStatus,
+      },
+    });
+    const flowCalibration = buildFlowCalibrationSummary(
+      extractFlowSummariesFromValidationRuns(stateStore.recentValidationRuns("replay", 12)),
+    );
+    stateStore.close();
+    const output = {
+      referenceBundle,
+      runtimeBundle,
+      candidateBundle: toCanonicalReferenceBundle(runtimeBundle),
+      runtimeDataStatus,
+      comparison: null,
+      flowSummary: null,
+      flowStatus: {
+        status: "WARN",
+        reasons: ["no_runtime_fills"],
+      },
+      runtimeChildOrderDispatch,
+      runtimeChildOrderDispatchStatus,
+      flowCalibration,
+      reportSummary: buildNoRuntimeFillsReportSummary(runtimeDataStatus, runtimeChildOrderDispatchStatus),
+    };
+    const outputPath =
+      options.out && options.out.length > 0
+        ? options.out
+        : `reports/xuan_compare_runtime_${options.marketSlug}_vs_${options.referenceSlug}.json`;
+    await writeStructuredLog("markets", {
+      event: "xuan_compare_runtime",
+      referenceSlug: options.referenceSlug,
+      marketSlug: options.marketSlug,
+      verdict: "NO_RUNTIME_FILLS",
+      runtimeDataStatus,
+      runtimeChildOrderDispatch,
+      runtimeChildOrderDispatchStatus,
+      flowCalibration,
+      reportSummary: output.reportSummary,
+    });
+    await writeJson(outputPath, output);
+    console.log(JSON.stringify({ outputPath, output }, null, 2));
+    return;
+  }
 
   const comparison = compareCanonicalReference(reference, candidate, {
     hardFails: runtimeBundle.hardFailsBySlug[options.marketSlug],
+    requireExactLifecycleParity: options.referenceSlug === "btc-updown-5m-1776253500",
   });
   const flowSummary = buildComparisonFlowSummary(comparison);
   const flowStatus = classifyComparisonFlowSummary(flowSummary);
+  const flowCalibrationAccepted = comparison.verdict !== "FAIL" && flowStatus.status !== "FAIL";
   const stateStore = new PersistentStateStore(config.stateStorePath);
   stateStore.recordValidationRun({
     kind: "replay",
@@ -375,8 +905,12 @@ async function runXuanCompareRuntimeCommand(options: {
       marketSlug: options.marketSlug,
       score: comparison.score,
       verdict: comparison.verdict,
+      flowCalibrationVersion: XUAN_FLOW_CALIBRATION_VERSION,
+      flowCalibrationAccepted,
       flowSummary,
       flowStatus,
+      runtimeChildOrderDispatch,
+      runtimeChildOrderDispatchStatus,
     },
   });
   const flowCalibration = buildFlowCalibrationSummary(
@@ -391,7 +925,16 @@ async function runXuanCompareRuntimeCommand(options: {
     comparison,
     flowSummary,
     flowStatus,
+    runtimeChildOrderDispatch,
+    runtimeChildOrderDispatchStatus,
     flowCalibration,
+    reportSummary: buildComparisonReportSummary({
+      verdict: comparison.verdict,
+      score: comparison.score,
+      flowStatus,
+      exactLifecycleParityRequired: comparison.details.exactLifecycleParityRequired,
+      exactLifecycleParityBroken: comparison.details.exactLifecycleParityBroken,
+    }),
   };
   const outputPath =
     options.out && options.out.length > 0
@@ -405,7 +948,10 @@ async function runXuanCompareRuntimeCommand(options: {
     score: comparison.score,
     flowSummary,
     flowStatus,
+    runtimeChildOrderDispatch,
+    runtimeChildOrderDispatchStatus,
     flowCalibration,
+    reportSummary: output.reportSummary,
   });
   await writeJson(outputPath, output);
   console.log(JSON.stringify({ outputPath, output }, null, 2));
@@ -478,6 +1024,9 @@ async function runPaperMulti(options: { windows: number }): Promise<void> {
 }
 
 async function runPaperSessionCommand(options: { variant: PaperSessionVariant }): Promise<void> {
+  if (!isPaperSessionVariant(options.variant)) {
+    throw new Error(`Gecersiz paper replay variant: ${options.variant}. Desteklenenler: ${paperSessionVariants.join(", ")}`);
+  }
   const env = loadEnv();
   const config = buildStrategyConfig(env);
   const replay = runPaperSession(env, options.variant);
@@ -1011,6 +1560,7 @@ export async function runCli(argv = process.argv): Promise<void> {
     .option("--sqlite-path <path>", "Lifecycle authority SQLite path")
     .option("--wallet <address>", "Wallet/proxy address override")
     .option("--out <path>", "Output comparison path")
+    .option("--isolated-calibration", "Do not read or write replay calibration history")
     .action(
       async (options: {
         variant: PaperSessionVariant;
@@ -1019,6 +1569,7 @@ export async function runCli(argv = process.argv): Promise<void> {
         sqlitePath?: string;
         wallet?: string;
         out?: string;
+        isolatedCalibration?: boolean;
       }) => runXuanComparePaperCommand(options),
     );
   program

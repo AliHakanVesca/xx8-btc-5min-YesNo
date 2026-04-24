@@ -14,49 +14,52 @@ describe("paper session replay", () => {
     const canonical = buildCanonicalReferenceFromPaperSession(report);
 
     expect(report.summary).toMatchObject({
-      stepCount: 24,
-      entryStepCount: 18,
+      stepCount: 25,
+      entryStepCount: 12,
       completionStepCount: 0,
-      mergeStepCount: 4,
-      totalBuyShares: 90,
-      totalEntryBuyShares: 90,
+      mergeStepCount: 3,
+      totalBuyShares: 60.275,
+      totalEntryBuyShares: 60.275,
       totalCompletionShares: 0,
-      totalMergeShares: 45,
+      totalMergeShares: 30,
+      totalRedeemShares: 0.275,
       finalUpShares: 0,
       finalDownShares: 0,
     });
-    expect(report.summary.totalRawSpend).toBeCloseTo(41.65, 8);
-    expect(report.summary.totalFeeUsd).toBeCloseTo(1.320228, 8);
-    expect(report.summary.totalEffectiveSpend).toBeCloseTo(42.970228, 8);
-    expect(report.summary.realizedMergeProfit).toBeCloseTo(2.029772, 8);
-    expect(report.summary.roiPct).toBeCloseTo(4.7237, 4);
+    expect(report.summary.totalRawSpend).toBeCloseTo(27.51725, 8);
+    expect(report.summary.totalFeeUsd).toBeCloseTo(0.95800482, 8);
+    expect(report.summary.totalEffectiveSpend).toBeCloseTo(28.47525482, 8);
+    expect(report.summary.realizedMergeProfit).toBeCloseTo(1.74528, 8);
+    expect(report.summary.roiPct).toBeCloseTo(6.1291, 4);
     expect(report.summary.footprint).toMatchObject({
-      cycleCount: 4,
-      cycleBucket: "4_plus",
-      alternatingTransitionCount: 12,
+      cycleCount: 3,
+      cycleBucket: "2_3",
+      alternatingTransitionCount: 9,
       partialRepairLatencyBucket: "none",
       dominantResidualSide: "FLAT",
       residualMagnitudeBucket: "flat",
       clipBucketCounts: {
-        "1_5": 18,
+        "1_5": 11,
+        "6_10": 1,
       },
     });
 
     expect(canonical).toMatchObject({
-      cycleCount: 9,
-      mergeCount: 4,
-      completionCount: 9,
-      overlapClipCount: 6,
+      cycleCount: 6,
+      mergeCount: 3,
+      redeemCount: 1,
+      completionCount: 6,
+      overlapClipCount: 4,
       hasOverlap: true,
       repairLatencyBucket: "0_10",
       finalResidualSide: "FLAT",
       finalResidualBucket: "flat",
       normalizedClipTierCounts: {
         "0_5x": 0,
-        "1x": 18,
+        "1x": 12,
       },
     });
-    expect(canonical.orderedClipSequence.filter((event) => event.kind === "BUY")).toHaveLength(18);
+    expect(canonical.orderedClipSequence.filter((event) => event.kind === "BUY")).toHaveLength(12);
     expect(canonical.orderedClipSequence.some((event) => event.phase === "HIGH_LOW_COMPLETION")).toBe(true);
 
     const openingSeed = report.steps.find((step) => step.name === "open-down-seed");
@@ -67,26 +70,70 @@ describe("paper session replay", () => {
     expect(openingSeed?.execution.fills[0]?.price).toBeCloseTo(0.44, 8);
     expect(openingSeed?.execution.skippedEntrySides).toEqual(["UP"]);
 
-    const highLowCompletion = report.steps.find((step) => step.name === "high-low-up-completion-1");
+    const highLowCompletion = report.steps.find((step) => step.name === "high-low-up-completion-3");
     expect(highLowCompletion?.execution.fills).toHaveLength(1);
     expect(highLowCompletion?.execution.fills[0]?.kind).toBe("entry");
     expect(highLowCompletion?.execution.fills[0]?.side).toBe("UP");
-    expect(highLowCompletion?.execution.fills[0]?.size).toBe(5);
-    expect(highLowCompletion?.execution.fills[0]?.price).toBeCloseTo(0.8, 8);
+    expect(highLowCompletion?.execution.fills[0]?.size).toBeCloseTo(5.275, 8);
+    expect(highLowCompletion?.execution.fills[0]?.price).toBeCloseTo(0.79, 8);
 
-    const lastMerge = report.steps.find((step) => step.name === "merge-flush-3");
-    expect(lastMerge?.execution.mergeShares).toBe(5);
-    expect(lastMerge?.execution.realizedMergeProfit).toBeGreaterThan(0);
+    const residualRedeem = report.steps.find((step) => step.execution.redeemShares > 0);
+    expect(residualRedeem?.execution.redeemShares).toBeCloseTo(0.275, 8);
+    expect(residualRedeem?.execution.redeemSide).toBe("UP");
   });
 
-  it("calibrates scripted completion opportunities without changing the default replay", () => {
+  it("calibrates scripted completion opportunities while preserving the guarded cycle count", () => {
     const report = runPaperSession(env, "xuan-flow", {
       completionPatienceMultiplier: 0.45,
     });
     const completionStep = report.steps.find((step) => step.name === "patient-up-completion");
 
-    expect(report.summary.stepCount).toBe(24);
-    expect(completionStep?.timestamp).toBe(report.market.startTs + 122);
+    expect(report.summary.stepCount).toBe(25);
+    expect(buildCanonicalReferenceFromPaperSession(report).cycleCount).toBe(6);
+    expect(completionStep?.timestamp).toBe(report.market.startTs + 103);
+  });
+
+  it("can replay partial pair fills using the bot's order-priority side", () => {
+    const report = runPaperSession(env, "xuan-flow", {
+      orderPriorityAwareFill: true,
+    });
+    const openingSeed = report.steps.find((step) => step.name === "open-down-seed");
+    const secondCycleSeed = report.steps.find((step) => step.name === "overlap-up-seed-1");
+
+    expect(openingSeed?.execution.fills).toHaveLength(1);
+    expect(openingSeed?.execution.fills[0]?.side).toBe("UP");
+    expect(openingSeed?.execution.skippedEntrySides).toEqual(["DOWN"]);
+    expect(secondCycleSeed?.execution.fills).toHaveLength(1);
+    expect(secondCycleSeed?.execution.fills[0]?.side).toBe("DOWN");
+    expect(secondCycleSeed?.execution.skippedEntrySides).toEqual(["UP"]);
+  });
+
+  it("can apply conservative overlap seed cadence compression without changing the buy count", () => {
+    const report = runPaperSession(env, "xuan-flow", {
+      completionPatienceMultiplier: 0.63,
+      overlapSeedOffsetShiftSec: 2,
+    });
+    const canonical = buildCanonicalReferenceFromPaperSession(report);
+    const secondCycleSeed = report.steps.find((step) => step.name === "overlap-up-seed-1");
+
+    expect(secondCycleSeed?.timestamp).toBe(report.market.startTs + 24);
+    expect(canonical.orderedClipSequence.filter((event) => event.kind === "BUY")).toHaveLength(12);
+    expect(canonical.redeemCount).toBe(1);
+  });
+
+  it("can compress intermediate forced merge flushes into a later lifecycle cohort", () => {
+    const report = runPaperSession(env, "xuan-flow", {
+      completionPatienceMultiplier: 0.63,
+      mergeCohortCompression: true,
+    });
+    const canonical = buildCanonicalReferenceFromPaperSession(report);
+    const mergeOffsets = canonical.orderedClipSequence
+      .filter((event) => event.kind === "MERGE")
+      .map((event) => event.tOffsetSec);
+
+    expect(canonical.mergeCount).toBe(2);
+    expect(new Set(mergeOffsets)).toEqual(new Set([86, 280]));
+    expect(canonical.finalResidualBucket).toBe("flat");
   });
 
   it("runs the blocked-completion session and finishes with residual inventory", () => {
@@ -119,8 +166,8 @@ describe("paper session replay", () => {
       cycleCount: 2,
       mergeCount: 1,
       completionCount: 1,
-      overlapClipCount: 1,
-      hasOverlap: true,
+      overlapClipCount: 0,
+      hasOverlap: false,
       repairLatencyBucket: "0_10",
       finalResidualSide: "UP",
       finalResidualBucket: "small",

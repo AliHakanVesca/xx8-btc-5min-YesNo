@@ -15,12 +15,14 @@ import {
 import { OrderBookState } from "./orderBookState.js";
 import {
   classifyResidualSeverity,
+  classifyCompletionReleaseRole,
+  type CompletionReleaseRole,
   completionAllowance,
   type FlowPressureBudgetState,
   deriveFlowPressureBudgetState,
   resolvePartialCompletionPhase,
   resolveResidualBehaviorState,
-  shouldDelayResidualCompletion,
+  resolveResidualCompletionDelayProfile,
 } from "./modePolicy.js";
 import { completionCost } from "./sumAvgEngine.js";
 import type { StrategyExecutionMode } from "./executionModes.js";
@@ -49,6 +51,11 @@ export interface CompletionDecision {
   residualSeverityPressure?: number;
   residualFlowDensity?: number;
   completionPatienceBias?: number;
+  completionReleaseRole?: CompletionReleaseRole;
+  completionCalibrationPatienceMultiplier?: number;
+  completionRolePatienceMultiplier?: number;
+  completionEffectivePatienceMultiplier?: number;
+  completionWaitUntilSec?: number;
   overlapRepairArbitration?: "no_overlap_lock" | "standard_pair_reentry" | "favor_independent_overlap" | "favor_residual_repair";
   arbitrationOutcome?: "completion" | "hold";
 }
@@ -183,17 +190,54 @@ function chooseCompletion(
       ? resolveBundledCompletionSequencePrior(state.market.slug, secsFromOpen, sideToBuy)
       : undefined;
   const exactCompletionQtyPrior = completionQtyPrior?.scope === "exact" ? completionQtyPrior : undefined;
+  if (
+    shouldHoldHighLowOvershootCompletionResidual({
+      config,
+      state,
+      leadingSide,
+      missingShares,
+      secsFromOpen,
+      exactPriorActive: Boolean(exactCompletionQtyPrior),
+    })
+  ) {
+    return null;
+  }
+  if (
+    shouldHoldLateSmallCompletionResidual({
+      config,
+      missingShares,
+      secsFromOpen,
+      secsToClose: ctx.secsToClose,
+      residualSeverityLevel: residualSeverity.level,
+      exactPriorActive: Boolean(exactCompletionQtyPrior),
+    })
+  ) {
+    return null;
+  }
+  const highLowOvershootCandidates = buildHighLowOvershootCandidateSizes({
+    config,
+    sideToBuy,
+    books,
+    existingAverage,
+    missingShares,
+    exactPriorActive: Boolean(exactCompletionQtyPrior),
+  });
   const phaseMaxQty =
     exactCompletionQtyPrior && Number.isFinite(phase.maxQty)
       ? Math.max(phase.maxQty, exactCompletionQtyPrior.qty)
-      : phase.maxQty;
+      : Number.isFinite(phase.maxQty) && highLowOvershootCandidates.length > 0
+        ? Math.max(phase.maxQty, ...highLowOvershootCandidates)
+        : phase.maxQty;
   const candidateSizes = Array.from(
     new Set(
       buildCandidateSizes(
         config.partialCompletionFractions,
         missingShares,
         config.completionMinQty,
-        exactCompletionQtyPrior ? [exactCompletionQtyPrior.qty] : [],
+        [
+          ...(exactCompletionQtyPrior ? [exactCompletionQtyPrior.qty] : []),
+          ...highLowOvershootCandidates,
+        ],
       )
         .map((size) =>
           normalizeSize(
@@ -293,6 +337,26 @@ function chooseCompletion(
         missingSidePrice: execution.averagePrice,
         partialAgeSec,
       });
+    const completionReleaseRole = classifyCompletionReleaseRole({
+      config,
+      oppositeAveragePrice: existingAverage,
+      missingSidePrice: execution.averagePrice,
+    });
+    const completionDelayProfile = resolveResidualCompletionDelayProfile({
+      config,
+      residualShares: missingShares,
+      partialAgeSec,
+      secsToClose: ctx.secsToClose,
+      oppositeAveragePrice: existingAverage,
+      missingSidePrice: execution.averagePrice,
+      exactPriorActive: Boolean(exactCompletionQtyPrior),
+      exceptionalMode: Boolean(allowance.highLowMismatch) || cheapLateCompletionChase,
+      recentSeedFlowCount,
+      activeIndependentFlowCount,
+      ...(ctx.completionPatienceMultiplier !== undefined
+        ? { completionPatienceMultiplier: ctx.completionPatienceMultiplier }
+        : {}),
+    });
     if (!allowance.allowed) {
       continue;
     }
@@ -302,23 +366,7 @@ function chooseCompletion(
     if (!fairValueDecision.allowed && phase.mode !== "POST_MERGE_RESIDUAL_COMPLETION") {
       continue;
     }
-    if (
-      shouldDelayResidualCompletion({
-        config,
-        residualShares: missingShares,
-        partialAgeSec,
-        secsToClose: ctx.secsToClose,
-        oppositeAveragePrice: existingAverage,
-        missingSidePrice: execution.averagePrice,
-        exactPriorActive: Boolean(exactCompletionQtyPrior),
-        exceptionalMode: Boolean(allowance.highLowMismatch) || cheapLateCompletionChase,
-        recentSeedFlowCount,
-        activeIndependentFlowCount,
-        ...(ctx.completionPatienceMultiplier !== undefined
-          ? { completionPatienceMultiplier: ctx.completionPatienceMultiplier }
-          : {}),
-      })
-    ) {
+    if (completionDelayProfile.shouldDelay) {
       continue;
     }
 
@@ -389,6 +437,11 @@ function chooseCompletion(
       residualSeverityPressure: residualBehaviorState.severityPressure,
       residualFlowDensity: residualBehaviorState.flowDensity,
       completionPatienceBias: residualBehaviorState.completionPatienceBias,
+      completionReleaseRole,
+      completionCalibrationPatienceMultiplier: completionDelayProfile.calibrationPatienceMultiplier,
+      completionRolePatienceMultiplier: completionDelayProfile.rolePatienceMultiplier,
+      completionEffectivePatienceMultiplier: completionDelayProfile.effectivePatienceMultiplier,
+      completionWaitUntilSec: completionDelayProfile.waitUntilSec,
       overlapRepairArbitration,
       arbitrationOutcome: "completion",
       order: buildTakerBuyOrder({
@@ -402,6 +455,45 @@ function chooseCompletion(
   }
 
   return null;
+}
+
+function shouldHoldLateSmallCompletionResidual(args: {
+  config: XuanStrategyConfig;
+  missingShares: number;
+  secsFromOpen: number;
+  secsToClose: number;
+  residualSeverityLevel: "flat" | "micro" | "small" | "medium" | "aggressive";
+  exactPriorActive: boolean;
+}): boolean {
+  if (args.config.botMode !== "XUAN" || args.exactPriorActive) {
+    return false;
+  }
+  const holdableSeverity =
+    args.residualSeverityLevel === "micro" ||
+    args.residualSeverityLevel === "small" ||
+    (args.residualSeverityLevel === "flat" && args.missingShares > 0.5);
+  if (!holdableSeverity || args.missingShares > 5 + 1e-6) {
+    return false;
+  }
+  return args.secsFromOpen >= 240 || args.secsToClose <= args.config.finalWindowSoftStartSec;
+}
+
+function shouldHoldHighLowOvershootCompletionResidual(args: {
+  config: XuanStrategyConfig;
+  state: XuanMarketState;
+  leadingSide: OutcomeSide;
+  missingShares: number;
+  secsFromOpen: number;
+  exactPriorActive: boolean;
+}): boolean {
+  if (args.config.botMode !== "XUAN" || args.exactPriorActive || args.secsFromOpen < 150) {
+    return false;
+  }
+  if (args.missingShares <= 0 || args.missingShares > Math.max(5, args.config.maxCompletionOvershootShares)) {
+    return false;
+  }
+  const residualLots = args.leadingSide === "UP" ? args.state.upLots : args.state.downLots;
+  return residualLots.some((lot) => lot.executionMode === "HIGH_LOW_COMPLETION_CHASE");
 }
 
 function shouldUseCheapLateCompletionChase(args: {
@@ -582,6 +674,38 @@ function buildCandidateSizes(
   }
 
   return [...new Set(candidateSizes)].sort((left, right) => right - left);
+}
+
+function buildHighLowOvershootCandidateSizes(args: {
+  config: XuanStrategyConfig;
+  sideToBuy: OutcomeSide;
+  books: OrderBookState;
+  existingAverage: number;
+  missingShares: number;
+  exactPriorActive: boolean;
+}): number[] {
+  if (args.config.botMode !== "XUAN" || args.exactPriorActive || args.missingShares <= 0) {
+    return [];
+  }
+  const missingSidePrice = args.books.bestAsk(args.sideToBuy);
+  const priceSpikeDelta = missingSidePrice - args.existingAverage;
+  const priceSpikeRatio = missingSidePrice / Math.max(args.existingAverage, 0.01);
+  const strongHighLowSpike =
+    missingSidePrice >= args.config.highSidePriceThreshold - 0.02 &&
+    priceSpikeDelta >= 0.45 &&
+    priceSpikeRatio >= 2.25;
+  const classicHighLow =
+    missingSidePrice >= Math.max(0.58, args.config.highSidePriceThreshold - 0.18) &&
+    args.existingAverage <= args.config.lowSideMaxForHighCompletion + 0.08;
+  if (!classicHighLow && !strongHighLowSpike) {
+    return [];
+  }
+  const overshootRatio = missingSidePrice >= args.config.highSidePriceThreshold ? 0.055 : 0.035;
+  const overshootQty = normalizeSize(args.missingShares * (1 + overshootRatio));
+  if (overshootQty <= args.missingShares + 1e-6) {
+    return [];
+  }
+  return [overshootQty];
 }
 
 function normalizeSize(value: number): number {

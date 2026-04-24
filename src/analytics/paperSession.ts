@@ -4,19 +4,58 @@ import { buildOfflineMarket } from "../infra/gamma/marketDiscovery.js";
 import { SystemClock } from "../infra/time/clock.js";
 import type { OrderBook, OutcomeSide } from "../infra/clob/types.js";
 import { Xuan5mBot } from "../strategy/xuan5m/Xuan5mBot.js";
-import { createMarketState, type FillRecord, type XuanMarketState } from "../strategy/xuan5m/marketState.js";
+import {
+  countActiveIndependentFlowCount,
+  countRecentSeedFlowCount,
+  createMarketState,
+  type FillRecord,
+  type XuanMarketState,
+} from "../strategy/xuan5m/marketState.js";
 import { OrderBookState } from "../strategy/xuan5m/orderBookState.js";
-import { applyFill, applyMerge, averageCost, pairVwapSum } from "../strategy/xuan5m/inventoryState.js";
-import { planMerge } from "../strategy/xuan5m/mergeCoordinator.js";
+import {
+  applyFill,
+  applyMerge,
+  averageCost,
+  pairVwapSum,
+  shrinkOutcomeToObservedShares,
+} from "../strategy/xuan5m/inventoryState.js";
+import {
+  createMergeBatchTracker,
+  evaluateDelayedMergeGate,
+  planMerge,
+  syncMergeBatchTracker,
+} from "../strategy/xuan5m/mergeCoordinator.js";
 import { takerFeePerShare } from "../strategy/xuan5m/sumAvgEngine.js";
 import type { FairValueSnapshot } from "../strategy/xuan5m/fairValueEngine.js";
+import type { EntryBuyDecision, EntryDecisionTrace } from "../strategy/xuan5m/entryLadderEngine.js";
+import type { CompletionReleaseRole } from "../strategy/xuan5m/modePolicy.js";
 import type { StrategyExecutionMode } from "../strategy/xuan5m/executionModes.js";
 import { buildFootprintSummary, type FootprintSummary } from "./footprintMetrics.js";
 
-export type PaperSessionVariant = "xuan-flow" | "blocked-completion";
+export const paperSessionVariants = ["xuan-flow", "blocked-completion"] as const;
+export type PaperSessionVariant = (typeof paperSessionVariants)[number];
+
+export function isPaperSessionVariant(value: string): value is PaperSessionVariant {
+  return (paperSessionVariants as readonly string[]).includes(value);
+}
 
 export interface PaperSessionOptions {
   completionPatienceMultiplier?: number | undefined;
+  openingSeedOffsetShiftSec?: number | undefined;
+  overlapSeedOffsetShiftSec?: number | undefined;
+  openingSeedReleaseBias?: "neutral" | "earlier" | "later" | undefined;
+  recentSeedFlowCountBonus?: number | undefined;
+  activeIndependentFlowCountBonus?: number | undefined;
+  semanticRoleAlignmentBias?:
+    | "neutral"
+    | "align_high_low_role"
+    | "preserve_raw_side"
+    | "cycle_role_arbitration"
+    | undefined;
+  childOrderMicroTimingBias?: "neutral" | "flow_intent" | undefined;
+  completionRoleReleaseOrderBias?: "neutral" | "role_order" | undefined;
+  orderPriorityAwareFill?: boolean | undefined;
+  mergeCohortCompression?: boolean | undefined;
 }
 
 interface ReplayBooks {
@@ -34,7 +73,8 @@ interface PaperSessionStepSpec {
   entryFillPolicy?: "all" | "up-only" | "down-only" | "none";
   completionFill?: boolean;
   unwindFill?: boolean;
-  mergePolicy?: "auto" | "skip";
+  mergePolicy?: "auto" | "skip" | "force";
+  redeemPolicy?: "none" | "residual";
 }
 
 export interface PaperSessionFillEvent {
@@ -70,6 +110,12 @@ export interface PaperSessionStepResult {
     allowNewEntries: boolean;
     completionOnly: boolean;
     hardCancel: boolean;
+    completionReleaseRole?: CompletionReleaseRole | undefined;
+    completionCalibrationPatienceMultiplier?: number | undefined;
+    completionRolePatienceMultiplier?: number | undefined;
+    completionEffectivePatienceMultiplier?: number | undefined;
+    completionWaitUntilSec?: number | undefined;
+    entryTrace?: EntryDecisionTrace | undefined;
   };
   execution: {
     fills: PaperSessionFillEvent[];
@@ -77,6 +123,8 @@ export interface PaperSessionStepResult {
     skippedCompletion: boolean;
     skippedUnwind: boolean;
     mergeShares: number;
+    redeemShares: number;
+    redeemSide?: OutcomeSide | undefined;
     mergePairCost?: number | undefined;
     mergeProceeds: number;
     realizedMergeProfit: number;
@@ -113,6 +161,7 @@ export interface PaperSessionReport {
     totalFeeUsd: number;
     totalEffectiveSpend: number;
     totalMergeShares: number;
+    totalRedeemShares: number;
     totalMergeProceeds: number;
     realizedMergeProfit: number;
     roiPct: number;
@@ -191,6 +240,7 @@ const sessionVariants: Record<PaperSessionVariant, PaperSessionStepSpec[]> = {
       note: "Entry prices are intentionally unattractive so the bot only flushes the earlier matched inventory into merge.",
       offsetSec: 86,
       books: { upBid: 0.62, upAsk: 0.63, downBid: 0.58, downAsk: 0.59 },
+      mergePolicy: "force",
     },
     {
       name: "overlap-down-completion-3",
@@ -221,6 +271,7 @@ const sessionVariants: Record<PaperSessionVariant, PaperSessionStepSpec[]> = {
       note: "A second unattractive-book pause clears the patient residual block so the later high/low cycles start from a flatter inventory base.",
       offsetSec: 161,
       books: { upBid: 0.66, upAsk: 0.67, downBid: 0.66, downAsk: 0.67 },
+      mergePolicy: "force",
     },
     {
       name: "high-low-down-seed-1",
@@ -275,6 +326,7 @@ const sessionVariants: Record<PaperSessionVariant, PaperSessionStepSpec[]> = {
       note: "A short post-high-low merge flush resets the book so the last mid-price cycle starts from flat inventory instead of inherited high-side basis.",
       offsetSec: 190,
       books: { upBid: 0.66, upAsk: 0.67, downBid: 0.66, downAsk: 0.67 },
+      mergePolicy: "force",
     },
     {
       name: "late-up-seed",
@@ -297,6 +349,7 @@ const sessionVariants: Record<PaperSessionVariant, PaperSessionStepSpec[]> = {
       note: "The last merge window converts the late matched inventory before the market enters the final idle stretch.",
       offsetSec: 280,
       books: { upBid: 0.67, upAsk: 0.68, downBid: 0.67, downAsk: 0.68 },
+      mergePolicy: "force",
     },
     {
       name: "late-hold",
@@ -309,6 +362,15 @@ const sessionVariants: Record<PaperSessionVariant, PaperSessionStepSpec[]> = {
       note: "Final seconds disable new entries.",
       offsetSec: 293,
       books: { upBid: 0.49, upAsk: 0.5, downBid: 0.49, downAsk: 0.5 },
+    },
+    {
+      name: "post-settlement-residual-redeem",
+      note: "Post-market lifecycle step redeems residual winner dust after merge batching has finished.",
+      offsetSec: 556,
+      books: { upBid: 0.49, upAsk: 0.5, downBid: 0.49, downAsk: 0.5 },
+      entryFillPolicy: "none",
+      mergePolicy: "skip",
+      redeemPolicy: "residual",
     },
   ],
   "blocked-completion": [
@@ -372,9 +434,15 @@ function snapshotState(state: XuanMarketState): PaperSessionStepResult["stateBef
   };
 }
 
-function shouldFillEntry(step: PaperSessionStepSpec, entryBuySide: OutcomeSide, entryBuyCount: number): boolean {
+function shouldFillEntry(
+  step: PaperSessionStepSpec,
+  entryBuy: EntryBuyDecision,
+  entryBuys: EntryBuyDecision[],
+  options: PaperSessionOptions,
+  entryTrace?: EntryDecisionTrace | undefined,
+): boolean {
   const policy = step.entryFillPolicy ?? "all";
-  if (entryBuyCount <= 1) {
+  if (entryBuys.length <= 1) {
     return policy !== "none";
   }
   if (policy === "all") {
@@ -383,7 +451,14 @@ function shouldFillEntry(step: PaperSessionStepSpec, entryBuySide: OutcomeSide, 
   if (policy === "none") {
     return false;
   }
-  return policy === "up-only" ? entryBuySide === "UP" : entryBuySide === "DOWN";
+  const flowIntentPriorityFill =
+    entryTrace?.childOrderReason === "flow_intent" &&
+    entryTrace.childOrderSelectedSide !== undefined &&
+    entryTrace.childOrderSelectedSide === entryBuys[0]?.side;
+  if (options.orderPriorityAwareFill || flowIntentPriorityFill) {
+    return entryBuy.side === entryBuys[0]?.side;
+  }
+  return policy === "up-only" ? entryBuy.side === "UP" : entryBuy.side === "DOWN";
 }
 
 function buildFillEvent(args: {
@@ -460,7 +535,20 @@ function applyCompletionTimingCalibration(
       return step;
     }
     const originalLatency = step.offsetSec - previous.offsetSec;
-    const calibratedLatency = Math.max(2, Math.round(originalLatency * Math.max(0.35, Math.min(1.4, multiplier))));
+    const boundedMultiplier = Math.max(0.25, Math.min(1.4, multiplier));
+    const patientOutlierLatencyCap =
+      originalLatency > 2 * 30
+        ? Math.max(10, Math.round(originalLatency * 0.18))
+        : originalLatency > 30
+          ? Math.max(12, Math.round(originalLatency * 0.34))
+          : Number.POSITIVE_INFINITY;
+    const calibratedLatency = Math.max(
+      2,
+      Math.min(
+        patientOutlierLatencyCap,
+        Math.round(originalLatency * boundedMultiplier),
+      ),
+    );
     const latestAllowedOffset =
       next && next.offsetSec > previous.offsetSec
         ? Math.max(previous.offsetSec + 1, next.offsetSec - 1)
@@ -480,6 +568,120 @@ function applyCompletionTimingCalibration(
   });
 
   return calibrated
+    .map((step, index) => ({ step, index }))
+    .sort((left, right) => left.step.offsetSec - right.step.offsetSec || left.index - right.index)
+    .map(({ step }) => step);
+}
+
+function applyOpeningSeedTimingCalibration(
+  steps: PaperSessionStepSpec[],
+  options: PaperSessionOptions,
+): PaperSessionStepSpec[] {
+  const requestedShiftSec = options.openingSeedOffsetShiftSec;
+  if (
+    requestedShiftSec === undefined ||
+    !Number.isFinite(requestedShiftSec) ||
+    Math.abs(requestedShiftSec) < 1
+  ) {
+    return steps;
+  }
+
+  const firstEntryIndex = steps.findIndex(
+    (step) => step.entryFillPolicy !== undefined && step.entryFillPolicy !== "none",
+  );
+  if (firstEntryIndex < 0) {
+    return steps;
+  }
+  const firstEntry = steps[firstEntryIndex];
+  if (!firstEntry) {
+    return steps;
+  }
+  const nextIndependentEntryIndex = steps.findIndex(
+    (step, index) =>
+      index > firstEntryIndex &&
+      step.entryFillPolicy !== undefined &&
+      step.entryFillPolicy !== "none",
+  );
+  const boundedShiftSec = Math.max(-8, Math.min(8, Math.round(requestedShiftSec)));
+  const earliestOffsetSec = 2;
+  const latestEntryOffsetSec =
+    nextIndependentEntryIndex >= 0
+      ? Math.max(earliestOffsetSec, (steps[nextIndependentEntryIndex]?.offsetSec ?? firstEntry.offsetSec) - 2)
+      : firstEntry.offsetSec + 8;
+  const shiftedFirstEntryOffsetSec = Math.max(
+    earliestOffsetSec,
+    Math.min(latestEntryOffsetSec, firstEntry.offsetSec - boundedShiftSec),
+  );
+  const effectiveShiftSec = firstEntry.offsetSec - shiftedFirstEntryOffsetSec;
+  if (Math.abs(effectiveShiftSec) < 1) {
+    return steps;
+  }
+
+  return steps.map((step, index) => {
+    const inOpeningPrefix =
+      index === firstEntryIndex ||
+      (index > firstEntryIndex &&
+        (nextIndependentEntryIndex < 0 || index < nextIndependentEntryIndex) &&
+        Boolean(step.completionFill));
+    if (!inOpeningPrefix) {
+      return step;
+    }
+    const offsetSec = Math.max(earliestOffsetSec, step.offsetSec - effectiveShiftSec);
+    if (offsetSec === step.offsetSec) {
+      return step;
+    }
+    return {
+      ...step,
+      offsetSec,
+      note: `${step.note} Opening seed timing calibrated from ${step.offsetSec}s to ${offsetSec}s.`,
+    };
+  });
+}
+
+function applyOverlapSeedTimingCalibration(
+  steps: PaperSessionStepSpec[],
+  options: PaperSessionOptions,
+): PaperSessionStepSpec[] {
+  const requestedShiftSec = options.overlapSeedOffsetShiftSec;
+  if (
+    requestedShiftSec === undefined ||
+    !Number.isFinite(requestedShiftSec) ||
+    Math.abs(requestedShiftSec) < 1
+  ) {
+    return steps;
+  }
+
+  const boundedShiftSec = Math.max(0, Math.min(24, Math.round(requestedShiftSec)));
+  const firstEntryIndex = steps.findIndex(
+    (step) => step.entryFillPolicy !== undefined && step.entryFillPolicy !== "none",
+  );
+  if (boundedShiftSec <= 0 || firstEntryIndex < 0) {
+    return steps;
+  }
+
+  return steps
+    .reduce<PaperSessionStepSpec[]>((acc, step, index) => {
+      const isOverlapSeed =
+        index > firstEntryIndex &&
+        step.entryFillPolicy !== undefined &&
+        step.entryFillPolicy !== "none";
+      if (!isOverlapSeed) {
+        acc.push(step);
+        return acc;
+      }
+      const previousOffsetSec = acc.at(-1)?.offsetSec ?? 0;
+      const offsetSec = Math.max(previousOffsetSec + 1, step.offsetSec - boundedShiftSec);
+      acc.push(
+        offsetSec === step.offsetSec
+          ? step
+          : {
+              ...step,
+              offsetSec,
+              note: `${step.note} Overlap seed cadence calibrated from ${step.offsetSec}s to ${offsetSec}s.`,
+            },
+      );
+      return acc;
+    }, [])
     .map((step, index) => ({ step, index }))
     .sort((left, right) => left.step.offsetSec - right.step.offsetSec || left.index - right.index)
     .map(({ step }) => step);
@@ -528,6 +730,32 @@ function applyEffectiveMerge(
   };
 }
 
+function residualRedeemPlan(state: XuanMarketState): { side: OutcomeSide; shares: number } | undefined {
+  const gap = Number(Math.abs(state.upShares - state.downShares).toFixed(6));
+  if (gap <= 1e-6) {
+    return undefined;
+  }
+  return {
+    side: state.upShares >= state.downShares ? "UP" : "DOWN",
+    shares: gap,
+  };
+}
+
+function applyEffectiveRedeem(
+  costState: EffectiveCostState,
+  stateBefore: XuanMarketState,
+  side: OutcomeSide,
+  redeemShares: number,
+): EffectiveCostState {
+  if (redeemShares <= 0) {
+    return costState;
+  }
+  const averageBefore = averageEffectiveCost(costState, stateBefore, side);
+  return side === "UP"
+    ? { ...costState, up: Math.max(0, costState.up - averageBefore * redeemShares) }
+    : { ...costState, down: Math.max(0, costState.down - averageBefore * redeemShares) };
+}
+
 export function runPaperSession(
   env: AppEnv,
   variant: PaperSessionVariant = "xuan-flow",
@@ -541,7 +769,15 @@ export function runPaperSession(
   let state = createMarketState(market);
   let effectiveCostState: EffectiveCostState = { up: 0, down: 0 };
   const steps: PaperSessionStepResult[] = [];
-  const replaySteps = applyCompletionTimingCalibration(sessionVariants[variant], options);
+  const replaySteps = applyCompletionTimingCalibration(
+    applyOverlapSeedTimingCalibration(
+      applyOpeningSeedTimingCalibration(sessionVariants[variant], options),
+      options,
+    ),
+    options,
+  );
+  let mergeBatchTracker = createMergeBatchTracker();
+  let nonFinalForcedMergeCohorts = 0;
 
   for (const step of replaySteps) {
     const nowTs = market.startTs + step.offsetSec;
@@ -550,6 +786,11 @@ export function runPaperSession(
       buildSyntheticBook(market.tokens.DOWN.tokenId, market.conditionId, step.books.downBid, step.books.downAsk),
     );
     const stateBefore = snapshotState(state);
+    const calibratedRecentSeedFlowCount =
+      countRecentSeedFlowCount(state.fillHistory, nowTs) + Math.max(0, options.recentSeedFlowCountBonus ?? 0);
+    const calibratedActiveIndependentFlowCount =
+      countActiveIndependentFlowCount(state.fillHistory, nowTs) +
+      Math.max(0, options.activeIndependentFlowCountBonus ?? 0);
     const decision = bot.evaluateTick({
       config,
       state,
@@ -566,8 +807,22 @@ export function runPaperSession(
       },
       dryRunOrSmallLive: true,
       fairValueSnapshot: buildPaperFairValueSnapshot(step),
+      recentSeedFlowCount: calibratedRecentSeedFlowCount,
+      activeIndependentFlowCount: calibratedActiveIndependentFlowCount,
       ...(options.completionPatienceMultiplier !== undefined
         ? { completionPatienceMultiplier: options.completionPatienceMultiplier }
+        : {}),
+      ...(options.openingSeedReleaseBias !== undefined
+        ? { openingSeedReleaseBias: options.openingSeedReleaseBias }
+        : {}),
+      ...(options.semanticRoleAlignmentBias !== undefined
+        ? { semanticRoleAlignmentBias: options.semanticRoleAlignmentBias }
+        : {}),
+      ...(options.childOrderMicroTimingBias !== undefined
+        ? { childOrderMicroTimingBias: options.childOrderMicroTimingBias }
+        : {}),
+      ...(options.completionRoleReleaseOrderBias !== undefined
+        ? { completionRoleReleaseOrderBias: options.completionRoleReleaseOrderBias }
         : {}),
     });
 
@@ -575,9 +830,40 @@ export function runPaperSession(
     const skippedEntrySides: OutcomeSide[] = [];
     let skippedCompletion = false;
     let skippedUnwind = false;
+    let completionHandled = false;
+    const applyCompletionFill = () => {
+      if (!decision.completion || completionHandled) {
+        return;
+      }
+      completionHandled = true;
+      if (step.completionFill ?? true) {
+        const fillEvent = buildFillEvent({
+          kind: "completion",
+          side: decision.completion.sideToBuy,
+          action: "BUY",
+          size: decision.completion.missingShares,
+          price: decision.completion.order.price ?? 0,
+          reason: decision.completion.capMode,
+          executionMode: decision.completion.mode,
+        });
+        fills.push(fillEvent);
+        effectiveCostState = applyEffectiveFill(effectiveCostState, state, fillEvent);
+        state = applySyntheticFill(state, fillEvent, nowTs);
+      } else {
+        skippedCompletion = true;
+      }
+    };
+    const completionBeforeEntries =
+      Boolean(decision.completion) &&
+      decision.entryBuys.length > 0 &&
+      decision.trace.entry.overlapRepairOutcome === "overlap_seed";
+
+    if (completionBeforeEntries) {
+      applyCompletionFill();
+    }
 
     for (const entryBuy of decision.entryBuys) {
-      if (!shouldFillEntry(step, entryBuy.side, decision.entryBuys.length)) {
+      if (!shouldFillEntry(step, entryBuy, decision.entryBuys, options, decision.trace.entry)) {
         skippedEntrySides.push(entryBuy.side);
         continue;
       }
@@ -595,23 +881,8 @@ export function runPaperSession(
       state = applySyntheticFill(state, fillEvent, nowTs);
     }
 
-    if (decision.completion) {
-      if (step.completionFill ?? true) {
-        const fillEvent = buildFillEvent({
-          kind: "completion",
-          side: decision.completion.sideToBuy,
-          action: "BUY",
-          size: decision.completion.missingShares,
-          price: decision.completion.order.price ?? 0,
-          reason: decision.completion.capMode,
-          executionMode: decision.completion.mode,
-        });
-        fills.push(fillEvent);
-        effectiveCostState = applyEffectiveFill(effectiveCostState, state, fillEvent);
-        state = applySyntheticFill(state, fillEvent, nowTs);
-      } else {
-        skippedCompletion = true;
-      }
+    if (!completionHandled) {
+      applyCompletionFill();
     }
 
     if (decision.unwind) {
@@ -634,19 +905,60 @@ export function runPaperSession(
     }
 
     const mergePlan = planMerge(config, state);
-    const mergeShares = step.mergePolicy === "skip" ? 0 : mergePlan.shouldMerge ? mergePlan.mergeable : 0;
+    const observedMergeable = Math.min(state.upShares, state.downShares);
+    const activeIndependentFlowCount = countActiveIndependentFlowCount(state.fillHistory, nowTs);
+    mergeBatchTracker = syncMergeBatchTracker(mergeBatchTracker, observedMergeable, nowTs, {
+      activeIndependentFlowCount,
+    });
+    const mergeGate = evaluateDelayedMergeGate(config, state, {
+      nowTs,
+      secsFromOpen: nowTs - market.startTs,
+      secsToClose: market.endTs - nowTs,
+      usdcBalance: 100,
+      tracker: mergeBatchTracker,
+      activeIndependentFlowCount,
+    });
+    const forceMergeInFinalWindow = market.endTs - nowTs <= config.finalWindowCompletionOnlySec;
+    const compressedForcedMerge =
+      Boolean(options.mergeCohortCompression) &&
+      step.mergePolicy === "force" &&
+      !forceMergeInFinalWindow &&
+      nonFinalForcedMergeCohorts >= 1;
+    const mergeShares =
+      step.mergePolicy === "skip" || compressedForcedMerge
+        ? 0
+        : step.mergePolicy === "force"
+          ? observedMergeable
+          : mergePlan.shouldMerge && mergeGate.allow
+            ? mergePlan.mergeable
+            : 0;
     const { nextCostState, pairCost: mergePairCost } = applyEffectiveMerge(effectiveCostState, state, mergeShares);
     const mergeProceeds = mergeShares;
     const realizedMergeProfit =
       mergePairCost !== undefined ? mergeShares * (1 - mergePairCost) : 0;
 
     if (mergeShares > 0) {
+      if (step.mergePolicy === "force" && !forceMergeInFinalWindow) {
+        nonFinalForcedMergeCohorts += 1;
+      }
       effectiveCostState = nextCostState;
       state = applyMerge(state, {
         amount: mergeShares,
         timestamp: nowTs,
         simulated: true,
       });
+      mergeBatchTracker = syncMergeBatchTracker(mergeBatchTracker, Math.min(state.upShares, state.downShares), nowTs);
+    }
+    const redeemPlan = step.redeemPolicy === "residual" ? residualRedeemPlan(state) : undefined;
+    const redeemShares = redeemPlan?.shares ?? 0;
+    const redeemSide = redeemPlan?.side;
+    if (redeemPlan && redeemShares > 0) {
+      effectiveCostState = applyEffectiveRedeem(effectiveCostState, state, redeemPlan.side, redeemShares);
+      state = shrinkOutcomeToObservedShares(
+        state,
+        redeemPlan.side,
+        Math.max(0, (redeemPlan.side === "UP" ? state.upShares : state.downShares) - redeemShares),
+      );
     }
 
     const rawSpend = fills
@@ -672,6 +984,22 @@ export function runPaperSession(
         allowNewEntries: decision.risk.allowNewEntries,
         completionOnly: decision.risk.completionOnly,
         hardCancel: decision.risk.hardCancel,
+        ...(decision.completion?.completionReleaseRole !== undefined
+          ? { completionReleaseRole: decision.completion.completionReleaseRole }
+          : {}),
+        ...(decision.completion?.completionCalibrationPatienceMultiplier !== undefined
+          ? { completionCalibrationPatienceMultiplier: decision.completion.completionCalibrationPatienceMultiplier }
+          : {}),
+        ...(decision.completion?.completionRolePatienceMultiplier !== undefined
+          ? { completionRolePatienceMultiplier: decision.completion.completionRolePatienceMultiplier }
+          : {}),
+        ...(decision.completion?.completionEffectivePatienceMultiplier !== undefined
+          ? { completionEffectivePatienceMultiplier: decision.completion.completionEffectivePatienceMultiplier }
+          : {}),
+        ...(decision.completion?.completionWaitUntilSec !== undefined
+          ? { completionWaitUntilSec: decision.completion.completionWaitUntilSec }
+          : {}),
+        entryTrace: decision.trace.entry,
       },
       execution: {
         fills,
@@ -679,6 +1007,8 @@ export function runPaperSession(
         skippedCompletion,
         skippedUnwind,
         mergeShares,
+        redeemShares,
+        ...(redeemSide !== undefined ? { redeemSide } : {}),
         ...(mergePairCost !== undefined ? { mergePairCost } : {}),
         mergeProceeds,
         realizedMergeProfit,
@@ -710,6 +1040,7 @@ export function runPaperSession(
   const totalFeeUsd = steps.reduce((acc, step) => acc + step.execution.feeUsd, 0);
   const totalEffectiveSpend = steps.reduce((acc, step) => acc + step.execution.effectiveSpend, 0);
   const totalMergeShares = steps.reduce((acc, step) => acc + step.execution.mergeShares, 0);
+  const totalRedeemShares = steps.reduce((acc, step) => acc + step.execution.redeemShares, 0);
   const totalMergeProceeds = steps.reduce((acc, step) => acc + step.execution.mergeProceeds, 0);
   const realizedMergeProfit = steps.reduce((acc, step) => acc + step.execution.realizedMergeProfit, 0);
   const footprint = buildFootprintSummary({
@@ -739,6 +1070,7 @@ export function runPaperSession(
       totalFeeUsd,
       totalEffectiveSpend,
       totalMergeShares,
+      totalRedeemShares,
       totalMergeProceeds,
       realizedMergeProfit,
       roiPct: realizedMergeProfit / Math.max(totalEffectiveSpend, 1e-9) * 100,

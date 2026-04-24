@@ -99,6 +99,16 @@ interface RuntimeMarketEvents {
   mergeRedeemEvents: RuntimeMergeRedeemRow[];
   repairSizeZeroEvents: Array<{ timestampSec: number; shareGap: number }>;
   marketState?: RuntimeMarketStateRow | undefined;
+  childOrderDispatch: RuntimeChildOrderDispatchDiagnostics;
+}
+
+interface RuntimeChildOrderDispatchDiagnostics {
+  pairSubmitCount: number;
+  sequentialPairSubmitCount: number;
+  flowIntentPairSubmitCount: number;
+  compressedPairSubmitCount: number;
+  averageInterChildDelayMs: number | null;
+  maxInterChildDelayMs: number | null;
 }
 
 export interface RuntimeCanonicalExtractBundle {
@@ -116,7 +126,11 @@ export interface RuntimeCanonicalExtractBundle {
       marketBaseLot: number;
       groupCount: number;
       grouplessBuyCount: number;
+      buyCount: number;
+      lifecycleEventCount: number;
       mergeableAtEnd: number;
+      childOrderDispatch: RuntimeChildOrderDispatchDiagnostics;
+      runtimeDataStatus: "runtime_fills_present" | "runtime_lifecycle_only" | "no_runtime_fills";
     }
   >;
 }
@@ -447,6 +461,43 @@ function mergeRepairEvents(
   return events;
 }
 
+function buildChildOrderDispatchDiagnostics(
+  ordersTrace: Record<string, unknown>[],
+  marketSlug: string,
+): RuntimeChildOrderDispatchDiagnostics {
+  const pairSubmits = ordersTrace.filter(
+    (record) =>
+      record.marketSlug === marketSlug &&
+      record.eventType === "pair_orders_submit",
+  );
+  const delays = pairSubmits
+    .map((record) => record.interChildDelayMs)
+    .filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+  const averageDelay =
+    delays.length > 0
+      ? normalize(delays.reduce((sum, value) => sum + value, 0) / delays.length)
+      : null;
+  const maxDelay = delays.length > 0 ? Math.max(...delays) : null;
+
+  return {
+    pairSubmitCount: pairSubmits.length,
+    sequentialPairSubmitCount: pairSubmits.filter((record) => record.sequentialPairExecution === true).length,
+    flowIntentPairSubmitCount: pairSubmits.filter(
+      (record) =>
+        record.childOrderReason === "flow_intent" ||
+        record.childOrderMicroTimingBias === "flow_intent",
+    ).length,
+    compressedPairSubmitCount: pairSubmits.filter(
+      (record) =>
+        typeof record.interChildDelayMs === "number" &&
+        Number.isFinite(record.interChildDelayMs) &&
+        record.interChildDelayMs <= 40,
+    ).length,
+    averageInterChildDelayMs: averageDelay,
+    maxInterChildDelayMs: maxDelay,
+  };
+}
+
 function assignGroupToLot(
   lot: RuntimeLotRow,
   pairGroups: RuntimePairGroupRow[],
@@ -474,6 +525,7 @@ function buildMarketEvents(args: {
   mergeRedeemEvents: RuntimeMergeRedeemRow[];
   marketState?: RuntimeMarketStateRow | undefined;
   repairEvents: Map<string, Array<{ timestampSec: number; shareGap: number }>>;
+  childOrderDispatch: RuntimeChildOrderDispatchDiagnostics;
 }): RuntimeMarketEvents {
   const marketPairGroups = args.pairGroups
     .filter((group) => group.marketSlug === args.marketSlug)
@@ -495,6 +547,7 @@ function buildMarketEvents(args: {
     mergeRedeemEvents: marketMergeRedeemEvents,
     repairSizeZeroEvents: args.repairEvents.get(args.marketSlug) ?? [],
     marketState: args.marketState,
+    childOrderDispatch: args.childOrderDispatch,
   };
 }
 
@@ -540,7 +593,11 @@ function buildRuntimeReferenceForMarket(args: {
     marketBaseLot: number;
     groupCount: number;
     grouplessBuyCount: number;
+    buyCount: number;
+    lifecycleEventCount: number;
     mergeableAtEnd: number;
+    childOrderDispatch: RuntimeChildOrderDispatchDiagnostics;
+    runtimeDataStatus: "runtime_fills_present" | "runtime_lifecycle_only" | "no_runtime_fills";
   };
 } {
   const maybeStart = Number(args.marketSlug.split("-").at(-1) ?? 0);
@@ -864,7 +921,16 @@ function buildRuntimeReferenceForMarket(args: {
       marketBaseLot: baseLot,
       groupCount: pairGroups.length,
       grouplessBuyCount: hardFails.grouplessBotFill,
+      buyCount: buyLots.length,
+      lifecycleEventCount: lifecycleEvents.length,
       mergeableAtEnd: finalMergeable,
+      childOrderDispatch: args.marketEvents.childOrderDispatch,
+      runtimeDataStatus:
+        buyLots.length > 0
+          ? "runtime_fills_present"
+          : lifecycleEvents.length > 0
+            ? "runtime_lifecycle_only"
+            : "no_runtime_fills",
     },
   };
 }
@@ -876,6 +942,7 @@ export async function buildRuntimeCanonicalExtractBundle(args: {
 }): Promise<RuntimeCanonicalExtractBundle> {
   const logsDir = args.logsDir ?? DEFAULT_RUNTIME_LOG_DIR;
   const decisionTrace = await readJsonlRecords(join(logsDir, "decision_trace.jsonl"));
+  const ordersTrace = await readJsonlRecords(join(logsDir, "orders.jsonl"));
   const riskEvents = await readJsonlRecords(join(logsDir, "risk_events.jsonl"));
   const runtimeData = loadRuntimeData(args.stateDbPath);
   const repairEvents = mergeRepairEvents(decisionTrace, riskEvents, DEFAULT_REPAIR_MIN_QTY);
@@ -904,6 +971,7 @@ export async function buildRuntimeCanonicalExtractBundle(args: {
       mergeRedeemEvents: runtimeData.mergeRedeemEvents,
       marketState: stateMarketMap.get(marketSlug),
       repairEvents,
+      childOrderDispatch: buildChildOrderDispatchDiagnostics(ordersTrace, marketSlug),
     });
     const result = buildRuntimeReferenceForMarket({
       marketSlug,

@@ -1,14 +1,18 @@
 import type {
   CanonicalPhase,
   CanonicalReferenceBundle,
+  CanonicalSequenceEvent,
   CanonicalReferenceExtract,
   NormalizedClipTier,
   QtyBucket,
   ResidualBucket,
   TimingBucket,
 } from "./xuanCanonicalReference.js";
+import type { OutcomeSide } from "../infra/clob/types.js";
 
 export type ComparatorVerdict = "PASS" | "WARN" | "FAIL";
+
+export const XUAN_FLOW_CALIBRATION_VERSION = "flow-calib-v4-side-role-opening-guard";
 
 export interface HardFailCounts {
   overshoot: number;
@@ -31,6 +35,10 @@ export interface ComparatorBreakdown {
   clipBucketScore: number;
   alternationScore: number;
   sideSequenceScore: number;
+  flowPairSideSetScore: number;
+  semanticRoleSequenceScore: number;
+  completionReleaseRoleScore: number;
+  flowPairRoleSetScore: number;
   overlapFamilyScore: number;
   phaseFamilyScore: number;
   eventQtyScore: number;
@@ -39,6 +47,56 @@ export interface ComparatorBreakdown {
   flowLineageScore: number;
   activeFlowPeakScore: number;
   cycleCompletionLatencyScore: number;
+  openingEntryTimingScore: number;
+  childOrderMicroTimingScore: number;
+}
+
+export interface SideSequenceMismatchDetail {
+  index: number;
+  referenceSide: OutcomeSide | null;
+  candidateSide: OutcomeSide | null;
+  referencePhase: CanonicalPhase | null;
+  candidatePhase: CanonicalPhase | null;
+  referenceInternalLabel: string | null;
+  candidateInternalLabel: string | null;
+  referenceCycleId: number | null;
+  candidateCycleId: number | null;
+  referenceOffsetSec: number | null;
+  candidateOffsetSec: number | null;
+  offsetDeltaSec: number | null;
+  mismatchSource: string;
+}
+
+export interface SemanticRoleSequenceMismatchDetail {
+  index: number;
+  referenceRole: SemanticRoleToken | null;
+  candidateRole: SemanticRoleToken | null;
+  referenceSide: OutcomeSide | null;
+  candidateSide: OutcomeSide | null;
+  referencePhase: CanonicalPhase | null;
+  candidatePhase: CanonicalPhase | null;
+  referenceInternalLabel: string | null;
+  candidateInternalLabel: string | null;
+  referenceCycleId: number | null;
+  candidateCycleId: number | null;
+  referenceOffsetSec: number | null;
+  candidateOffsetSec: number | null;
+  referencePrice: number | null;
+  candidatePrice: number | null;
+  offsetDeltaSec: number | null;
+  priceDelta: number | null;
+  mismatchSource: string;
+}
+
+export interface ChildOrderMicroTimingDetail {
+  index: number;
+  referenceSide: OutcomeSide | null;
+  candidateSide: OutcomeSide | null;
+  referencePhase: CanonicalPhase | null;
+  candidatePhase: CanonicalPhase | null;
+  referenceOffsetSec: number | null;
+  candidateOffsetSec: number | null;
+  offsetDeltaSec: number | null;
 }
 
 export interface CanonicalComparisonResult {
@@ -60,6 +118,15 @@ export interface CanonicalComparisonResult {
     alternationSimilarity: number;
     sideSequenceSimilarity: number;
     sideSequenceMismatchCount: number;
+    sideSequenceMismatchDetails: SideSequenceMismatchDetail[];
+    flowPairSideSetSimilarity: number;
+    semanticRoleSequenceSimilarity: number;
+    semanticRoleSequenceMismatchCount: number;
+    semanticRoleSequenceMismatchDetails: SemanticRoleSequenceMismatchDetail[];
+    completionReleaseRoleSimilarity: number;
+    completionReleaseRoleMismatchCount: number;
+    completionReleaseRoleMismatchDetails: SemanticRoleSequenceMismatchDetail[];
+    flowPairRoleSetSimilarity: number;
     overlapFamilySimilarity: number;
     phaseFamilySimilarity: number;
     eventQtySimilarity: number;
@@ -68,11 +135,31 @@ export interface CanonicalComparisonResult {
     flowLineageSimilarity: number;
     activeFlowPeakSimilarity: number;
     cycleCompletionLatencySimilarity: number;
+    openingEntryTimingSimilarity: number;
+    childOrderMicroTimingSimilarity: number;
+    childOrderMicroTimingMismatchCount: number;
+    childOrderMicroTimingDetails: ChildOrderMicroTimingDetail[];
+    childOrderSideInversionCount: number;
+    childOrderGlobalDelayP50Sec: number;
+    childOrderGlobalDelayP75Sec: number;
+    childOrderGlobalAbsDelayP75Sec: number;
+    childOrderMicroTimingDeltaP50Sec: number;
+    childOrderMicroTimingDeltaP75Sec: number;
+    childOrderMicroTimingMaxAbsDeltaSec: number;
     referenceActiveFlowPeak: number;
     candidateActiveFlowPeak: number;
+    referenceFirstEntryOffsetSec: number | null;
+    candidateFirstEntryOffsetSec: number | null;
+    firstEntryOffsetDeltaSec: number | null;
     referenceAverageCycleCompletionLatencySec: number;
     candidateAverageCycleCompletionLatencySec: number;
     averageCycleCompletionLatencyDeltaSec: number;
+    cycleCompletionLatencyDeltasSec: number[];
+    cycleCompletionLatencyDeltaP50Sec: number;
+    cycleCompletionLatencyDeltaP75Sec: number;
+    cycleCompletionLatencyMaxAbsDeltaSec: number;
+    exactLifecycleParityRequired: boolean;
+    exactLifecycleParityBroken: boolean;
   };
 }
 
@@ -80,14 +167,44 @@ export interface ComparisonFlowSummary {
   flowLineageSimilarity: number;
   activeFlowPeakSimilarity: number;
   cycleCompletionLatencySimilarity: number;
+  openingEntryTimingSimilarity: number;
+  childOrderMicroTimingSimilarity: number;
+  childOrderMicroTimingMismatchCount: number;
+  childOrderMicroTimingDetails: ChildOrderMicroTimingDetail[];
+  childOrderSideInversionCount: number;
+  childOrderGlobalDelayP50Sec: number;
+  childOrderGlobalDelayP75Sec: number;
+  childOrderGlobalAbsDelayP75Sec: number;
+  childOrderMicroTimingDeltaP50Sec: number;
+  childOrderMicroTimingDeltaP75Sec: number;
+  childOrderMicroTimingMaxAbsDeltaSec: number;
+  sideSequenceSimilarity: number;
+  sideSequenceMismatchCount: number;
+  sideSequenceMismatchDetails: SideSequenceMismatchDetail[];
+  flowPairSideSetSimilarity: number;
+  semanticRoleSequenceSimilarity: number;
+  semanticRoleSequenceMismatchCount: number;
+  semanticRoleSequenceMismatchDetails: SemanticRoleSequenceMismatchDetail[];
+  completionReleaseRoleSimilarity: number;
+  completionReleaseRoleMismatchCount: number;
+  completionReleaseRoleMismatchDetails: SemanticRoleSequenceMismatchDetail[];
+  flowPairRoleSetSimilarity: number;
   referenceActiveFlowPeak: number;
   candidateActiveFlowPeak: number;
+  referenceFirstEntryOffsetSec: number | null;
+  candidateFirstEntryOffsetSec: number | null;
+  firstEntryOffsetDeltaSec: number | null;
   referenceAverageCycleCompletionLatencySec: number;
   candidateAverageCycleCompletionLatencySec: number;
   averageCycleCompletionLatencyDeltaSec: number;
+  cycleCompletionLatencyDeltaP50Sec: number;
+  cycleCompletionLatencyDeltaP75Sec: number;
+  cycleCompletionLatencyMaxAbsDeltaSec: number;
   flowLineageScore: number;
   activeFlowPeakScore: number;
   cycleCompletionLatencyScore: number;
+  openingEntryTimingScore: number;
+  childOrderMicroTimingScore: number;
 }
 
 export interface ComparisonFlowStatus {
@@ -100,7 +217,35 @@ export interface FlowCalibrationSummary {
   averageFlowLineageSimilarity: number;
   averageActiveFlowPeakSimilarity: number;
   averageCycleCompletionLatencySimilarity: number;
+  averageOpeningEntryTimingSimilarity: number;
+  averageChildOrderMicroTimingSimilarity: number;
+  averageChildOrderMicroTimingMismatchCount: number;
+  averageChildOrderSideInversionCount: number;
+  averageChildOrderGlobalDelayP50Sec: number;
+  averageChildOrderGlobalDelayP75Sec: number;
+  averageChildOrderGlobalAbsDelayP75Sec: number;
+  averageChildOrderMicroTimingDeltaP50Sec: number;
+  averageChildOrderMicroTimingDeltaP75Sec: number;
+  averageChildOrderMicroTimingMaxAbsDeltaSec: number;
+  childOrderTimingDirection: "candidate_early" | "candidate_late" | "mixed" | "aligned";
+  averageFirstEntryOffsetDeltaSec: number;
+  openingEntryTimingDirection: "candidate_early" | "candidate_late" | "aligned";
+  averageSideSequenceSimilarity: number;
+  averageSideSequenceMismatchCount: number;
+  averageSideSequenceMismatchOffsetDeltaSec: number;
+  averageFlowPairSideSetSimilarity: number;
+  averageSemanticRoleSequenceSimilarity: number;
+  averageSemanticRoleSequenceMismatchCount: number;
+  averageSemanticRoleMismatchOffsetDeltaSec: number;
+  averageCompletionReleaseRoleSimilarity: number;
+  averageCompletionReleaseRoleMismatchCount: number;
+  averageCompletionReleaseRoleMismatchOffsetDeltaSec: number;
+  averageFlowPairRoleSetSimilarity: number;
+  roleSideTradeoffRisk: "none" | "side_preservation_blocks_role_alignment" | "role_alignment_may_break_side_sequence";
   averageCycleCompletionLatencyDeltaSec: number;
+  averageCycleCompletionLatencyDeltaP50Sec: number;
+  averageCycleCompletionLatencyDeltaP75Sec: number;
+  averageCycleCompletionLatencyMaxAbsDeltaSec: number;
   completionLatencyDirection: "candidate_early" | "candidate_late" | "aligned";
   status: ComparatorVerdict;
   recommendedFocus: string[];
@@ -192,24 +337,367 @@ function overlapSimilarity(reference: CanonicalReferenceExtract, candidate: Cano
 function sideSequenceComparison(reference: CanonicalReferenceExtract, candidate: CanonicalReferenceExtract): {
   similarity: number;
   mismatchCount: number;
+  mismatchDetails: SideSequenceMismatchDetail[];
 } {
   const maxLength = Math.max(reference.buySequence.length, candidate.buySequence.length);
   if (maxLength === 0) {
     return {
       similarity: 1,
       mismatchCount: 0,
+      mismatchDetails: [],
     };
   }
+  const referenceBuys = reference.orderedClipSequence.filter((event) => event.kind === "BUY");
+  const candidateBuys = candidate.orderedClipSequence.filter((event) => event.kind === "BUY");
   let samePositionMatches = 0;
-  const minLength = Math.min(reference.buySequence.length, candidate.buySequence.length);
-  for (let index = 0; index < minLength; index += 1) {
-    if (reference.buySequence[index] === candidate.buySequence[index]) {
+  const mismatchDetails: SideSequenceMismatchDetail[] = [];
+  for (let index = 0; index < maxLength; index += 1) {
+    const referenceEvent = referenceBuys[index];
+    const candidateEvent = candidateBuys[index];
+    const referenceSide = reference.buySequence[index] ?? null;
+    const candidateSide = candidate.buySequence[index] ?? null;
+    if (referenceSide !== null && referenceSide === candidateSide) {
       samePositionMatches += 1;
+      continue;
     }
+    mismatchDetails.push(buildSideSequenceMismatchDetail(index, referenceEvent, candidateEvent));
   }
   return {
     similarity: samePositionMatches / maxLength,
-    mismatchCount: maxLength - samePositionMatches,
+    mismatchCount: mismatchDetails.length,
+    mismatchDetails,
+  };
+}
+
+function childOrderMicroTimingComparison(reference: CanonicalReferenceExtract, candidate: CanonicalReferenceExtract): {
+  similarity: number;
+  mismatchCount: number;
+  details: ChildOrderMicroTimingDetail[];
+  deltasSec: number[];
+  sideInversionCount: number;
+  deltaP50Sec: number;
+  deltaP75Sec: number;
+  absDeltaP75Sec: number;
+  maxAbsDeltaSec: number;
+} {
+  const referenceBuys = reference.orderedClipSequence.filter((event) => event.kind === "BUY");
+  const candidateBuys = candidate.orderedClipSequence.filter((event) => event.kind === "BUY");
+  const maxLength = Math.max(referenceBuys.length, candidateBuys.length);
+  if (maxLength === 0) {
+    return {
+      similarity: 1,
+      mismatchCount: 0,
+      details: [],
+      deltasSec: [],
+      sideInversionCount: 0,
+      deltaP50Sec: 0,
+      deltaP75Sec: 0,
+      absDeltaP75Sec: 0,
+      maxAbsDeltaSec: 0,
+    };
+  }
+  let score = 0;
+  const details: ChildOrderMicroTimingDetail[] = [];
+  const deltasSec: number[] = [];
+  let sideInversionCount = 0;
+  for (let index = 0; index < maxLength; index += 1) {
+    const referenceEvent = referenceBuys[index];
+    const candidateEvent = candidateBuys[index];
+    const referenceOffset = referenceEvent?.tOffsetSec ?? null;
+    const candidateOffset = candidateEvent?.tOffsetSec ?? null;
+    const offsetDelta =
+      referenceOffset === null || candidateOffset === null
+        ? null
+        : Number((candidateOffset - referenceOffset).toFixed(6));
+    if (offsetDelta !== null) {
+      deltasSec.push(offsetDelta);
+    }
+    if (
+      referenceEvent?.outcome !== undefined &&
+      referenceEvent.outcome !== null &&
+      candidateEvent?.outcome !== undefined &&
+      candidateEvent.outcome !== null &&
+      referenceEvent.outcome !== candidateEvent.outcome
+    ) {
+      sideInversionCount += 1;
+    }
+    const timingScore = timingOffsetSimilarity(referenceOffset, candidateOffset, 2, 30);
+    score += timingScore;
+    if (timingScore < 0.999) {
+      details.push({
+        index,
+        referenceSide: referenceEvent?.outcome ?? null,
+        candidateSide: candidateEvent?.outcome ?? null,
+        referencePhase: referenceEvent?.phase ?? null,
+        candidatePhase: candidateEvent?.phase ?? null,
+        referenceOffsetSec: referenceOffset,
+        candidateOffsetSec: candidateOffset,
+        offsetDeltaSec: offsetDelta,
+      });
+    }
+  }
+  const absoluteDeltas = deltasSec.map((delta) => Math.abs(delta));
+  return {
+    similarity: score / maxLength,
+    mismatchCount: details.length,
+    details,
+    deltasSec,
+    sideInversionCount,
+    deltaP50Sec: percentileNumber(deltasSec, 0.5),
+    deltaP75Sec: percentileNumber(deltasSec, 0.75),
+    absDeltaP75Sec: percentileNumber(absoluteDeltas, 0.75),
+    maxAbsDeltaSec: absoluteDeltas.length > 0 ? Number(Math.max(...absoluteDeltas).toFixed(6)) : 0,
+  };
+}
+
+function cycleSideSetToken(events: CanonicalSequenceEvent[]): string {
+  return events
+    .filter((event) => event.kind === "BUY" && event.outcome !== null)
+    .map((event) => event.outcome)
+    .sort()
+    .join("+");
+}
+
+function flowPairSideSetSimilarity(reference: CanonicalReferenceExtract, candidate: CanonicalReferenceExtract): number {
+  const group = (extract: CanonicalReferenceExtract): Map<number, string> => {
+    const byCycle = new Map<number, CanonicalSequenceEvent[]>();
+    for (const event of extract.orderedClipSequence) {
+      if (event.kind !== "BUY") {
+        continue;
+      }
+      const events = byCycle.get(event.cycleId) ?? [];
+      events.push(event);
+      byCycle.set(event.cycleId, events);
+    }
+    return new Map(
+      [...byCycle.entries()]
+        .map(([cycleId, events]) => [cycleId, cycleSideSetToken(events)] as const)
+        .filter(([, token]) => token.length > 0),
+    );
+  };
+  const left = group(reference);
+  const right = group(candidate);
+  const cycleIds = new Set([...left.keys(), ...right.keys()]);
+  if (cycleIds.size === 0) {
+    return 1;
+  }
+  let matches = 0;
+  for (const cycleId of cycleIds) {
+    if (left.get(cycleId) === right.get(cycleId)) {
+      matches += 1;
+    }
+  }
+  return matches / cycleIds.size;
+}
+
+type SemanticRoleToken =
+  | "ENTRY_HIGH"
+  | "ENTRY_MID"
+  | "ENTRY_LOW"
+  | "OVERLAP_HIGH"
+  | "OVERLAP_MID"
+  | "OVERLAP_LOW"
+  | "COMPLETION_EXPENSIVE"
+  | "COMPLETION_MID"
+  | "COMPLETION_CHEAP"
+  | "HIGH_LOW_COMPLETION_EXPENSIVE"
+  | "HIGH_LOW_COMPLETION_MID"
+  | "HIGH_LOW_COMPLETION_CHEAP";
+
+function semanticRoleSequenceComparison(reference: CanonicalReferenceExtract, candidate: CanonicalReferenceExtract): {
+  similarity: number;
+  mismatchCount: number;
+  mismatchDetails: SemanticRoleSequenceMismatchDetail[];
+} {
+  const left = semanticRoleSequence(reference);
+  const right = semanticRoleSequence(candidate);
+  return compareSemanticRoleTokens(left, right);
+}
+
+function completionReleaseRoleSequenceComparison(reference: CanonicalReferenceExtract, candidate: CanonicalReferenceExtract): {
+  similarity: number;
+  mismatchCount: number;
+  mismatchDetails: SemanticRoleSequenceMismatchDetail[];
+} {
+  const completionTokens = (extract: CanonicalReferenceExtract): SemanticRoleEventToken[] =>
+    semanticRoleSequence(extract).filter(
+      (token) => token.event.phase === "COMPLETION" || token.event.phase === "HIGH_LOW_COMPLETION",
+    );
+  return compareSemanticRoleTokens(completionTokens(reference), completionTokens(candidate));
+}
+
+function compareSemanticRoleTokens(left: SemanticRoleEventToken[], right: SemanticRoleEventToken[]): {
+  similarity: number;
+  mismatchCount: number;
+  mismatchDetails: SemanticRoleSequenceMismatchDetail[];
+} {
+  const maxLength = Math.max(left.length, right.length);
+  if (maxLength === 0) {
+    return { similarity: 1, mismatchCount: 0, mismatchDetails: [] };
+  }
+  let matches = 0;
+  const mismatchDetails: SemanticRoleSequenceMismatchDetail[] = [];
+  for (let index = 0; index < maxLength; index += 1) {
+    const referenceToken = left[index];
+    const candidateToken = right[index];
+    if (referenceToken !== undefined && candidateToken !== undefined && referenceToken.role === candidateToken.role) {
+      matches += 1;
+      continue;
+    }
+    mismatchDetails.push(buildSemanticRoleSequenceMismatchDetail(index, referenceToken, candidateToken));
+  }
+  return {
+    similarity: matches / maxLength,
+    mismatchCount: mismatchDetails.length,
+    mismatchDetails,
+  };
+}
+
+function flowPairRoleSetSimilarity(reference: CanonicalReferenceExtract, candidate: CanonicalReferenceExtract): number {
+  const group = (extract: CanonicalReferenceExtract): Map<number, string> => {
+    const byCycle = new Map<number, string[]>();
+    for (const token of semanticRoleSequence(extract)) {
+      const roles = byCycle.get(token.event.cycleId) ?? [];
+      roles.push(token.role);
+      byCycle.set(token.event.cycleId, roles);
+    }
+    return new Map(
+      [...byCycle.entries()]
+        .map(([cycleId, roles]) => [cycleId, roles.sort().join("+")] as const)
+        .filter(([, token]) => token.length > 0),
+    );
+  };
+  const left = group(reference);
+  const right = group(candidate);
+  const cycleIds = new Set([...left.keys(), ...right.keys()]);
+  if (cycleIds.size === 0) {
+    return 1;
+  }
+  let matches = 0;
+  for (const cycleId of cycleIds) {
+    if (left.get(cycleId) === right.get(cycleId)) {
+      matches += 1;
+    }
+  }
+  return matches / cycleIds.size;
+}
+
+interface SemanticRoleEventToken {
+  role: SemanticRoleToken;
+  event: CanonicalSequenceEvent;
+}
+
+function semanticRoleSequence(extract: CanonicalReferenceExtract): SemanticRoleEventToken[] {
+  const buys = extract.orderedClipSequence.filter((event) => event.kind === "BUY");
+  const byCycle = new Map<number, CanonicalSequenceEvent[]>();
+  for (const event of buys) {
+    const cycleEvents = byCycle.get(event.cycleId) ?? [];
+    cycleEvents.push(event);
+    byCycle.set(event.cycleId, cycleEvents);
+  }
+  return buys.map((event) => ({
+    event,
+    role: semanticRoleToken(event, byCycle.get(event.cycleId) ?? [event]),
+  }));
+}
+
+function semanticRoleToken(
+  event: CanonicalSequenceEvent,
+  cycleEvents: CanonicalSequenceEvent[],
+): SemanticRoleToken {
+  const opener =
+    cycleEvents.find((cycleEvent) => cycleEvent.phase === "ENTRY" || cycleEvent.phase === "OVERLAP") ??
+    cycleEvents[0] ??
+    event;
+  const completion =
+    cycleEvents.find(
+      (cycleEvent) => cycleEvent.phase === "COMPLETION" || cycleEvent.phase === "HIGH_LOW_COMPLETION",
+    ) ?? cycleEvents.find((cycleEvent) => cycleEvent !== opener);
+  const counterpart = event === opener ? completion : opener;
+  const priceDelta = event.price !== null && counterpart?.price !== null && counterpart?.price !== undefined
+    ? Number((event.price - counterpart.price).toFixed(6))
+    : 0;
+  const role = priceDelta >= 0.08 ? "HIGH" : priceDelta <= -0.08 ? "LOW" : "MID";
+  if (event.phase === "COMPLETION" || event.phase === "HIGH_LOW_COMPLETION") {
+    const completionRole =
+      role === "HIGH" ? "EXPENSIVE" : role === "LOW" ? "CHEAP" : "MID";
+    return `COMPLETION_${completionRole}` as SemanticRoleToken;
+  }
+  return `${event.phase}_${role}` as SemanticRoleToken;
+}
+
+function buildSideSequenceMismatchDetail(
+  index: number,
+  referenceEvent: CanonicalSequenceEvent | undefined,
+  candidateEvent: CanonicalSequenceEvent | undefined,
+): SideSequenceMismatchDetail {
+  const candidateSource =
+    candidateEvent !== undefined
+      ? `${phaseToken(candidateEvent.phase)}:${candidateEvent.internalLabel}`
+      : "missing_candidate_buy";
+  const offsetDeltaSec =
+    referenceEvent === undefined || candidateEvent === undefined
+      ? null
+      : Number((candidateEvent.tOffsetSec - referenceEvent.tOffsetSec).toFixed(6));
+  return {
+    index,
+    referenceSide: referenceEvent?.outcome ?? null,
+    candidateSide: candidateEvent?.outcome ?? null,
+    referencePhase: referenceEvent?.phase ?? null,
+    candidatePhase: candidateEvent?.phase ?? null,
+    referenceInternalLabel: referenceEvent?.internalLabel ?? null,
+    candidateInternalLabel: candidateEvent?.internalLabel ?? null,
+    referenceCycleId: referenceEvent?.cycleId ?? null,
+    candidateCycleId: candidateEvent?.cycleId ?? null,
+    referenceOffsetSec: referenceEvent?.tOffsetSec ?? null,
+    candidateOffsetSec: candidateEvent?.tOffsetSec ?? null,
+    offsetDeltaSec,
+    mismatchSource: candidateSource,
+  };
+}
+
+function buildSemanticRoleSequenceMismatchDetail(
+  index: number,
+  referenceToken: SemanticRoleEventToken | undefined,
+  candidateToken: SemanticRoleEventToken | undefined,
+): SemanticRoleSequenceMismatchDetail {
+  const referenceEvent = referenceToken?.event;
+  const candidateEvent = candidateToken?.event;
+  const candidateSource =
+    candidateToken !== undefined && candidateEvent !== undefined
+      ? `${candidateToken.role}:${phaseToken(candidateEvent.phase)}:${candidateEvent.internalLabel}`
+      : "missing_candidate_role";
+  const offsetDeltaSec =
+    referenceEvent === undefined || candidateEvent === undefined
+      ? null
+      : Number((candidateEvent.tOffsetSec - referenceEvent.tOffsetSec).toFixed(6));
+  const priceDelta =
+    referenceEvent?.price === null ||
+    referenceEvent?.price === undefined ||
+    candidateEvent?.price === null ||
+    candidateEvent?.price === undefined
+      ? null
+      : Number((candidateEvent.price - referenceEvent.price).toFixed(6));
+
+  return {
+    index,
+    referenceRole: referenceToken?.role ?? null,
+    candidateRole: candidateToken?.role ?? null,
+    referenceSide: referenceEvent?.outcome ?? null,
+    candidateSide: candidateEvent?.outcome ?? null,
+    referencePhase: referenceEvent?.phase ?? null,
+    candidatePhase: candidateEvent?.phase ?? null,
+    referenceInternalLabel: referenceEvent?.internalLabel ?? null,
+    candidateInternalLabel: candidateEvent?.internalLabel ?? null,
+    referenceCycleId: referenceEvent?.cycleId ?? null,
+    candidateCycleId: candidateEvent?.cycleId ?? null,
+    referenceOffsetSec: referenceEvent?.tOffsetSec ?? null,
+    candidateOffsetSec: candidateEvent?.tOffsetSec ?? null,
+    referencePrice: referenceEvent?.price ?? null,
+    candidatePrice: candidateEvent?.price ?? null,
+    offsetDeltaSec,
+    priceDelta,
+    mismatchSource: candidateSource,
   };
 }
 
@@ -313,6 +801,26 @@ function cycleCompletionLatencies(extract: CanonicalReferenceExtract): number[] 
   return latencies;
 }
 
+function firstEntryOffsetSec(extract: CanonicalReferenceExtract): number | null {
+  const firstEntry = extract.orderedClipSequence.find(
+    (event) => event.kind === "BUY" && event.phase === "ENTRY",
+  );
+  return firstEntry?.tOffsetSec ?? null;
+}
+
+function timingOffsetSimilarity(
+  referenceOffsetSec: number | null,
+  candidateOffsetSec: number | null,
+  toleranceSec = 2,
+  fullPenaltyAfterSec = 20,
+): number {
+  if (referenceOffsetSec === null && candidateOffsetSec === null) return 1;
+  if (referenceOffsetSec === null || candidateOffsetSec === null) return 0;
+  const absoluteDelta = Math.abs(candidateOffsetSec - referenceOffsetSec);
+  if (absoluteDelta <= toleranceSec) return 1;
+  return Math.max(0, 1 - (absoluteDelta - toleranceSec) / fullPenaltyAfterSec);
+}
+
 function sequenceQtySimilarity(
   left: number[],
   right: number[],
@@ -330,6 +838,24 @@ function averageNumber(values: number[]): number {
   return values.length > 0
     ? Number((values.reduce((sum, value) => sum + value, 0) / values.length).toFixed(6))
     : 0;
+}
+
+function percentileNumber(values: number[], percentile: number): number {
+  if (values.length === 0) {
+    return 0;
+  }
+  const sorted = [...values].sort((left, right) => left - right);
+  const index = Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * percentile) - 1));
+  return Number((sorted[index] ?? 0).toFixed(6));
+}
+
+function cycleCompletionLatencyDeltas(reference: number[], candidate: number[]): number[] {
+  const maxLength = Math.max(reference.length, candidate.length);
+  const deltas: number[] = [];
+  for (let index = 0; index < maxLength; index += 1) {
+    deltas.push(Number(((candidate[index] ?? 0) - (reference[index] ?? 0)).toFixed(6)));
+  }
+  return deltas;
 }
 
 function buyEventQtySimilarity(reference: CanonicalReferenceExtract, candidate: CanonicalReferenceExtract): number {
@@ -371,20 +897,51 @@ export function buildComparisonFlowSummary(comparison: CanonicalComparisonResult
     flowLineageSimilarity: comparison.details.flowLineageSimilarity,
     activeFlowPeakSimilarity: comparison.details.activeFlowPeakSimilarity,
     cycleCompletionLatencySimilarity: comparison.details.cycleCompletionLatencySimilarity,
+    openingEntryTimingSimilarity: comparison.details.openingEntryTimingSimilarity,
+    childOrderMicroTimingSimilarity: comparison.details.childOrderMicroTimingSimilarity,
+    childOrderMicroTimingMismatchCount: comparison.details.childOrderMicroTimingMismatchCount,
+    childOrderMicroTimingDetails: comparison.details.childOrderMicroTimingDetails,
+    childOrderSideInversionCount: comparison.details.childOrderSideInversionCount,
+    childOrderGlobalDelayP50Sec: comparison.details.childOrderGlobalDelayP50Sec,
+    childOrderGlobalDelayP75Sec: comparison.details.childOrderGlobalDelayP75Sec,
+    childOrderGlobalAbsDelayP75Sec: comparison.details.childOrderGlobalAbsDelayP75Sec,
+    childOrderMicroTimingDeltaP50Sec: comparison.details.childOrderMicroTimingDeltaP50Sec,
+    childOrderMicroTimingDeltaP75Sec: comparison.details.childOrderMicroTimingDeltaP75Sec,
+    childOrderMicroTimingMaxAbsDeltaSec: comparison.details.childOrderMicroTimingMaxAbsDeltaSec,
+    sideSequenceSimilarity: comparison.details.sideSequenceSimilarity,
+    sideSequenceMismatchCount: comparison.details.sideSequenceMismatchCount,
+    sideSequenceMismatchDetails: comparison.details.sideSequenceMismatchDetails,
+    flowPairSideSetSimilarity: comparison.details.flowPairSideSetSimilarity,
+    semanticRoleSequenceSimilarity: comparison.details.semanticRoleSequenceSimilarity,
+    semanticRoleSequenceMismatchCount: comparison.details.semanticRoleSequenceMismatchCount,
+    semanticRoleSequenceMismatchDetails: comparison.details.semanticRoleSequenceMismatchDetails,
+    completionReleaseRoleSimilarity: comparison.details.completionReleaseRoleSimilarity,
+    completionReleaseRoleMismatchCount: comparison.details.completionReleaseRoleMismatchCount,
+    completionReleaseRoleMismatchDetails: comparison.details.completionReleaseRoleMismatchDetails,
+    flowPairRoleSetSimilarity: comparison.details.flowPairRoleSetSimilarity,
     referenceActiveFlowPeak: comparison.details.referenceActiveFlowPeak,
     candidateActiveFlowPeak: comparison.details.candidateActiveFlowPeak,
+    referenceFirstEntryOffsetSec: comparison.details.referenceFirstEntryOffsetSec,
+    candidateFirstEntryOffsetSec: comparison.details.candidateFirstEntryOffsetSec,
+    firstEntryOffsetDeltaSec: comparison.details.firstEntryOffsetDeltaSec,
     referenceAverageCycleCompletionLatencySec: comparison.details.referenceAverageCycleCompletionLatencySec,
     candidateAverageCycleCompletionLatencySec: comparison.details.candidateAverageCycleCompletionLatencySec,
     averageCycleCompletionLatencyDeltaSec: comparison.details.averageCycleCompletionLatencyDeltaSec,
+    cycleCompletionLatencyDeltaP50Sec: comparison.details.cycleCompletionLatencyDeltaP50Sec,
+    cycleCompletionLatencyDeltaP75Sec: comparison.details.cycleCompletionLatencyDeltaP75Sec,
+    cycleCompletionLatencyMaxAbsDeltaSec: comparison.details.cycleCompletionLatencyMaxAbsDeltaSec,
     flowLineageScore: comparison.breakdown.flowLineageScore,
     activeFlowPeakScore: comparison.breakdown.activeFlowPeakScore,
     cycleCompletionLatencyScore: comparison.breakdown.cycleCompletionLatencyScore,
+    openingEntryTimingScore: comparison.breakdown.openingEntryTimingScore,
+    childOrderMicroTimingScore: comparison.breakdown.childOrderMicroTimingScore,
   };
 }
 
 export function classifyComparisonFlowSummary(summary: ComparisonFlowSummary): ComparisonFlowStatus {
   const failReasons: string[] = [];
   const warnReasons: string[] = [];
+  const openingEntryTimingSimilarity = summary.openingEntryTimingSimilarity ?? 1;
   if (summary.flowLineageSimilarity < 0.55) {
     failReasons.push("flow_lineage_similarity_low");
   } else if (summary.flowLineageSimilarity < 0.75) {
@@ -399,6 +956,35 @@ export function classifyComparisonFlowSummary(summary: ComparisonFlowSummary): C
     failReasons.push("cycle_completion_latency_similarity_low");
   } else if (summary.cycleCompletionLatencySimilarity < 0.65) {
     warnReasons.push("cycle_completion_latency_similarity_warn");
+  }
+  if (openingEntryTimingSimilarity < 0.55) {
+    failReasons.push("opening_entry_timing_similarity_low");
+  } else if (openingEntryTimingSimilarity < 0.75) {
+    warnReasons.push("opening_entry_timing_similarity_warn");
+  }
+  if ((summary.childOrderMicroTimingSimilarity ?? 1) < 0.75 || (summary.childOrderMicroTimingMismatchCount ?? 0) > 0) {
+    warnReasons.push("child_order_micro_timing_similarity_warn");
+  }
+  if ((summary.childOrderGlobalAbsDelayP75Sec ?? 0) >= 4) {
+    warnReasons.push("child_order_global_delay_warn");
+  }
+  if ((summary.childOrderSideInversionCount ?? 0) > 0) {
+    warnReasons.push("child_order_side_inversion_warn");
+  }
+  if ((summary.sideSequenceSimilarity ?? 1) < 0.65) {
+    failReasons.push("side_sequence_similarity_low");
+  } else if ((summary.sideSequenceSimilarity ?? 1) < 0.9 || (summary.sideSequenceMismatchCount ?? 0) > 0) {
+    warnReasons.push("side_sequence_similarity_warn");
+  }
+  if ((summary.semanticRoleSequenceSimilarity ?? 1) < 0.35) {
+    failReasons.push("semantic_role_sequence_similarity_low");
+  } else if ((summary.semanticRoleSequenceSimilarity ?? 1) < 0.7) {
+    warnReasons.push("semantic_role_sequence_similarity_warn");
+  }
+  if ((summary.completionReleaseRoleSimilarity ?? 1) < 0.35) {
+    failReasons.push("completion_release_role_similarity_low");
+  } else if ((summary.completionReleaseRoleSimilarity ?? 1) < 0.7) {
+    warnReasons.push("completion_release_role_similarity_warn");
   }
 
   if (failReasons.length > 0) {
@@ -416,18 +1002,71 @@ export function buildFlowCalibrationSummary(summaries: ComparisonFlowSummary[]):
     sampleCount > 0
       ? Number((summaries.reduce((sum, summary) => sum + selector(summary), 0) / sampleCount).toFixed(6))
       : 0;
+  const averageMismatchOffsetDeltaSec = (): number => {
+    const deltas = summaries.flatMap((summary) =>
+      (summary.sideSequenceMismatchDetails ?? [])
+        .map((detail) => detail.offsetDeltaSec)
+        .filter((delta): delta is number => typeof delta === "number" && Number.isFinite(delta)),
+    );
+    return deltas.length > 0
+      ? Number((deltas.reduce((sum, delta) => sum + delta, 0) / deltas.length).toFixed(6))
+      : 0;
+  };
   const aggregate: ComparisonFlowSummary = {
     flowLineageSimilarity: average((summary) => summary.flowLineageSimilarity),
     activeFlowPeakSimilarity: average((summary) => summary.activeFlowPeakSimilarity),
     cycleCompletionLatencySimilarity: average((summary) => summary.cycleCompletionLatencySimilarity),
+    openingEntryTimingSimilarity: average((summary) => summary.openingEntryTimingSimilarity ?? 1),
+    childOrderMicroTimingSimilarity: average((summary) => summary.childOrderMicroTimingSimilarity ?? 1),
+    childOrderMicroTimingMismatchCount: average((summary) => summary.childOrderMicroTimingMismatchCount ?? 0),
+    childOrderMicroTimingDetails: summaries.flatMap((summary) => summary.childOrderMicroTimingDetails ?? []),
+    childOrderSideInversionCount: average((summary) => summary.childOrderSideInversionCount ?? 0),
+    childOrderGlobalDelayP50Sec: average((summary) => summary.childOrderGlobalDelayP50Sec ?? 0),
+    childOrderGlobalDelayP75Sec: average((summary) => summary.childOrderGlobalDelayP75Sec ?? 0),
+    childOrderGlobalAbsDelayP75Sec: average((summary) => summary.childOrderGlobalAbsDelayP75Sec ?? 0),
+    childOrderMicroTimingDeltaP50Sec: average((summary) => summary.childOrderMicroTimingDeltaP50Sec ?? 0),
+    childOrderMicroTimingDeltaP75Sec: average((summary) => summary.childOrderMicroTimingDeltaP75Sec ?? 0),
+    childOrderMicroTimingMaxAbsDeltaSec: average((summary) => summary.childOrderMicroTimingMaxAbsDeltaSec ?? 0),
+    sideSequenceSimilarity: average((summary) => summary.sideSequenceSimilarity ?? 1),
+    sideSequenceMismatchCount: average((summary) => summary.sideSequenceMismatchCount ?? 0),
+    sideSequenceMismatchDetails: summaries.flatMap((summary) => summary.sideSequenceMismatchDetails ?? []),
+    flowPairSideSetSimilarity: average((summary) => summary.flowPairSideSetSimilarity ?? 1),
+    semanticRoleSequenceSimilarity: average((summary) => summary.semanticRoleSequenceSimilarity ?? 1),
+    semanticRoleSequenceMismatchCount: average((summary) => summary.semanticRoleSequenceMismatchCount ?? 0),
+    semanticRoleSequenceMismatchDetails: summaries.flatMap(
+      (summary) => summary.semanticRoleSequenceMismatchDetails ?? [],
+    ),
+    completionReleaseRoleSimilarity: average((summary) => summary.completionReleaseRoleSimilarity ?? 1),
+    completionReleaseRoleMismatchCount: average((summary) => summary.completionReleaseRoleMismatchCount ?? 0),
+    completionReleaseRoleMismatchDetails: summaries.flatMap(
+      (summary) => summary.completionReleaseRoleMismatchDetails ?? [],
+    ),
+    flowPairRoleSetSimilarity: average((summary) => summary.flowPairRoleSetSimilarity ?? 1),
     referenceActiveFlowPeak: average((summary) => summary.referenceActiveFlowPeak),
     candidateActiveFlowPeak: average((summary) => summary.candidateActiveFlowPeak),
+    referenceFirstEntryOffsetSec: average((summary) => summary.referenceFirstEntryOffsetSec ?? 0),
+    candidateFirstEntryOffsetSec: average((summary) => summary.candidateFirstEntryOffsetSec ?? 0),
+    firstEntryOffsetDeltaSec: average((summary) => summary.firstEntryOffsetDeltaSec ?? 0),
     referenceAverageCycleCompletionLatencySec: average((summary) => summary.referenceAverageCycleCompletionLatencySec ?? 0),
     candidateAverageCycleCompletionLatencySec: average((summary) => summary.candidateAverageCycleCompletionLatencySec ?? 0),
     averageCycleCompletionLatencyDeltaSec: average((summary) => summary.averageCycleCompletionLatencyDeltaSec ?? 0),
+    cycleCompletionLatencyDeltaP50Sec: average(
+      (summary) => summary.cycleCompletionLatencyDeltaP50Sec ?? summary.averageCycleCompletionLatencyDeltaSec ?? 0,
+    ),
+    cycleCompletionLatencyDeltaP75Sec: average(
+      (summary) => summary.cycleCompletionLatencyDeltaP75Sec ?? summary.averageCycleCompletionLatencyDeltaSec ?? 0,
+    ),
+    cycleCompletionLatencyMaxAbsDeltaSec: average(
+      (summary) =>
+        summary.cycleCompletionLatencyMaxAbsDeltaSec ?? Math.abs(summary.averageCycleCompletionLatencyDeltaSec ?? 0),
+    ),
     flowLineageScore: average((summary) => summary.flowLineageScore),
     activeFlowPeakScore: average((summary) => summary.activeFlowPeakScore),
     cycleCompletionLatencyScore: average((summary) => summary.cycleCompletionLatencyScore),
+    openingEntryTimingScore: average((summary) => summary.openingEntryTimingScore ?? summary.openingEntryTimingSimilarity ?? 1),
+    childOrderMicroTimingScore: average(
+      (summary) => summary.childOrderMicroTimingScore ?? summary.childOrderMicroTimingSimilarity ?? 1,
+    ),
   };
   const status = classifyComparisonFlowSummary(aggregate);
   const completionLatencyDirection =
@@ -436,7 +1075,21 @@ export function buildFlowCalibrationSummary(summaries: ComparisonFlowSummary[]):
       : aggregate.averageCycleCompletionLatencyDeltaSec < -1
         ? "candidate_early"
         : "aligned";
-  const recommendedFocus = status.reasons.map((reason) => {
+  const openingEntryTimingDirection =
+    (aggregate.firstEntryOffsetDeltaSec ?? 0) > 2
+      ? "candidate_late"
+      : (aggregate.firstEntryOffsetDeltaSec ?? 0) < -2
+        ? "candidate_early"
+        : "aligned";
+  const childOrderTimingDirection =
+    Math.abs(aggregate.childOrderGlobalDelayP75Sec) <= 2 && aggregate.childOrderGlobalAbsDelayP75Sec <= 3
+      ? "aligned"
+      : aggregate.childOrderGlobalDelayP75Sec > 2
+        ? "candidate_late"
+        : aggregate.childOrderGlobalDelayP75Sec < -2
+          ? "candidate_early"
+          : "mixed";
+  const recommendedFocus: string[] = status.reasons.map((reason) => {
     if (reason.includes("flow_lineage")) return "increase_lineage_preservation";
     if (reason.includes("active_flow_peak")) return "allow_more_parallel_flow_when_budget_supports";
     if (reason.includes("completion_latency")) {
@@ -444,14 +1097,111 @@ export function buildFlowCalibrationSummary(summaries: ComparisonFlowSummary[]):
       if (completionLatencyDirection === "candidate_early") return "increase_completion_patience";
       return "tune_completion_patience_and_release";
     }
+    if (reason.includes("opening_entry_timing")) return "align_opening_seed_release";
+    if (reason.includes("child_order_global_delay")) return "compress_child_order_timing";
+    if (reason.includes("child_order_side_inversion")) return "stabilize_child_order_side_rhythm";
+    if (reason.includes("child_order_micro_timing")) return "improve_child_order_micro_timing";
+    if (reason.includes("side_sequence")) return "improve_seed_side_rhythm";
+    if (reason.includes("semantic_role_sequence")) return "align_high_low_role_sequence";
+    if (reason.includes("completion_release_role")) return "align_completion_release_role_sequence";
     return "inspect_flow_similarity";
   });
+  const sideSequenceMismatchOffsetDeltaSec = averageMismatchOffsetDeltaSec();
+  const semanticRoleMismatchOffsetDeltaSec = averageNumber(
+    aggregate.semanticRoleSequenceMismatchDetails
+      .map((detail) => detail.offsetDeltaSec)
+      .filter((value): value is number => value !== null),
+  );
+  const completionReleaseRoleMismatchOffsetDeltaSec = averageNumber(
+    aggregate.completionReleaseRoleMismatchDetails
+      .map((detail) => detail.offsetDeltaSec)
+      .filter((value): value is number => value !== null),
+  );
+  if (
+    aggregate.sideSequenceMismatchCount > 0 &&
+    sideSequenceMismatchOffsetDeltaSec >= 20
+  ) {
+    recommendedFocus.push("compress_overlap_seed_rhythm");
+  }
+  if (
+    aggregate.sideSequenceMismatchCount > 0 &&
+    aggregate.flowPairSideSetSimilarity >= 0.95 &&
+    aggregate.sideSequenceSimilarity < 0.9
+  ) {
+    recommendedFocus.push("improve_child_order_micro_timing");
+  }
+  if (
+    aggregate.semanticRoleSequenceMismatchCount > 0 &&
+    aggregate.sideSequenceSimilarity >= 0.8 &&
+    (aggregate.semanticRoleSequenceSimilarity < 0.7 || aggregate.semanticRoleSequenceMismatchCount >= 2)
+  ) {
+    recommendedFocus.push("preserve_raw_side_before_role_override");
+  }
+  const roleSideTradeoffRisk =
+    aggregate.semanticRoleSequenceMismatchCount > 0 &&
+    aggregate.sideSequenceSimilarity >= 0.8 &&
+    (aggregate.semanticRoleSequenceSimilarity < 0.7 || aggregate.semanticRoleSequenceMismatchCount >= 2)
+      ? "side_preservation_blocks_role_alignment"
+      : aggregate.sideSequenceSimilarity < 0.8 &&
+          aggregate.semanticRoleSequenceSimilarity >= 0.7
+        ? "role_alignment_may_break_side_sequence"
+        : "none";
+  if (roleSideTradeoffRisk !== "none") {
+    recommendedFocus.push("guard_role_alignment_against_side_regression");
+  }
+  if (
+    aggregate.semanticRoleSequenceMismatchCount > 0 &&
+    semanticRoleMismatchOffsetDeltaSec >= 20
+  ) {
+    recommendedFocus.push("compress_high_low_role_rhythm");
+  }
+  if (
+    aggregate.completionReleaseRoleMismatchCount > 0 &&
+    aggregate.completionReleaseRoleSimilarity < 0.98
+  ) {
+    recommendedFocus.push("tune_completion_role_release_order");
+  }
+  if ((aggregate.firstEntryOffsetDeltaSec ?? 0) >= 4) {
+    recommendedFocus.push("release_opening_seed_earlier");
+  } else if ((aggregate.firstEntryOffsetDeltaSec ?? 0) <= -4) {
+    recommendedFocus.push("delay_opening_seed_release");
+  } else if (sampleCount > 0 && aggregate.openingEntryTimingSimilarity >= 0.98 && status.status !== "PASS") {
+    recommendedFocus.push("maintain_opening_seed_early");
+  }
   return {
     sampleCount,
     averageFlowLineageSimilarity: aggregate.flowLineageSimilarity,
     averageActiveFlowPeakSimilarity: aggregate.activeFlowPeakSimilarity,
     averageCycleCompletionLatencySimilarity: aggregate.cycleCompletionLatencySimilarity,
+    averageOpeningEntryTimingSimilarity: aggregate.openingEntryTimingSimilarity,
+    averageChildOrderMicroTimingSimilarity: aggregate.childOrderMicroTimingSimilarity,
+    averageChildOrderMicroTimingMismatchCount: aggregate.childOrderMicroTimingMismatchCount,
+    averageChildOrderSideInversionCount: aggregate.childOrderSideInversionCount,
+    averageChildOrderGlobalDelayP50Sec: aggregate.childOrderGlobalDelayP50Sec,
+    averageChildOrderGlobalDelayP75Sec: aggregate.childOrderGlobalDelayP75Sec,
+    averageChildOrderGlobalAbsDelayP75Sec: aggregate.childOrderGlobalAbsDelayP75Sec,
+    averageChildOrderMicroTimingDeltaP50Sec: aggregate.childOrderMicroTimingDeltaP50Sec,
+    averageChildOrderMicroTimingDeltaP75Sec: aggregate.childOrderMicroTimingDeltaP75Sec,
+    averageChildOrderMicroTimingMaxAbsDeltaSec: aggregate.childOrderMicroTimingMaxAbsDeltaSec,
+    childOrderTimingDirection,
+    averageFirstEntryOffsetDeltaSec: aggregate.firstEntryOffsetDeltaSec ?? 0,
+    openingEntryTimingDirection,
+    averageSideSequenceSimilarity: aggregate.sideSequenceSimilarity,
+    averageSideSequenceMismatchCount: aggregate.sideSequenceMismatchCount,
+    averageSideSequenceMismatchOffsetDeltaSec: sideSequenceMismatchOffsetDeltaSec,
+    averageFlowPairSideSetSimilarity: aggregate.flowPairSideSetSimilarity,
+    averageSemanticRoleSequenceSimilarity: aggregate.semanticRoleSequenceSimilarity,
+    averageSemanticRoleSequenceMismatchCount: aggregate.semanticRoleSequenceMismatchCount,
+    averageSemanticRoleMismatchOffsetDeltaSec: semanticRoleMismatchOffsetDeltaSec,
+    averageCompletionReleaseRoleSimilarity: aggregate.completionReleaseRoleSimilarity,
+    averageCompletionReleaseRoleMismatchCount: aggregate.completionReleaseRoleMismatchCount,
+    averageCompletionReleaseRoleMismatchOffsetDeltaSec: completionReleaseRoleMismatchOffsetDeltaSec,
+    averageFlowPairRoleSetSimilarity: aggregate.flowPairRoleSetSimilarity,
+    roleSideTradeoffRisk,
     averageCycleCompletionLatencyDeltaSec: aggregate.averageCycleCompletionLatencyDeltaSec,
+    averageCycleCompletionLatencyDeltaP50Sec: aggregate.cycleCompletionLatencyDeltaP50Sec,
+    averageCycleCompletionLatencyDeltaP75Sec: aggregate.cycleCompletionLatencyDeltaP75Sec,
+    averageCycleCompletionLatencyMaxAbsDeltaSec: aggregate.cycleCompletionLatencyMaxAbsDeltaSec,
     completionLatencyDirection,
     status: sampleCount === 0 ? "WARN" : status.status,
     recommendedFocus: [...new Set(sampleCount === 0 ? ["collect_replay_flow_samples"] : recommendedFocus)],
@@ -463,6 +1213,7 @@ export function compareCanonicalReference(
   candidate: CanonicalReferenceExtract,
   options?: {
     hardFails?: Partial<HardFailCounts> | undefined;
+    requireExactLifecycleParity?: boolean | undefined;
   },
 ): CanonicalComparisonResult {
   const hardFails = defaultHardFails(options?.hardFails);
@@ -482,25 +1233,54 @@ export function compareCanonicalReference(
   );
   const alternationSimilarity = boundedRatioSimilarity(alternationRatio(reference), alternationRatio(candidate));
   const sideSequence = sideSequenceComparison(reference, candidate);
+  const childOrderMicroTiming = childOrderMicroTimingComparison(reference, candidate);
+  const pairSideSetSimilarity = flowPairSideSetSimilarity(reference, candidate);
+  const semanticRoleSequence = semanticRoleSequenceComparison(reference, candidate);
+  const completionReleaseRoleSequence = completionReleaseRoleSequenceComparison(reference, candidate);
+  const pairRoleSetSimilarity = flowPairRoleSetSimilarity(reference, candidate);
   const overlapFamily = overlapSimilarity(reference, candidate);
   const phaseFamily = phaseFamilySimilarity(reference, candidate);
   const eventQty = buyEventQtySimilarity(reference, candidate);
   const mergeClusterQty = clusterQtySimilarity(reference, candidate, "MERGE");
   const redeemClusterQty = clusterQtySimilarity(reference, candidate, "REDEEM");
+  const exactLifecycleParityRequired = Boolean(options?.requireExactLifecycleParity);
+  const exactLifecycleParityBroken =
+    exactLifecycleParityRequired &&
+    (reference.buySequence.length !== candidate.buySequence.length ||
+      reference.mergeCount !== candidate.mergeCount ||
+      reference.redeemCount !== candidate.redeemCount ||
+      mergeClusterQty < 0.999 ||
+      redeemClusterQty < 0.999);
   const lineageFlow = flowLineageSimilarity(reference, candidate);
   const referenceActiveFlowPeak = activeFlowPeak(reference);
   const candidateActiveFlowPeak = activeFlowPeak(candidate);
   const referenceCompletionLatencies = cycleCompletionLatencies(reference);
   const candidateCompletionLatencies = cycleCompletionLatencies(candidate);
+  const referenceFirstEntryOffsetSec = firstEntryOffsetSec(reference);
+  const candidateFirstEntryOffsetSec = firstEntryOffsetSec(candidate);
+  const firstEntryOffsetDeltaSec =
+    referenceFirstEntryOffsetSec === null || candidateFirstEntryOffsetSec === null
+      ? null
+      : Number((candidateFirstEntryOffsetSec - referenceFirstEntryOffsetSec).toFixed(6));
   const referenceAverageCycleCompletionLatencySec = averageNumber(referenceCompletionLatencies);
   const candidateAverageCycleCompletionLatencySec = averageNumber(candidateCompletionLatencies);
   const averageCycleCompletionLatencyDeltaSec = Number(
     (candidateAverageCycleCompletionLatencySec - referenceAverageCycleCompletionLatencySec).toFixed(6),
   );
+  const completionLatencyDeltas = cycleCompletionLatencyDeltas(referenceCompletionLatencies, candidateCompletionLatencies);
+  const absoluteCompletionLatencyDeltas = completionLatencyDeltas.map((delta) => Math.abs(delta));
+  const cycleCompletionLatencyDeltaP50Sec = percentileNumber(completionLatencyDeltas, 0.5);
+  const cycleCompletionLatencyDeltaP75Sec = percentileNumber(completionLatencyDeltas, 0.75);
+  const cycleCompletionLatencyMaxAbsDeltaSec =
+    absoluteCompletionLatencyDeltas.length > 0 ? Math.max(...absoluteCompletionLatencyDeltas) : 0;
   const activeFlowPeakSimilarity = boundedRatioSimilarity(referenceActiveFlowPeak, candidateActiveFlowPeak);
   const cycleCompletionLatencySimilarity = sequenceQtySimilarity(
     referenceCompletionLatencies,
     candidateCompletionLatencies,
+  );
+  const openingEntryTimingSimilarity = timingOffsetSimilarity(
+    referenceFirstEntryOffsetSec,
+    candidateFirstEntryOffsetSec,
   );
 
   const correctnessScore =
@@ -514,20 +1294,25 @@ export function compareCanonicalReference(
   const familyScore =
     clipBucketSimilarity * 7 +
     alternationSimilarity * 4 +
-    sideSequence.similarity * 4 +
+    sideSequence.similarity * 2.4 +
+    pairSideSetSimilarity * 0.6 +
+    semanticRoleSequence.similarity * 1.7 +
+    completionReleaseRoleSequence.similarity * 0.8 +
+    pairRoleSetSimilarity * 0.3 +
     overlapFamily * 4 +
     phaseFamily * 4 +
-    eventQty * 6 +
+    eventQty * 5 +
     mergeClusterQty * 3 +
     redeemClusterQty * 3 +
     lineageFlow * 3 +
     activeFlowPeakSimilarity * 1 +
-    cycleCompletionLatencySimilarity * 1;
+    cycleCompletionLatencySimilarity * 1 +
+    childOrderMicroTiming.similarity * 0.6;
 
   const score = Math.round((correctnessScore + familyScore) * 100) / 100;
 
   let verdict: ComparatorVerdict;
-  if (hardFailTotal > 0) {
+  if (hardFailTotal > 0 || exactLifecycleParityBroken) {
     verdict = "FAIL";
   } else if (score >= 80) {
     verdict = "PASS";
@@ -554,6 +1339,10 @@ export function compareCanonicalReference(
       clipBucketScore: clipBucketSimilarity,
       alternationScore: alternationSimilarity,
       sideSequenceScore: sideSequence.similarity,
+      flowPairSideSetScore: pairSideSetSimilarity,
+      semanticRoleSequenceScore: semanticRoleSequence.similarity,
+      completionReleaseRoleScore: completionReleaseRoleSequence.similarity,
+      flowPairRoleSetScore: pairRoleSetSimilarity,
       overlapFamilyScore: overlapFamily,
       phaseFamilyScore: phaseFamily,
       eventQtyScore: eventQty,
@@ -562,6 +1351,8 @@ export function compareCanonicalReference(
       flowLineageScore: lineageFlow,
       activeFlowPeakScore: activeFlowPeakSimilarity,
       cycleCompletionLatencyScore: cycleCompletionLatencySimilarity,
+      openingEntryTimingScore: openingEntryTimingSimilarity,
+      childOrderMicroTimingScore: childOrderMicroTiming.similarity,
     },
     details: {
       referenceSlug: reference.slug,
@@ -576,6 +1367,15 @@ export function compareCanonicalReference(
       alternationSimilarity,
       sideSequenceSimilarity: sideSequence.similarity,
       sideSequenceMismatchCount: sideSequence.mismatchCount,
+      sideSequenceMismatchDetails: sideSequence.mismatchDetails,
+      flowPairSideSetSimilarity: pairSideSetSimilarity,
+      semanticRoleSequenceSimilarity: semanticRoleSequence.similarity,
+      semanticRoleSequenceMismatchCount: semanticRoleSequence.mismatchCount,
+      semanticRoleSequenceMismatchDetails: semanticRoleSequence.mismatchDetails,
+      completionReleaseRoleSimilarity: completionReleaseRoleSequence.similarity,
+      completionReleaseRoleMismatchCount: completionReleaseRoleSequence.mismatchCount,
+      completionReleaseRoleMismatchDetails: completionReleaseRoleSequence.mismatchDetails,
+      flowPairRoleSetSimilarity: pairRoleSetSimilarity,
       overlapFamilySimilarity: overlapFamily,
       phaseFamilySimilarity: phaseFamily,
       eventQtySimilarity: eventQty,
@@ -584,11 +1384,31 @@ export function compareCanonicalReference(
       flowLineageSimilarity: lineageFlow,
       activeFlowPeakSimilarity,
       cycleCompletionLatencySimilarity,
+      openingEntryTimingSimilarity,
+      childOrderMicroTimingSimilarity: childOrderMicroTiming.similarity,
+      childOrderMicroTimingMismatchCount: childOrderMicroTiming.mismatchCount,
+      childOrderMicroTimingDetails: childOrderMicroTiming.details,
+      childOrderSideInversionCount: childOrderMicroTiming.sideInversionCount,
+      childOrderGlobalDelayP50Sec: childOrderMicroTiming.deltaP50Sec,
+      childOrderGlobalDelayP75Sec: childOrderMicroTiming.deltaP75Sec,
+      childOrderGlobalAbsDelayP75Sec: childOrderMicroTiming.absDeltaP75Sec,
+      childOrderMicroTimingDeltaP50Sec: childOrderMicroTiming.deltaP50Sec,
+      childOrderMicroTimingDeltaP75Sec: childOrderMicroTiming.deltaP75Sec,
+      childOrderMicroTimingMaxAbsDeltaSec: childOrderMicroTiming.maxAbsDeltaSec,
       referenceActiveFlowPeak,
       candidateActiveFlowPeak,
+      referenceFirstEntryOffsetSec,
+      candidateFirstEntryOffsetSec,
+      firstEntryOffsetDeltaSec,
       referenceAverageCycleCompletionLatencySec,
       candidateAverageCycleCompletionLatencySec,
       averageCycleCompletionLatencyDeltaSec,
+      cycleCompletionLatencyDeltasSec: completionLatencyDeltas,
+      cycleCompletionLatencyDeltaP50Sec,
+      cycleCompletionLatencyDeltaP75Sec,
+      cycleCompletionLatencyMaxAbsDeltaSec: Number(cycleCompletionLatencyMaxAbsDeltaSec.toFixed(6)),
+      exactLifecycleParityRequired,
+      exactLifecycleParityBroken,
     },
   };
 }

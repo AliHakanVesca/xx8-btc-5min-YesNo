@@ -33,6 +33,7 @@ export interface MergeGateDecision extends MergeBatchMetrics {
     | "not_ready"
     | "entry_shield"
     | "cluster_window"
+    | "public_footprint_hold"
     | "cycle_target"
     | "age_target"
     | "forced_age"
@@ -172,6 +173,10 @@ export function evaluateDelayedMergeGate(
     config.xuanCloneMode === "PUBLIC_FOOTPRINT" && args.secsFromOpen !== undefined
       ? resolveBundledMergeClusterPrior(state.market.slug, args.secsFromOpen)
       : undefined;
+  const exactMergePriorActive = timingPrior?.scope === "exact" || mergeClusterPrior?.scope === "exact";
+  const publicFootprintHoldWithoutPrior =
+    config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
+    !exactMergePriorActive;
   const mergeShieldSecFromOpen = timingPrior
     ? Math.max(
         config.mergeShieldSecFromOpen,
@@ -223,15 +228,6 @@ export function evaluateDelayedMergeGate(
     };
   }
 
-  if (config.forceMergeInLast30S && args.secsToClose <= config.finalWindowCompletionOnlySec) {
-    return {
-      allow: true,
-      forced: true,
-      reason: "final_window",
-      ...metrics,
-    };
-  }
-
   if (config.forceMergeOnHardImbalance && imbalance(state) >= config.hardImbalanceRatio) {
     return {
       allow: true,
@@ -246,6 +242,24 @@ export function evaluateDelayedMergeGate(
       allow: true,
       forced: true,
       reason: "low_collateral",
+      ...metrics,
+    };
+  }
+
+  if (publicFootprintHoldWithoutPrior) {
+    return {
+      allow: false,
+      forced: false,
+      reason: "public_footprint_hold",
+      ...metrics,
+    };
+  }
+
+  if (config.forceMergeInLast30S && args.secsToClose <= config.finalWindowCompletionOnlySec) {
+    return {
+      allow: true,
+      forced: true,
+      reason: "final_window",
       ...metrics,
     };
   }

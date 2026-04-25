@@ -112,6 +112,7 @@ export interface BalancedPairCandidateTrace {
     | "ACCUMULATING_CONTINUATION"
     | "UNBALANCED_CAMPAIGN_RESIDUAL"
     | "RESIDUAL_COMPLETION_ACTIVE"
+    | "WATCH_FOR_DEBT_REDUCER"
     | undefined;
   campaignBaseLot?: number | undefined;
   executedProbeQty?: number | undefined;
@@ -137,6 +138,10 @@ export interface BalancedPairCandidateTrace {
   campaignClipType?: MarketBasketClipType | undefined;
   avgImprovingBudgetRemainingUSDC?: number | undefined;
   avgImprovingClipBudgetRemaining?: number | undefined;
+  flowShapingBudgetRemainingUSDC?: number | undefined;
+  flowShapingClipBudgetRemaining?: number | undefined;
+  campaignFlowCount?: number | undefined;
+  campaignFlowTarget?: number | undefined;
   cycleSkippedReason?: string | undefined;
   xuanBorderlinePhase?: XuanBorderlineEntryPhase | undefined;
   fairValueFallbackReason?: string | undefined;
@@ -193,6 +198,10 @@ export interface SingleLegSeedCandidateTrace {
   campaignClipType?: MarketBasketClipType | undefined;
   avgImprovingBudgetRemainingUSDC?: number | undefined;
   avgImprovingClipBudgetRemaining?: number | undefined;
+  flowShapingBudgetRemainingUSDC?: number | undefined;
+  flowShapingClipBudgetRemaining?: number | undefined;
+  campaignFlowCount?: number | undefined;
+  campaignFlowTarget?: number | undefined;
   addedDebtUSDC?: number | undefined;
   cycleSkippedReason?: string | undefined;
   xuanBorderlinePhase?: XuanBorderlineEntryPhase | undefined;
@@ -244,7 +253,8 @@ export interface EntryDecisionTrace {
     | "BASKET_CAMPAIGN_ACTIVE"
     | "ACCUMULATING_CONTINUATION"
     | "UNBALANCED_CAMPAIGN_RESIDUAL"
-    | "RESIDUAL_COMPLETION_ACTIVE";
+    | "RESIDUAL_COMPLETION_ACTIVE"
+    | "WATCH_FOR_DEBT_REDUCER";
   campaignBaseLot?: number;
   executedProbeQty?: number;
   plannedContinuationQty?: number;
@@ -268,12 +278,22 @@ export interface EntryDecisionTrace {
   continuationClass?: MarketBasketContinuationClass;
   avgImprovingBudgetRemainingUSDC?: number;
   avgImprovingClipBudgetRemaining?: number;
+  flowShapingBudgetRemainingUSDC?: number;
+  flowShapingClipBudgetRemaining?: number;
+  campaignFlowCount?: number;
+  campaignFlowTarget?: number;
   initialBasketRecoveryPlan?: "none" | "weak" | "medium" | "strong";
   initialBasketRecoveryScore?: number;
   initialBasketEffectivePair?: number;
   initialBasketDebtUSDC?: number;
   initialBasketQtyCap?: number;
   initialBasketRecoveryReason?: string;
+  campaignLaunchMode?: "STRONG_LAUNCH" | "RECOVERABLE_LAUNCH" | "XUAN_PROBE_LAUNCH" | "HARD_SKIP" | "NO_RECOVERY_LAUNCH";
+  visibleRecoveryPath?: boolean;
+  minEffectivePairAcrossTiers?: number;
+  bestDebtReducingQty?: number;
+  bestDebtReducingEffectivePair?: number;
+  recoveryPathReason?: string;
   terminalPnlIfUp?: number;
   terminalPnlIfDown?: number;
   stateBefore?: InventoryTraceState;
@@ -397,6 +417,7 @@ interface BalancedPairCandidate {
     | "ACCUMULATING_CONTINUATION"
     | "UNBALANCED_CAMPAIGN_RESIDUAL"
     | "RESIDUAL_COMPLETION_ACTIVE"
+    | "WATCH_FOR_DEBT_REDUCER"
     | undefined;
   campaignBaseLot?: number | undefined;
   executedProbeQty?: number | undefined;
@@ -420,6 +441,10 @@ interface BalancedPairCandidate {
   campaignClipType?: MarketBasketClipType | undefined;
   avgImprovingBudgetRemainingUSDC?: number | undefined;
   avgImprovingClipBudgetRemaining?: number | undefined;
+  flowShapingBudgetRemainingUSDC?: number | undefined;
+  flowShapingClipBudgetRemaining?: number | undefined;
+  campaignFlowCount?: number | undefined;
+  campaignFlowTarget?: number | undefined;
   feeUSDC: number;
   expectedNetIfMerged: number;
   cycleQualityLabel: CycleQualityLabel;
@@ -895,13 +920,30 @@ function marketBasketStateTrace(config: XuanStrategyConfig, state: XuanMarketSta
     mergeableQty >= config.marketBasketContinuationMinMatchedShares - 1e-9 &&
     residualQty <= Math.max(config.postMergeFlatDustShares, 1e-6) + 1e-9 &&
     basketDebtUSDC > config.marketBasketMinDebtUsdc + 1e-9;
+  const campaignSeedActive = state.fillHistory.some(
+    (fill) =>
+      fill.side === "BUY" &&
+      (
+        fill.executionMode === "TEMPORAL_SINGLE_LEG_SEED" ||
+        fill.executionMode === "PAIRGROUP_COVERED_SEED" ||
+        fill.executionMode === "XUAN_HARD_PAIR_SWEEP" ||
+        fill.executionMode === "XUAN_SOFT_PAIR_SWEEP" ||
+        fill.executionMode === "STRICT_PAIR_SWEEP" ||
+        fill.executionMode === "PARTIAL_FAST_COMPLETION" ||
+        fill.executionMode === "PARTIAL_SOFT_COMPLETION" ||
+        fill.executionMode === "HIGH_LOW_COMPLETION_CHASE"
+      ),
+  );
   const campaignActive =
     config.xuanBasketCampaignEnabled &&
     config.marketBasketContinuationEnabled &&
     mergeableQty >= config.xuanBasketCampaignMinMatchedShares - 1e-9 &&
-    residualQty <= Math.max(config.postMergeFlatDustShares, 1e-6) + 1e-9 &&
     basketDebtUSDC > config.marketBasketMinDebtUsdc + 1e-9 &&
-    basketEffectiveAvg > config.marketBasketGoodAvgCap + 1e-9;
+    basketEffectiveAvg > config.marketBasketGoodAvgCap + 1e-9 &&
+    (
+      residualQty <= Math.max(config.postMergeFlatDustShares, 1e-6) + 1e-9 ||
+      campaignSeedActive
+    );
   return {
     totalUp: normalizeTraceNumber(state.upShares),
     totalDown: normalizeTraceNumber(state.downShares),
@@ -1320,6 +1362,14 @@ function basketTraceFromCandidate(candidate: BalancedPairCandidate): Partial<Ent
     ...(candidate.avgImprovingClipBudgetRemaining !== undefined
       ? { avgImprovingClipBudgetRemaining: candidate.avgImprovingClipBudgetRemaining }
       : {}),
+    ...(candidate.flowShapingBudgetRemainingUSDC !== undefined
+      ? { flowShapingBudgetRemainingUSDC: candidate.flowShapingBudgetRemainingUSDC }
+      : {}),
+    ...(candidate.flowShapingClipBudgetRemaining !== undefined
+      ? { flowShapingClipBudgetRemaining: candidate.flowShapingClipBudgetRemaining }
+      : {}),
+    ...(candidate.campaignFlowCount !== undefined ? { campaignFlowCount: candidate.campaignFlowCount } : {}),
+    ...(candidate.campaignFlowTarget !== undefined ? { campaignFlowTarget: candidate.campaignFlowTarget } : {}),
     ...(candidate.addedDebtUSDC !== undefined ? { addedDebtUSDC: candidate.addedDebtUSDC } : {}),
   };
 }
@@ -1355,6 +1405,14 @@ function basketTraceFromSeedCandidate(candidate: SingleLegSeedCandidateTrace | u
     ...(candidate.avgImprovingClipBudgetRemaining !== undefined
       ? { avgImprovingClipBudgetRemaining: candidate.avgImprovingClipBudgetRemaining }
       : {}),
+    ...(candidate.flowShapingBudgetRemainingUSDC !== undefined
+      ? { flowShapingBudgetRemainingUSDC: candidate.flowShapingBudgetRemainingUSDC }
+      : {}),
+    ...(candidate.flowShapingClipBudgetRemaining !== undefined
+      ? { flowShapingClipBudgetRemaining: candidate.flowShapingClipBudgetRemaining }
+      : {}),
+    ...(candidate.campaignFlowCount !== undefined ? { campaignFlowCount: candidate.campaignFlowCount } : {}),
+    ...(candidate.campaignFlowTarget !== undefined ? { campaignFlowTarget: candidate.campaignFlowTarget } : {}),
   };
 }
 
@@ -1486,6 +1544,78 @@ interface InitialBasketRecoveryPlan {
   initialDebtUSDC: number;
   qtyCap: number;
   reason: string;
+  launchMode: "STRONG_LAUNCH" | "RECOVERABLE_LAUNCH" | "XUAN_PROBE_LAUNCH" | "HARD_SKIP" | "NO_RECOVERY_LAUNCH";
+  visibleRecoveryPath: boolean;
+  minEffectivePairAcrossTiers?: number | undefined;
+  bestDebtReducingQty?: number | undefined;
+  bestDebtReducingEffectivePair?: number | undefined;
+  recoveryPathReason?: string | undefined;
+}
+
+interface LaunchRecoveryScan {
+  visibleRecoveryPath: boolean;
+  minEffectivePairAcrossTiers?: number | undefined;
+  bestDebtReducingQty?: number | undefined;
+  bestDebtReducingEffectivePair?: number | undefined;
+  reason?: string | undefined;
+}
+
+function scanLaunchRecoveryPath(args: {
+  config: XuanStrategyConfig;
+  books: OrderBookState;
+}): LaunchRecoveryScan {
+  let minEffectivePairAcrossTiers = Number.POSITIVE_INFINITY;
+  let bestDebtReducingQty: number | undefined;
+  let bestDebtReducingEffectivePair: number | undefined;
+
+  for (const rawTier of args.config.campaignLaunchVwapTiers) {
+    const tier = normalizeOrderSize(rawTier, 1);
+    if (tier <= 0) {
+      continue;
+    }
+    const up = args.books.quoteForSize("UP", "ask", tier);
+    const down = args.books.quoteForSize("DOWN", "ask", tier);
+    if (!up.fullyFilled || !down.fullyFilled) {
+      continue;
+    }
+    const effectivePair = pairCostWithBothTaker(up.averagePrice, down.averagePrice, args.config.cryptoTakerFeeRate);
+    if (effectivePair < minEffectivePairAcrossTiers) {
+      minEffectivePairAcrossTiers = effectivePair;
+    }
+    if (
+      effectivePair < args.config.highLowDebtReducingEffectiveCap - 1e-9 &&
+      (bestDebtReducingEffectivePair === undefined || effectivePair < bestDebtReducingEffectivePair)
+    ) {
+      bestDebtReducingQty = tier;
+      bestDebtReducingEffectivePair = effectivePair;
+    }
+  }
+
+  if (bestDebtReducingQty !== undefined && bestDebtReducingEffectivePair !== undefined) {
+    return {
+      visibleRecoveryPath: true,
+      minEffectivePairAcrossTiers: normalizeTraceNumber(minEffectivePairAcrossTiers),
+      bestDebtReducingQty,
+      bestDebtReducingEffectivePair: normalizeTraceNumber(bestDebtReducingEffectivePair),
+      reason: "visible_debt_reducing_vwap_tier",
+    };
+  }
+
+  if (minEffectivePairAcrossTiers <= args.config.campaignLaunchApproachingEffectiveCap + 1e-9) {
+    return {
+      visibleRecoveryPath: false,
+      minEffectivePairAcrossTiers: normalizeTraceNumber(minEffectivePairAcrossTiers),
+      reason: "vwap_tier_near_but_not_debt_reducing",
+    };
+  }
+
+  return {
+    visibleRecoveryPath: false,
+    ...(Number.isFinite(minEffectivePairAcrossTiers)
+      ? { minEffectivePairAcrossTiers: normalizeTraceNumber(minEffectivePairAcrossTiers) }
+      : {}),
+    reason: "no_visible_recovery_path",
+  };
 }
 
 function initialBasketRecoveryPlanForBooks(args: {
@@ -1503,8 +1633,7 @@ function initialBasketRecoveryPlanForBooks(args: {
   const initialDebtUSDC = Math.max(0, args.effectivePair - 1) * Math.max(args.requestedLot, 0);
   if (
     !args.config.initialBasketRecoveryPlanEnabled ||
-    args.state.upShares + args.state.downShares > Math.max(args.config.postMergeFlatDustShares, 1e-6) ||
-    args.effectivePair <= args.config.initialBasketDebtSoftEffectiveCap + 1e-9
+    args.state.upShares + args.state.downShares > Math.max(args.config.postMergeFlatDustShares, 1e-6)
   ) {
     return {
       strength: "strong",
@@ -1513,17 +1642,24 @@ function initialBasketRecoveryPlanForBooks(args: {
       initialDebtUSDC: normalizeTraceNumber(initialDebtUSDC),
       qtyCap: noCap,
       reason: "initial_basket_soft_or_disabled",
+      launchMode: "STRONG_LAUNCH",
+      visibleRecoveryPath: true,
     };
   }
 
+  const recoveryScan = scanLaunchRecoveryPath({
+    config: args.config,
+    books: args.books,
+  });
   const highSidePrice = Math.max(args.upPrice, args.downPrice);
   const lowSidePrice = Math.min(args.upPrice, args.downPrice);
   const spread = highSidePrice - lowSidePrice;
   const visibleDebtReducer =
-    args.effectivePair <= args.config.marketBasketGoodAvgCap + 1e-9 ||
+    args.effectivePair <= args.config.highLowDebtReducingEffectiveCap + 1e-9 ||
+    recoveryScan.bestDebtReducingQty !== undefined ||
     (spread >= args.config.openingFollowupMinSpread - 1e-9 &&
       highSidePrice >= args.config.openingFollowupHighSideMinPrice - 1e-9 &&
-      args.effectivePair <= args.config.openingFollowupMaxEffectivePair + 1e-9);
+      args.effectivePair <= Math.min(args.config.openingFollowupMaxEffectivePair, args.config.campaignLaunchApproachingEffectiveCap) + 1e-9);
   const upFair = fairValueForOrphanSide(args.ctx.fairValueSnapshot, "UP");
   const downFair = fairValueForOrphanSide(args.ctx.fairValueSnapshot, "DOWN");
   const upEffective = args.upPrice + takerFeePerShare(args.upPrice, args.config.cryptoTakerFeeRate);
@@ -1548,40 +1684,81 @@ function initialBasketRecoveryPlanForBooks(args: {
   const mediumTerminalEdge =
     bestTerminalFairEdge >= args.config.initialBasketMediumTerminalFairValueEdge - 1e-9 ||
     (terminalPairProjection.deltaTerminalExpectedPnl ?? 0) >= args.config.terminalCarryMinEvGainUsdc - 1e-9;
+  const visibleRecoveryPath = visibleDebtReducer || recoveryScan.visibleRecoveryPath || strongTerminalEdge || mediumTerminalEdge;
+  const fairValueStronglyAgainst =
+    Number.isFinite(bestTerminalFairEdge) &&
+    bestTerminalFairEdge < -args.config.campaignLaunchXuanProbeMaxFairValueDrag + 1e-9;
+  const debtPerPair = Math.max(0, args.effectivePair - 1);
+  const minProbeDebtUSDC = debtPerPair * args.state.market.minOrderSize;
+  const xuanProbeAllowed =
+    args.config.xuanBasketCampaignEnabled &&
+    args.ctx.secsFromOpen <= args.config.campaignLaunchXuanProbeMaxAgeSec + 1e-9 &&
+    args.effectivePair <= args.config.campaignLaunchXuanProbeEffectiveCap + 1e-9 &&
+    minProbeDebtUSDC <= args.config.campaignLaunchXuanProbeMaxDebtUsdc + 1e-9 &&
+    !fairValueStronglyAgainst;
+  const launchMode: InitialBasketRecoveryPlan["launchMode"] =
+    args.effectivePair <= args.config.campaignLaunchStrongEffectiveCap + 1e-9
+      ? "STRONG_LAUNCH"
+      : visibleRecoveryPath && args.effectivePair <= args.config.campaignLaunchRecoverableEffectiveCap + 1e-9
+        ? "RECOVERABLE_LAUNCH"
+        : strongTerminalEdge
+          ? "RECOVERABLE_LAUNCH"
+          : xuanProbeAllowed
+            ? "XUAN_PROBE_LAUNCH"
+            : "HARD_SKIP";
 
   let strength: InitialBasketRecoveryPlan["strength"] = "none";
   let reason = "no_visible_recovery_plan";
-  if (visibleDebtReducer || strongTerminalEdge) {
+  if (args.effectivePair <= args.config.campaignLaunchStrongEffectiveCap + 1e-9 || visibleDebtReducer || strongTerminalEdge) {
     strength = "strong";
-    reason = visibleDebtReducer ? "visible_debt_reducer" : "strong_terminal_fair_value_edge";
-  } else if (mediumTerminalEdge) {
+    reason =
+      args.effectivePair <= args.config.campaignLaunchStrongEffectiveCap + 1e-9
+        ? "strong_initial_basket"
+        : visibleDebtReducer
+          ? recoveryScan.reason ?? "visible_debt_reducer"
+          : "strong_terminal_fair_value_edge";
+  } else if (visibleRecoveryPath && mediumTerminalEdge) {
     strength = "medium";
     reason = "medium_terminal_fair_value_edge";
-  } else if (args.effectivePair <= args.config.initialBasketDebtHardEffectiveCap + 1e-9) {
+  } else if (
+    visibleRecoveryPath &&
+    args.effectivePair <= args.config.campaignLaunchRecoverableEffectiveCap + 1e-9
+  ) {
     strength = "weak";
-    reason = "soft_debt_without_recovery_plan";
+    reason = recoveryScan.reason ?? "recoverable_launch_recovery_path";
+  } else if (xuanProbeAllowed) {
+    reason = "xuan_probe_launch_no_visible_recovery_path";
   }
 
   const score = normalizeTraceNumber(
     (visibleDebtReducer ? 1 : 0) +
+      (recoveryScan.visibleRecoveryPath ? 0.5 : 0) +
       Math.max(0, Number.isFinite(bestTerminalFairEdge) ? bestTerminalFairEdge : 0) * 10 +
       Math.max(0, terminalPairProjection.deltaTerminalExpectedPnl ?? 0) / Math.max(args.requestedLot, 1),
   );
-  const noRecoveryProbeQty =
-    args.config.initialNoRecoveryProbeMode === "XUAN_FOOTPRINT"
-      ? normalizeOrderSize(args.requestedLot * args.config.initialNoRecoveryProbePct, args.state.market.minOrderSize)
-      : normalizeOrderSize(
-          Math.min(args.requestedLot, args.config.initialBasketHardDebtNoPlanMaxQty),
-          args.state.market.minOrderSize,
-        );
+  const diagnosticQty = normalizeOrderSize(
+    Math.min(args.requestedLot, args.config.initialBasketHardDebtNoPlanMaxQty, args.config.campaignLaunchDiagnosticQty),
+    args.state.market.minOrderSize,
+  );
+  const xuanProbeDebtQty =
+    debtPerPair > 0 ? args.config.campaignLaunchXuanProbeMaxDebtUsdc / debtPerPair : args.requestedLot;
+  const xuanProbeQty = normalizeOrderSize(
+    Math.max(
+      args.state.market.minOrderSize,
+      Math.min(args.requestedLot, args.requestedLot * args.config.campaignLaunchXuanProbePct, xuanProbeDebtQty),
+    ),
+    args.state.market.minOrderSize,
+  );
   const qtyCap =
     strength === "strong"
       ? noCap
       : strength === "medium"
         ? normalizeOrderSize(args.requestedLot * args.config.initialBasketMediumRecoveryQtyMultiplier, args.state.market.minOrderSize)
-        : args.effectivePair > args.config.initialBasketDebtHardEffectiveCap + 1e-9
-          ? Math.max(args.state.market.minOrderSize, Math.min(args.requestedLot, noRecoveryProbeQty))
-          : normalizeOrderSize(args.requestedLot * args.config.initialBasketWeakRecoveryQtyMultiplier, args.state.market.minOrderSize);
+        : strength === "weak"
+          ? normalizeOrderSize(args.requestedLot * args.config.initialBasketWeakRecoveryQtyMultiplier, args.state.market.minOrderSize)
+          : launchMode === "XUAN_PROBE_LAUNCH"
+            ? xuanProbeQty
+            : Math.max(args.state.market.minOrderSize, diagnosticQty);
 
   return {
     strength,
@@ -1590,6 +1767,16 @@ function initialBasketRecoveryPlanForBooks(args: {
     initialDebtUSDC: normalizeTraceNumber(initialDebtUSDC),
     qtyCap,
     reason,
+    launchMode,
+    visibleRecoveryPath,
+    ...(recoveryScan.minEffectivePairAcrossTiers !== undefined
+      ? { minEffectivePairAcrossTiers: recoveryScan.minEffectivePairAcrossTiers }
+      : {}),
+    ...(recoveryScan.bestDebtReducingQty !== undefined ? { bestDebtReducingQty: recoveryScan.bestDebtReducingQty } : {}),
+    ...(recoveryScan.bestDebtReducingEffectivePair !== undefined
+      ? { bestDebtReducingEffectivePair: recoveryScan.bestDebtReducingEffectivePair }
+      : {}),
+    ...(recoveryScan.reason ? { recoveryPathReason: recoveryScan.reason } : {}),
   };
 }
 
@@ -1866,7 +2053,33 @@ export function evaluateEntryBuys(
             initialBasketDebtUSDC: freshLotResolution.recoveryPlan.initialDebtUSDC,
             initialBasketQtyCap: freshLotResolution.recoveryPlan.qtyCap,
             initialBasketRecoveryReason: freshLotResolution.recoveryPlan.reason,
-            ...(freshRequestedLot < ctx.lot - 1e-9
+            campaignLaunchMode: freshLotResolution.recoveryPlan.launchMode,
+            visibleRecoveryPath: freshLotResolution.recoveryPlan.visibleRecoveryPath,
+            ...(freshLotResolution.recoveryPlan.minEffectivePairAcrossTiers !== undefined
+              ? { minEffectivePairAcrossTiers: freshLotResolution.recoveryPlan.minEffectivePairAcrossTiers }
+              : {}),
+            ...(freshLotResolution.recoveryPlan.bestDebtReducingQty !== undefined
+              ? { bestDebtReducingQty: freshLotResolution.recoveryPlan.bestDebtReducingQty }
+              : {}),
+            ...(freshLotResolution.recoveryPlan.bestDebtReducingEffectivePair !== undefined
+              ? { bestDebtReducingEffectivePair: freshLotResolution.recoveryPlan.bestDebtReducingEffectivePair }
+              : {}),
+            ...(freshLotResolution.recoveryPlan.recoveryPathReason
+              ? { recoveryPathReason: freshLotResolution.recoveryPlan.recoveryPathReason }
+              : {}),
+            ...(freshLotResolution.recoveryPlan.launchMode === "HARD_SKIP" ||
+            freshLotResolution.recoveryPlan.launchMode === "NO_RECOVERY_LAUNCH"
+              ? {
+                  campaignMode: "WATCH_FOR_DEBT_REDUCER" as const,
+                  campaignBaseLot: ctx.lot,
+                }
+              : freshLotResolution.recoveryPlan.launchMode === "XUAN_PROBE_LAUNCH"
+                ? {
+                    campaignMode: "BASKET_CAMPAIGN_ACTIVE" as const,
+                    campaignBaseLot: ctx.lot,
+                    executedProbeQty: freshRequestedLot,
+                  }
+              : freshRequestedLot < ctx.lot - 1e-9
               ? {
                   campaignMode: "PROBE_OPENED" as const,
                   campaignBaseLot: ctx.lot,
@@ -1884,6 +2097,21 @@ export function evaluateEntryBuys(
       ...(inspected.bestEffectivePair !== undefined ? { bestEffectivePair: inspected.bestEffectivePair } : {}),
       candidates: inspected.traces,
     };
+
+    if (
+      (freshLotResolution.recoveryPlan?.launchMode === "HARD_SKIP" ||
+        freshLotResolution.recoveryPlan?.launchMode === "NO_RECOVERY_LAUNCH") &&
+      !freshLotResolution.recoveryPlan.visibleRecoveryPath
+    ) {
+      return {
+        decisions: [],
+        trace: {
+          ...trace,
+          skipReason: "watch_for_debt_reducer",
+          cycleSkippedReason: freshLotResolution.recoveryPlan.recoveryPathReason ?? "no_visible_recovery_path",
+        },
+      };
+    }
 
     const temporalSeedEvaluation = evaluateTemporalSingleLegSeed(
       config,
@@ -2121,6 +2349,14 @@ export function evaluateEntryBuys(
     ctx.forcedOverlapRepairArbitration === "favor_independent_overlap" &&
     (ctx.protectedResidualShares ?? 0) > 0;
   const allowOverlapPath = Boolean(ctx.allowControlledOverlap || carryPreservedOverlapPath);
+  const campaignResidualFlowActive =
+    currentBasketState.campaignActive &&
+    isUnbalancedCampaignResidual(config, state, shareGap) &&
+    ctx.secsToClose > config.finalWindowCompletionOnlySec;
+  const allowCampaignPairContinuation =
+    campaignResidualFlowActive &&
+    config.marketBasketContinuationEnabled &&
+    config.xuanBasketCampaignEnabled;
   const overlapRepairReason =
     ctx.forcedOverlapRepairArbitration !== undefined
       ? "sticky_arbitration_carry"
@@ -2131,7 +2367,7 @@ export function evaluateEntryBuys(
         : overlapRepairArbitration === "standard_pair_reentry"
           ? "standard_pair_reentry"
           : "no_overlap_lock";
-  const overlapInspection = allowOverlapPath
+  const overlapInspection = allowOverlapPath || allowCampaignPairContinuation
       ? inspectBalancedPairCandidates(
           config,
           state,
@@ -2257,6 +2493,22 @@ export function evaluateEntryBuys(
       return overlapSeedEvaluation;
     }
   }
+
+  if (allowCampaignPairContinuation) {
+    const pairReentry = buildOverlapPairReentry();
+    if (pairReentry) {
+      return {
+        decisions: pairReentry.decisions,
+        trace: {
+          ...pairReentry.trace,
+          campaignMode: "ACCUMULATING_CONTINUATION",
+          overlapRepairReason: "campaign_residual_pair_continuation",
+          overlapRepairOutcome: "pair_reentry",
+          skipReason: "campaign_residual_pair_continuation",
+        },
+      };
+    }
+  }
   const completionQtyPrior =
     config.xuanCloneMode === "PUBLIC_FOOTPRINT"
       ? resolveBundledCompletionSequencePrior(state.market.slug, ctx.secsFromOpen, laggingSide)
@@ -2284,16 +2536,29 @@ export function evaluateEntryBuys(
     config.completionQtyMode === "ALLOW_OVERSHOOT"
       ? shareGap + config.maxCompletionOvershootShares
       : shareGap;
+  const unbalancedCampaignResidual = isUnbalancedCampaignResidual(config, state, shareGap);
+  const currentMatchedEffectiveForHedge =
+    mergeableShares(state) > 1e-6 ? matchedEffectivePairCost(state, config.cryptoTakerFeeRate) : Number.POSITIVE_INFINITY;
+  const debtPositiveCampaignHedgeQtyCap =
+    unbalancedCampaignResidual &&
+    !exactCompletionQtyPrior &&
+    ctx.secsToClose > config.finalWindowCompletionOnlySec &&
+    currentMatchedEffectiveForHedge > config.fullRebalanceOnlyIfEffectivePairBelow + 1e-9
+      ? Math.max(
+          0,
+          (leadingSide === "UP" ? state.upShares : state.downShares) * config.initialDebtyCampaignMaxHedgeRatio -
+            (laggingSide === "UP" ? state.upShares : state.downShares),
+        )
+      : Number.POSITIVE_INFINITY;
   const repairEffectiveQtyCap = exactCompletionQtyPrior
     ? Math.max(repairQtyCap, exactCompletionQtyPrior.qty)
     : highLowRepairOvershootQty !== undefined
       ? Math.max(repairQtyCap, highLowRepairOvershootQty)
-      : repairQtyCap;
+      : Math.min(repairQtyCap, debtPositiveCampaignHedgeQtyCap);
   const repairSize = normalizeOrderSize(
     Math.min(repairRequestedQty, repairEffectiveQtyCap),
     config.repairMinQty,
   );
-  const unbalancedCampaignResidual = isUnbalancedCampaignResidual(config, state, shareGap);
   const campaignCompletionSizing =
     unbalancedCampaignResidual && !exactCompletionQtyPrior
       ? resolveCampaignCompletionSizing(config, shareGap)
@@ -4642,9 +4907,10 @@ function inspectBalancedPairCandidates(
       basketProjection !== undefined &&
       basketProjection.improvement >= config.marketBasketMinAvgImprovement - 1e-9;
     const basketContinuationPairOverride =
-      marketBasketFairValueFallbackEligible &&
-      basketProjection !== undefined &&
-      basketProjection.projectedEffectivePair <= config.marketBasketBorderlineAvgCap + 1e-9;
+      allowance?.allowed === true &&
+      allowance.marketBasketContinuation === true &&
+      upExecution.fullyFilled &&
+      downExecution.fullyFilled;
     const fairValueReasons = [upFairValue.reason, downFairValue.reason].filter((reason): reason is string =>
       Boolean(reason),
     );
@@ -4700,7 +4966,10 @@ function inspectBalancedPairCandidates(
       upExecution.fullyFilled &&
       downExecution.fullyFilled &&
       terminalCarryProjection.allowed;
-    const effectiveFreshCycleSkipReason = terminalCarryPairOverride ? undefined : freshCycleSkipReason;
+    const effectiveFreshCycleSkipReason =
+      terminalCarryPairOverride || (allowance?.allowed === true && allowance.marketBasketContinuation === true)
+        ? undefined
+        : freshCycleSkipReason;
     const orphanRiskAllowed = (upOrphanRisk.allowed && downOrphanRisk.allowed) || basketContinuationPairOverride;
     const allowanceAllowed = Boolean(allowance?.allowed || terminalCarryPairOverride);
     const selectedMode = allowance?.mode ?? (terminalCarryPairOverride ? "XUAN_HARD_PAIR_SWEEP" : undefined);
@@ -4819,6 +5088,14 @@ function inspectBalancedPairCandidates(
       ...(allowance?.avgImprovingClipBudgetRemaining !== undefined
         ? { avgImprovingClipBudgetRemaining: allowance.avgImprovingClipBudgetRemaining }
         : {}),
+      ...(allowance?.flowShapingBudgetRemainingUSDC !== undefined
+        ? { flowShapingBudgetRemainingUSDC: allowance.flowShapingBudgetRemainingUSDC }
+        : {}),
+      ...(allowance?.flowShapingClipBudgetRemaining !== undefined
+        ? { flowShapingClipBudgetRemaining: allowance.flowShapingClipBudgetRemaining }
+        : {}),
+      ...(allowance?.campaignFlowCount !== undefined ? { campaignFlowCount: allowance.campaignFlowCount } : {}),
+      ...(allowance?.campaignFlowTarget !== undefined ? { campaignFlowTarget: allowance.campaignFlowTarget } : {}),
       ...(effectiveFreshCycleSkipReason && !continuationRejectedReason
         ? { cycleSkippedReason: effectiveFreshCycleSkipReason }
         : {}),
@@ -4903,6 +5180,14 @@ function inspectBalancedPairCandidates(
         ...(allowance?.avgImprovingClipBudgetRemaining !== undefined
           ? { avgImprovingClipBudgetRemaining: allowance.avgImprovingClipBudgetRemaining }
           : {}),
+        ...(allowance?.flowShapingBudgetRemainingUSDC !== undefined
+          ? { flowShapingBudgetRemainingUSDC: allowance.flowShapingBudgetRemainingUSDC }
+          : {}),
+        ...(allowance?.flowShapingClipBudgetRemaining !== undefined
+          ? { flowShapingClipBudgetRemaining: allowance.flowShapingClipBudgetRemaining }
+          : {}),
+        ...(allowance?.campaignFlowCount !== undefined ? { campaignFlowCount: allowance.campaignFlowCount } : {}),
+        ...(allowance?.campaignFlowTarget !== undefined ? { campaignFlowTarget: allowance.campaignFlowTarget } : {}),
         feeUSDC: cycleTrace.feeUSDC,
         expectedNetIfMerged: cycleTrace.expectedNetIfMerged,
         cycleQualityLabel: cycleTrace.cycleQualityLabel,
@@ -5309,6 +5594,10 @@ function evaluateSingleLegSeed(
             campaignClipType: continuationProjection.campaignClipType,
             avgImprovingBudgetRemainingUSDC: continuationProjection.avgImprovingBudgetRemainingUSDC,
             avgImprovingClipBudgetRemaining: continuationProjection.avgImprovingClipBudgetRemaining,
+            flowShapingBudgetRemainingUSDC: continuationProjection.flowShapingBudgetRemainingUSDC,
+            flowShapingClipBudgetRemaining: continuationProjection.flowShapingClipBudgetRemaining,
+            campaignFlowCount: continuationProjection.campaignFlowCount,
+            campaignFlowTarget: continuationProjection.campaignFlowTarget,
             addedDebtUSDC: continuationProjection.addedDebtUSDC,
           }
         : {}),
@@ -5332,6 +5621,10 @@ function evaluateSingleLegSeed(
       skipReason === "avg_improving_clip_budget_exhausted" ||
       skipReason === "avg_improving_budget_exhausted" ||
       skipReason === "avg_improving_qty_cap" ||
+      skipReason === "flow_shaping_flow_target_met" ||
+      skipReason === "flow_shaping_clip_budget_exhausted" ||
+      skipReason === "flow_shaping_budget_exhausted" ||
+      skipReason === "flow_shaping_qty_cap" ||
       skipReason === "debt_reducing_qty_cap" ||
       skipReason === "continuation_not_debt_reducing_or_avg_improving" ||
       skipReason === "market_basket_continuation_rejected"

@@ -211,6 +211,73 @@ describe("xuan mode and pair order groups", () => {
     expect(adjustment?.completion?.negativeEdgeUsdc).toBeGreaterThan(0);
   });
 
+  it("delays early debt-positive temporal completion but releases it when the opposite leg becomes cost-reducing", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.5,
+      size: 33.25,
+      timestamp: market.startTs,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+
+    const earlyBooks = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.5, size: 200 }], [{ price: 0.51, size: 200 }]),
+      buildBook(
+        market.tokens.DOWN.tokenId,
+        market.conditionId,
+        [{ price: 0.49, size: 200 }],
+        [{ price: 0.5, size: 200 }],
+      ),
+    );
+    const config = buildConfig({
+      BOT_MODE: "XUAN",
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      XUAN_TEMPORAL_COMPLETION_MIN_AGE_SEC: "15",
+    });
+
+    const earlyAdjustment = chooseInventoryAdjustment(config, state, earlyBooks, {
+      secsToClose: 299,
+      nowTs: market.startTs + 1,
+      fairValueSnapshot: {
+        status: "valid",
+        estimatedThreshold: false,
+        fairUp: 0.51,
+        fairDown: 0.5,
+      },
+    });
+    expect(earlyAdjustment).toBeNull();
+
+    const laterBooks = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.42, size: 200 }], [{ price: 0.43, size: 200 }]),
+      buildBook(
+        market.tokens.DOWN.tokenId,
+        market.conditionId,
+        [{ price: 0.5, size: 200 }],
+        [{ price: 0.51, size: 200 }],
+      ),
+    );
+    const laterAdjustment = chooseInventoryAdjustment(config, state, laterBooks, {
+      secsToClose: 281,
+      nowTs: market.startTs + 19,
+      fairValueSnapshot: {
+        status: "valid",
+        estimatedThreshold: false,
+        fairUp: 0.43,
+        fairDown: 0.51,
+      },
+    });
+
+    expect(laterAdjustment?.completion).toMatchObject({
+      sideToBuy: "UP",
+      missingShares: 33.25,
+    });
+    expect(laterAdjustment?.completion?.costWithFees).toBeLessThan(1);
+  });
+
   it("blocks fee-inclusive completion when the effective merged result exceeds the quality cap", () => {
     const market = buildOfflineMarket(1713696000);
     const state = createMarketState(market);
@@ -2161,7 +2228,7 @@ describe("xuan mode and pair order groups", () => {
     expect(evaluation.trace.repairCost).toBeLessThanOrEqual(1.075);
   });
 
-  it("steers protected-residual overlap away from same-side amplification", () => {
+  it("blocks protected-residual overlap seed when the opposite leg would worsen cost basis", () => {
     const market = buildOfflineMarket(1713696000);
     const state = createMarketState(market);
     state.upShares = 80;
@@ -2204,15 +2271,10 @@ describe("xuan mode and pair order groups", () => {
       },
     );
 
-    expect(evaluation.decisions).toHaveLength(1);
-    expect(evaluation.decisions[0]).toMatchObject({
-      side: "DOWN",
-      size: 5,
-      mode: "TEMPORAL_SINGLE_LEG_SEED",
-      reason: "temporal_single_leg_seed",
-    });
-    expect(evaluation.trace.skipReason).toBe("protected_residual_overlap_seed");
-    expect(evaluation.trace.overlapRepairOutcome).toBe("overlap_seed");
+    expect(evaluation.decisions).toHaveLength(0);
+    expect(evaluation.trace.mode).toBe("lagging_rebalance");
+    expect(evaluation.trace.repairCost).toBeGreaterThan(1.005);
+    expect(evaluation.trace.skipReason).toBe("repair_phase_cap");
   });
 
   it("treats a micro protected residual as eligible for opposite-side overlap seed instead of immediate repair", () => {
@@ -2464,6 +2526,145 @@ describe("xuan mode and pair order groups", () => {
     expect(evaluation.trace.overlapRepairArbitration).toBe("favor_independent_overlap");
     expect(evaluation.trace.residualSeverityLevel).toBe("micro");
     expect(evaluation.trace.overlapRepairOutcome).toBe("overlap_seed");
+  });
+
+  it("scales a debt-reducing protected residual overlap seed beyond the micro cap", () => {
+    const market = buildOfflineMarket(1713696000);
+    const state = createMarketState(market);
+    state.downShares = 80;
+    state.downCost = 48;
+    state.downLots = [
+      {
+        size: 80,
+        price: 0.6,
+        timestamp: market.startTs + 1,
+      },
+    ];
+    state.upShares = 55;
+    state.upCost = 28.6;
+    state.upLots = [
+      {
+        size: 55,
+        price: 0.52,
+        timestamp: market.startTs + 1,
+      },
+    ];
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.18, size: 200 }], [{ price: 0.19, size: 200 }]),
+      buildBook(
+        market.tokens.DOWN.tokenId,
+        market.conditionId,
+        [{ price: 0.79, size: 200 }],
+        [{ price: 0.8, size: 200 }],
+      ),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        CONTROLLED_OVERLAP_SEED_MAX_QTY: "5",
+        SINGLE_LEG_SEED_MAX_QTY: "120",
+        MAX_SINGLE_ORPHAN_QTY: "120",
+        ORPHAN_LEG_MAX_NOTIONAL_USDC: "120",
+        MAX_MARKET_ORPHAN_USDC: "120",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 90,
+        secsToClose: 210,
+        lot: 80,
+        allowControlledOverlap: true,
+        protectedResidualShares: 25,
+        protectedResidualSide: "DOWN",
+        fairValueSnapshot: {
+          status: "valid",
+          estimatedThreshold: false,
+          fairUp: 0.2,
+          fairDown: 0.8,
+        },
+      },
+    );
+
+    expect(evaluation.decisions).toHaveLength(1);
+    expect(evaluation.decisions[0]).toMatchObject({
+      side: "UP",
+      mode: "TEMPORAL_SINGLE_LEG_SEED",
+      reason: "temporal_single_leg_seed",
+    });
+    expect(evaluation.decisions[0]!.size).toBeGreaterThan(5);
+    expect(evaluation.trace.skipReason).toBe("protected_residual_overlap_seed");
+    const selectedTrace = evaluation.trace.seedCandidates?.find((candidate) => candidate.allowed);
+    expect(selectedTrace?.existingResidualPairCost).toBeLessThan(1);
+  });
+
+  it("blocks a non-dust protected residual overlap seed when it worsens basket cost basis", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 38.25,
+      price: 0.501182,
+      timestamp: market.startTs + 1,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      size: 44.25,
+      price: 0.473815,
+      timestamp: market.startTs + 2,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.53, size: 200 }], [{ price: 0.54, size: 200 }]),
+      buildBook(
+        market.tokens.DOWN.tokenId,
+        market.conditionId,
+        [{ price: 0.46, size: 200 }],
+        [{ price: 0.47, size: 200 }],
+      ),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        CONTROLLED_OVERLAP_SEED_MAX_QTY: "5",
+        SINGLE_LEG_SEED_MAX_QTY: "120",
+        MAX_SINGLE_ORPHAN_QTY: "120",
+        ORPHAN_LEG_MAX_NOTIONAL_USDC: "120",
+        MAX_MARKET_ORPHAN_USDC: "120",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 183,
+        secsToClose: 117,
+        lot: 80,
+        allowControlledOverlap: true,
+        protectedResidualShares: 6,
+        protectedResidualSide: "DOWN",
+        fairValueSnapshot: {
+          status: "valid",
+          estimatedThreshold: false,
+          fairUp: 0.54,
+          fairDown: 0.47,
+        },
+      },
+    );
+
+    expect(evaluation.decisions).toEqual([]);
+    expect([
+      evaluation.trace.skipReason,
+      ...(evaluation.trace.seedCandidates ?? []).map((candidate) => candidate.skipReason),
+    ]).toEqual(expect.arrayContaining([expect.stringMatching(/repair_qty_cap|residual_completion_cost_basis_cap/)]));
   });
 
   it("preempts controlled-overlap pair reentry with opposite-leg repair when a protected residual is open", () => {
@@ -4634,6 +4835,73 @@ describe("xuan mode and pair order groups", () => {
     expect(evaluation.trace.deltaBasketDebt).toBeGreaterThan(4);
   });
 
+  it("scales true debt-reducing campaign continuation to the large VWAP tier", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 250,
+      price: 0.55,
+      timestamp: market.startTs + 1,
+      makerTaker: "taker",
+      executionMode: "XUAN_HARD_PAIR_SWEEP",
+    });
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      size: 250,
+      price: 0.55,
+      timestamp: market.startTs + 2,
+      makerTaker: "taker",
+      executionMode: "XUAN_HARD_PAIR_SWEEP",
+    });
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.02, size: 500 }], [{ price: 0.03, size: 500 }]),
+      buildBook(
+        market.tokens.DOWN.tokenId,
+        market.conditionId,
+        [{ price: 0.9, size: 500 }],
+        [{ price: 0.91, size: 500 }],
+      ),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        LIVE_SMALL_LOT_LADDER: "200,300",
+        MARKET_BASKET_CONTINUATION_MAX_QTY: "300",
+        MAX_ONE_SIDED_EXPOSURE_SHARES: "1000",
+        MAX_MARKET_EXPOSURE_SHARES: "1200",
+        MAX_MARKET_SHARES_PER_SIDE: "1000",
+        ORPHAN_LEG_MAX_NOTIONAL_USDC: "500",
+        MAX_MARKET_ORPHAN_USDC: "500",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 120,
+        secsToClose: 180,
+        lot: 400,
+        fairValueSnapshot: {
+          status: "valid",
+          estimatedThreshold: false,
+          fairUp: 0.03,
+          fairDown: 0.91,
+        },
+      },
+    );
+
+    expect(evaluation.decisions).toHaveLength(2);
+    expect(evaluation.decisions.every((decision) => decision.size === 300)).toBe(true);
+    expect(evaluation.trace.marketBasketContinuation).toBe(true);
+    expect(evaluation.trace.continuationClass).toBe("DEBT_REDUCING");
+    expect(evaluation.trace.campaignClipType).toBe("STRONG_HIGH_LOW_CONTINUATION");
+    expect(evaluation.trace.marketBasketProjectedMatchedQty).toBe(550);
+    expect(evaluation.trace.deltaBasketDebt).toBeGreaterThan(15);
+  });
+
   it("allows an average-improving basket campaign continuation without fair value", () => {
     const market = buildOfflineMarket(1713696000);
     let state = createMarketState(market);
@@ -4836,7 +5104,7 @@ describe("xuan mode and pair order groups", () => {
     expect(evaluation.trace.deltaTerminalExpectedPnl).toBeGreaterThan(evaluation.trace.addedDebtUSDC ?? 0);
   });
 
-  it("downsizes an oversized flow-shaping covered seed to the campaign debt budget", () => {
+  it("keeps flow-shaping covered seeds trace-only instead of using them as the profit engine", () => {
     const market = buildOfflineMarket(1713696000);
     let state = createMarketState(market);
     state = applyFill(state, {
@@ -4892,15 +5160,15 @@ describe("xuan mode and pair order groups", () => {
       },
     );
 
-    expect(evaluation.decisions).toHaveLength(2);
-    expect(evaluation.decisions.every((decision) => decision.size === 10)).toBe(true);
-    expect(evaluation.trace.campaignMode).toBe("ACCUMULATING_CONTINUATION");
-    expect(evaluation.trace.continuationClass).toBe("FLOW_SHAPING");
-    expect(evaluation.trace.addedDebtUSDC).toBeLessThanOrEqual(0.25);
+    expect(evaluation.decisions).toEqual([]);
+    expect(evaluation.trace.campaignMode).toBe("BASKET_CAMPAIGN_ACTIVE");
+    expect(evaluation.trace.candidates.some((candidate) => candidate.continuationClass === "FLOW_SHAPING")).toBe(true);
+    expect(evaluation.trace.candidates.some((candidate) => candidate.cycleSkippedReason === "flow_shaping_trace_only")).toBe(true);
+    expect(evaluation.trace.candidates.some((candidate) => (candidate.addedDebtUSDC ?? Infinity) <= 0.25)).toBe(true);
     expect(evaluation.trace.marketBasketDebtUSDC).toBeGreaterThan(3);
   });
 
-  it("allows only a tightly bounded flow-shaping continuation while campaign flow target is behind", () => {
+  it("blocks flow-shaping continuation while campaign flow target is behind unless it reduces debt", () => {
     const market = buildOfflineMarket(1713696000);
     let state = createMarketState(market);
     state = applyFill(state, {
@@ -4955,17 +5223,17 @@ describe("xuan mode and pair order groups", () => {
       },
     );
 
-    expect(evaluation.decisions).toHaveLength(2);
-    expect(evaluation.decisions.every((decision) => decision.size === 10)).toBe(true);
-    expect(evaluation.trace.campaignMode).toBe("ACCUMULATING_CONTINUATION");
-    expect(evaluation.trace.marketBasketContinuation).toBe(true);
-    expect(evaluation.trace.continuationClass).toBe("FLOW_SHAPING");
-    expect(evaluation.trace.campaignFlowCount).toBe(1);
-    expect(evaluation.trace.campaignFlowTarget).toBe(3);
-    expect(evaluation.trace.addedDebtUSDC).toBeLessThanOrEqual(0.25);
+    expect(evaluation.decisions).toEqual([]);
+    expect(evaluation.trace.campaignMode).toBe("BASKET_CAMPAIGN_ACTIVE");
+    expect(evaluation.trace.candidates.some((candidate) => candidate.marketBasketContinuation === true)).toBe(true);
+    expect(evaluation.trace.candidates.some((candidate) => candidate.continuationClass === "FLOW_SHAPING")).toBe(true);
+    expect(evaluation.trace.candidates.some((candidate) => candidate.cycleSkippedReason === "flow_shaping_trace_only")).toBe(true);
+    expect(evaluation.trace.candidates.some((candidate) => candidate.campaignFlowCount === 1)).toBe(true);
+    expect(evaluation.trace.candidates.some((candidate) => candidate.campaignFlowTarget === 3)).toBe(true);
+    expect(evaluation.trace.candidates.some((candidate) => (candidate.addedDebtUSDC ?? Infinity) <= 0.25)).toBe(true);
   });
 
-  it("keeps campaign pair continuation alive while a campaign residual is open", () => {
+  it("does not turn campaign-residual flow-shaping into paired buys when it only adds debt", () => {
     const market = buildOfflineMarket(1713696000);
     let state = createMarketState(market);
     state = applyFill(state, {
@@ -5020,12 +5288,9 @@ describe("xuan mode and pair order groups", () => {
       },
     );
 
-    expect(evaluation.decisions).toHaveLength(2);
-    expect(evaluation.decisions.every((decision) => decision.size === 10)).toBe(true);
-    expect(evaluation.trace.campaignMode).toBe("ACCUMULATING_CONTINUATION");
-    expect(evaluation.trace.skipReason).toBe("campaign_residual_pair_continuation");
-    expect(evaluation.trace.overlapRepairReason).toBe("campaign_residual_pair_continuation");
-    expect(evaluation.trace.continuationClass).toBe("FLOW_SHAPING");
+    expect(evaluation.decisions).toEqual([]);
+    expect(evaluation.trace.campaignMode).toBe("UNBALANCED_CAMPAIGN_RESIDUAL");
+    expect(["repair_qty_cap", "campaign_residual_pair_continuation"]).toContain(evaluation.trace.skipReason);
   });
 
   it("blocks a large continuation clip when it would break the market basket cap", () => {

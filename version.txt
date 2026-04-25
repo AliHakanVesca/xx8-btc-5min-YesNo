@@ -1,6 +1,16 @@
 
 ##############################################
 
+Version : V.0.0.31
+Date    : 25.04.2026
+Author  : Ali Hakan Çakır
+Changes : - Temporal completion age gate ve cost-reducing phase override akislari eklendi.
+          - Protected residual overlap ve final-window basket carry testleri guncellendi.
+
+##############################################
+
+##############################################
+
 Version : V.0.0.30
 Date    : 25.04.2026
 Author  : Ali Hakan Çakır

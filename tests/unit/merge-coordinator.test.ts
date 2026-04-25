@@ -242,6 +242,48 @@ describe("merge coordinator", () => {
     expect(lowCollateralGate.reason).toBe("low_collateral");
   });
 
+  it("carries a small debt-positive public-footprint basket instead of forcing a tiny final merge", () => {
+    const config = buildConfig({
+      BOT_MODE: "XUAN",
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+    });
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.49,
+      size: 33.25,
+      timestamp: market.startTs,
+      makerTaker: "taker",
+    });
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      price: 0.52,
+      size: 33.25,
+      timestamp: market.startTs + 1,
+      makerTaker: "taker",
+    });
+    let tracker = createMergeBatchTracker();
+    tracker = syncMergeBatchTracker(tracker, 33.25, market.startTs + 1);
+
+    const gate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 275,
+      secsFromOpen: 275,
+      secsToClose: 25,
+      usdcBalance: 100,
+      tracker,
+    });
+
+    expect(gate.allow).toBe(false);
+    expect(gate.forced).toBe(false);
+    expect(gate.reason).toBe("basket_debt_hold");
+    expect(gate.mergeVsCarryDecision).toBe("CARRY_TO_SETTLEMENT");
+    expect(gate.mergeVsCarryReason).toBe("small_debt_positive_basket_below_xuan_merge_target");
+    expect(gate.basketEffectivePair).toBeGreaterThan(1);
+  });
+
   it("defers small hard-imbalance merges briefly in xuan mode to preserve batching rhythm", () => {
     const config = buildConfig({
       BOT_MODE: "XUAN",
@@ -423,8 +465,9 @@ describe("merge coordinator", () => {
     expect(heldGate.allow).toBe(false);
     expect(heldGate.forced).toBe(false);
     expect(heldGate.reason).toBe("basket_debt_hold");
-    expect(finalGate.allow).toBe(true);
-    expect(finalGate.reason).toBe("final_window");
+    expect(finalGate.allow).toBe(false);
+    expect(finalGate.reason).toBe("basket_debt_hold");
+    expect(finalGate.mergeVsCarryDecision).toBe("CARRY_TO_SETTLEMENT");
   });
 
   it("does not hard-imbalance merge a tiny debt-positive matched basket while residual completion can continue", () => {

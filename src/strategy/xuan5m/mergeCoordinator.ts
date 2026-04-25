@@ -350,6 +350,23 @@ export function evaluateDelayedMergeGate(
     const debtPositiveFinalWindow =
       basketEffectivePair !== undefined &&
       basketEffectivePair > config.marketBasketMergeEffectivePairCap + 1e-9;
+    const shouldCarrySmallDebtPositiveBasket =
+      publicFootprintHoldWithoutPrior &&
+      debtPositiveFinalWindow &&
+      metrics.pendingMatchedQty < basketMergeTargetShares - 1e-9 &&
+      args.usdcBalance >= config.minUsdcBalanceForNewEntry &&
+      imbalance(state) < config.hardImbalanceRatio;
+    if (shouldCarrySmallDebtPositiveBasket) {
+      return {
+        allow: false,
+        forced: false,
+        reason: "basket_debt_hold",
+        ...(basketEffectivePair !== undefined ? { basketEffectivePair: normalize(basketEffectivePair) } : {}),
+        mergeVsCarryDecision: "CARRY_TO_SETTLEMENT",
+        mergeVsCarryReason: "small_debt_positive_basket_below_xuan_merge_target",
+        ...metrics,
+      };
+    }
     return {
       allow: true,
       forced: true,

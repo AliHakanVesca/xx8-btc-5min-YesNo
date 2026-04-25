@@ -2827,6 +2827,35 @@ export function evaluateEntryBuys(
       newGap,
     });
     const campaignPhaseCapOverride = campaignResidualFallback.allowed;
+    const campaignResidualCostBasisBlocked =
+      unbalancedCampaignResidual &&
+      oldGap >= Math.max(config.controlledOverlapMinResidualShares, config.microRepairMaxQty) - 1e-9 &&
+      !campaignResidualFallback.allowed &&
+      ctx.secsToClose > config.finalWindowCompletionOnlySec;
+    if (campaignResidualCostBasisBlocked) {
+      lastBlockedRepairEvaluation = {
+        decisions: [],
+        trace: {
+          ...trace,
+          repairSizingMode,
+          repairCandidateCount: repairCandidateSizes.length,
+          repairFilledSize: executableSize,
+          repairFinalQty: executableSize,
+          repairCost,
+          repairAllowed: false,
+          repairCapMode: allowance.capMode,
+          repairOldGap: oldGap,
+          repairNewGap: newGap,
+          repairWouldIncreaseImbalance: wouldIncreaseImbalance,
+          repairOppositeAveragePrice: oppositeAveragePrice,
+          repairHighLowMismatch: allowance.highLowMismatch ?? false,
+          completionReleaseRole: blockedCompletionReleaseRole,
+          currentBasketEffectiveAvg: normalizeTraceNumber(currentMatchedEffectivePair),
+          skipReason: "residual_completion_cost_basis_cap",
+        },
+      };
+      continue;
+    }
     if (
       (repairCost > phaseCap && !highLowPhaseCapOverride && !campaignPhaseCapOverride) ||
       executableSize > campaignPhaseMaxQty
@@ -4102,8 +4131,16 @@ function evaluateTemporalSingleLegSeed(
   const protectedOverlapActive = Boolean(
     (ctx.allowControlledOverlap || stickyOverlapCarryActive) && (ctx.protectedResidualShares ?? 0) > 0,
   );
+  const campaignBaseLot = config.liveSmallLotLadder[0] ?? config.defaultLot;
+  const debtReducingOverlapSeedCap = Math.max(
+    config.controlledOverlapSeedMaxQty,
+    Math.min(
+      config.xuanBasketCampaignCompletionClipMaxQty,
+      campaignBaseLot * config.xuanBasketCampaignDebtReducingQtyMultiplier,
+    ),
+  );
   const overlapSeedCap = protectedOverlapActive
-    ? Math.max(0, config.controlledOverlapSeedMaxQty)
+    ? Math.max(0, debtReducingOverlapSeedCap)
     : Number.POSITIVE_INFINITY;
   const candidateSize = normalizeOrderSize(
     Math.min(
@@ -4239,8 +4276,31 @@ function evaluateTemporalSingleLegSeed(
             cycleQualityLabel: "BAD_PAIR" as const,
           };
     const negativeEdgeUsdc = executableSize > 0 ? Math.max(0, referencePairCost - 1) * executableSize : 0;
+    const oldGap = absoluteShareGap(state);
     const projectedGap = Math.abs(currentSideShares + executableSize - oppositeShares);
     const effectiveProjectedGap = Math.max(0, projectedGap - protectedResidualAllowance(config, ctx, side));
+    const matchedEffectivePair =
+      mergeableShares(state) > 1e-6
+        ? matchedEffectivePairCost(state, config.cryptoTakerFeeRate)
+        : Number.POSITIVE_INFINITY;
+    const dustOnlyResidual =
+      oldGap <=
+      Math.max(config.postMergeFlatDustShares, config.repairMinQty, config.completionMinQty) + 1e-9;
+    const microOverlapResidual =
+      oldGap < Math.max(config.controlledOverlapMinResidualShares, config.microRepairMaxQty) - 1e-9;
+    const protectedResidualDebtReducing =
+      completingExistingResidual && referencePairCost <= config.residualCompletionCostBasisCap + 1e-9;
+    const protectedResidualAverageImproving =
+      completingExistingResidual &&
+      Number.isFinite(matchedEffectivePair) &&
+      referencePairCost <= config.softResidualCompletionCap + 1e-9 &&
+      referencePairCost < matchedEffectivePair - config.residualCompletionImprovementThreshold + 1e-9;
+    const protectedResidualCostBasisAllowed =
+      !completingExistingResidual ||
+      dustOnlyResidual ||
+      microOverlapResidual ||
+      protectedResidualDebtReducing ||
+      protectedResidualAverageImproving;
     const cheapSeedExpensiveCompletionBlocked = shouldBlockCheapSeedExpensiveCompletionSetup({
       config,
       state,
@@ -4282,6 +4342,8 @@ function evaluateTemporalSingleLegSeed(
     if (skipReason === undefined) {
       if (cheapSeedExpensiveCompletionBlocked) {
         skipReason = "cheap_seed_expensive_completion_guard";
+      } else if (!protectedResidualCostBasisAllowed) {
+        skipReason = "protected_residual_overlap_seed_cost_basis_cap";
       } else if (sameSideOverlapAmplificationBlocked) {
         skipReason = "overlap_same_side_amplification";
       } else if (state.consecutiveSeedSide === side && state.consecutiveSeedCount >= config.maxConsecutiveSingleLegSeedsPerSide) {
@@ -5702,9 +5764,13 @@ function buildCandidateSizes(
     config.botMode === "XUAN" && config.clipSplitMode === "DEPTH_ADAPTIVE_XUAN_BIAS"
       ? buildXuanClipSizeCandidates(maxCandidateSize, minOrderSize)
       : [];
+  const debtReducingVwapTiers =
+    config.botMode === "XUAN"
+      ? config.campaignLaunchVwapTiers
+      : [];
   const normalized = Array.from(
     new Set(
-      [...xuanClipSizes, ...ladder, maxCandidateSize]
+      [...xuanClipSizes, ...debtReducingVwapTiers, ...ladder, maxCandidateSize]
         .map((size) => normalizeOrderSize(size, minOrderSize))
         .filter((size) => size > 0 && size <= maxCandidateSize),
     ),
@@ -5719,7 +5785,7 @@ function buildCandidateSizes(
 
 function buildXuanClipSizeCandidates(maxCandidateSize: number, minOrderSize: number): number[] {
   const candidates: number[] = [];
-  for (const tier of [5, 10, 20, 40, 80, 160]) {
+  for (const tier of [5, 10, 20, 40, 80, 160, 300]) {
     if (maxCandidateSize >= tier) {
       candidates.push(tier);
     }

@@ -364,12 +364,6 @@ function chooseCompletion(
       missingSidePrice: execution.averagePrice,
       nowTs: ctx.nowTs,
     });
-    if (
-      candidateSize > campaignPhaseMaxQty &&
-      !marketBasketProjection?.phaseMaxOverrideAllowed
-    ) {
-      continue;
-    }
     const allowance = completionAllowance(config, state, {
       costWithFees,
       candidateSize,
@@ -377,6 +371,19 @@ function chooseCompletion(
       missingSidePrice: execution.averagePrice,
       partialAgeSec,
     });
+    const temporalCostReducingPhaseOverride =
+      config.botMode === "XUAN" &&
+      config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
+      partialAgeSec >= config.xuanTemporalCompletionMinAgeSec &&
+      costWithFees <= config.xuanTemporalCompletionEarlyMaxEffectivePair + 1e-9 &&
+      candidateSize <= config.marketBasketContinuationMaxQty + 1e-9;
+    if (
+      candidateSize > campaignPhaseMaxQty &&
+      !marketBasketProjection?.phaseMaxOverrideAllowed &&
+      !temporalCostReducingPhaseOverride
+    ) {
+      continue;
+    }
     const highLowPhaseCapOverride = Boolean(allowance.highLowMismatch && allowance.allowed);
     const marketBasketPhaseCapOverride = Boolean(marketBasketProjection?.phaseMaxOverrideAllowed);
     const currentMatchedEffectivePair =
@@ -393,6 +400,19 @@ function chooseCompletion(
       oldGap,
       newGap: projectedGap,
     });
+    const earlyTemporalCompletionWait =
+      config.botMode === "XUAN" &&
+      config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
+      !exactCompletionQtyPrior &&
+      !allowance.highLowMismatch &&
+      partialAgeSec < config.xuanTemporalCompletionMinAgeSec &&
+      ctx.secsToClose > config.finalWindowCompletionOnlySec &&
+      costWithFees > config.xuanTemporalCompletionEarlyMaxEffectivePair + 1e-9 &&
+      !marketBasketProjection?.phaseMaxOverrideAllowed &&
+      !campaignResidualFallback.allowed;
+    if (earlyTemporalCompletionWait) {
+      continue;
+    }
     const campaignPhaseCapOverride = campaignResidualFallback.allowed;
     if (
       costWithFees > phase.cap &&

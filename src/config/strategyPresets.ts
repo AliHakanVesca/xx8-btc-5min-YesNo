@@ -89,6 +89,16 @@ export interface XuanStrategyConfig {
   initialBasketHardDebtNoPlanMaxQty: number;
   initialNoRecoveryProbeMode: "SAFE" | "XUAN_FOOTPRINT";
   initialNoRecoveryProbePct: number;
+  campaignLaunchStrongEffectiveCap: number;
+  campaignLaunchRecoverableEffectiveCap: number;
+  campaignLaunchApproachingEffectiveCap: number;
+  campaignLaunchDiagnosticQty: number;
+  campaignLaunchVwapTiers: number[];
+  campaignLaunchXuanProbeEffectiveCap: number;
+  campaignLaunchXuanProbeMaxAgeSec: number;
+  campaignLaunchXuanProbePct: number;
+  campaignLaunchXuanProbeMaxDebtUsdc: number;
+  campaignLaunchXuanProbeMaxFairValueDrag: number;
   initialBasketMediumTerminalFairValueEdge: number;
   initialBasketStrongTerminalFairValueEdge: number;
   terminalCarryImprovementEnabled: boolean;
@@ -101,6 +111,14 @@ export interface XuanStrategyConfig {
   xuanBasketCampaignAvgImprovementQtyMultiplier: number;
   xuanBasketCampaignDebtReducingQtyMultiplier: number;
   xuanBasketCampaignCompletionClipMaxQty: number;
+  xuanBasketCampaignMinFlows: number;
+  xuanBasketCampaignTargetFlows: number;
+  xuanBasketCampaignFlowShapingEffectiveCap: number;
+  xuanBasketCampaignFlowShapingQtyMultiplier: number;
+  maxFlowShapingAddedDebtUsdc: number;
+  maxFlowShapingClipsPerMarket: number;
+  initialDebtyCampaignMaxHedgeRatio: number;
+  fullRebalanceOnlyIfEffectivePairBelow: number;
   microRepairMaxQty: number;
   campaignMinClipPct: number;
   campaignDefaultClipPct: number;
@@ -474,6 +492,16 @@ export function buildStrategyConfig(env: AppEnv): XuanStrategyConfig {
     initialBasketHardDebtNoPlanMaxQty: env.INITIAL_BASKET_HARD_DEBT_NO_PLAN_MAX_QTY,
     initialNoRecoveryProbeMode: env.INITIAL_NO_RECOVERY_PROBE_MODE,
     initialNoRecoveryProbePct: env.INITIAL_NO_RECOVERY_PROBE_PCT,
+    campaignLaunchStrongEffectiveCap: env.CAMPAIGN_LAUNCH_STRONG_EFFECTIVE_CAP,
+    campaignLaunchRecoverableEffectiveCap: env.CAMPAIGN_LAUNCH_RECOVERABLE_EFFECTIVE_CAP,
+    campaignLaunchApproachingEffectiveCap: env.CAMPAIGN_LAUNCH_APPROACHING_EFFECTIVE_CAP,
+    campaignLaunchDiagnosticQty: env.CAMPAIGN_LAUNCH_DIAGNOSTIC_QTY,
+    campaignLaunchVwapTiers: env.CAMPAIGN_LAUNCH_VWAP_TIERS,
+    campaignLaunchXuanProbeEffectiveCap: env.CAMPAIGN_LAUNCH_XUAN_PROBE_EFFECTIVE_CAP,
+    campaignLaunchXuanProbeMaxAgeSec: env.CAMPAIGN_LAUNCH_XUAN_PROBE_MAX_AGE_SEC,
+    campaignLaunchXuanProbePct: env.CAMPAIGN_LAUNCH_XUAN_PROBE_PCT,
+    campaignLaunchXuanProbeMaxDebtUsdc: env.CAMPAIGN_LAUNCH_XUAN_PROBE_MAX_DEBT_USDC,
+    campaignLaunchXuanProbeMaxFairValueDrag: env.CAMPAIGN_LAUNCH_XUAN_PROBE_MAX_FAIR_VALUE_DRAG,
     initialBasketMediumTerminalFairValueEdge: env.INITIAL_BASKET_MEDIUM_TERMINAL_FAIR_VALUE_EDGE,
     initialBasketStrongTerminalFairValueEdge: env.INITIAL_BASKET_STRONG_TERMINAL_FAIR_VALUE_EDGE,
     terminalCarryImprovementEnabled: env.TERMINAL_CARRY_IMPROVEMENT_ENABLED,
@@ -486,6 +514,14 @@ export function buildStrategyConfig(env: AppEnv): XuanStrategyConfig {
     xuanBasketCampaignAvgImprovementQtyMultiplier: env.XUAN_BASKET_CAMPAIGN_AVG_IMPROVEMENT_QTY_MULTIPLIER,
     xuanBasketCampaignDebtReducingQtyMultiplier: env.XUAN_BASKET_CAMPAIGN_DEBT_REDUCING_QTY_MULTIPLIER,
     xuanBasketCampaignCompletionClipMaxQty: env.XUAN_BASKET_CAMPAIGN_COMPLETION_CLIP_MAX_QTY,
+    xuanBasketCampaignMinFlows: env.XUAN_BASKET_CAMPAIGN_MIN_FLOWS,
+    xuanBasketCampaignTargetFlows: env.XUAN_BASKET_CAMPAIGN_TARGET_FLOWS,
+    xuanBasketCampaignFlowShapingEffectiveCap: env.XUAN_BASKET_CAMPAIGN_FLOW_SHAPING_EFFECTIVE_CAP,
+    xuanBasketCampaignFlowShapingQtyMultiplier: env.XUAN_BASKET_CAMPAIGN_FLOW_SHAPING_QTY_MULTIPLIER,
+    maxFlowShapingAddedDebtUsdc: env.MAX_FLOW_SHAPING_ADDED_DEBT_USDC,
+    maxFlowShapingClipsPerMarket: env.MAX_FLOW_SHAPING_CLIPS_PER_MARKET,
+    initialDebtyCampaignMaxHedgeRatio: env.INITIAL_DEBTY_CAMPAIGN_MAX_HEDGE_RATIO,
+    fullRebalanceOnlyIfEffectivePairBelow: env.FULL_REBALANCE_ONLY_IF_EFFECTIVE_PAIR_BELOW,
     microRepairMaxQty: env.MICRO_REPAIR_MAX_QTY,
     campaignMinClipPct: env.CAMPAIGN_MIN_CLIP_PCT,
     campaignDefaultClipPct: env.CAMPAIGN_DEFAULT_CLIP_PCT,

@@ -18,17 +18,21 @@ import {
   completionQualitySkipReason,
   classifyCompletionReleaseRole,
   type CompletionReleaseRole,
+  type CampaignCompletionSizing,
   deriveFlowPressureBudgetState,
   highSideCompletionQualitySkipReason,
   residualSeverityPressure,
   resolveResidualBehaviorState,
   type FlowPressureBudgetState,
+  type MarketBasketContinuationClass,
+  type MarketBasketClipType,
   type OverlapRepairArbitration,
   marketBasketBootstrapAllowed,
   marketBasketContinuationProjection as projectMarketBasketContinuation,
   pairEntryCap,
   pairSweepAllowance,
   resolvePartialCompletionPhase,
+  resolveCampaignCompletionSizing,
   resolveResidualCompletionDelayProfile,
 } from "./modePolicy.js";
 import { OrderBookState } from "./orderBookState.js";
@@ -101,6 +105,38 @@ export interface BalancedPairCandidateTrace {
   marketBasketDebtDeltaUSDC?: number | undefined;
   marketBasketBootstrap?: boolean | undefined;
   marketBasketContinuation?: boolean | undefined;
+  balancedButDebted?: boolean | undefined;
+  campaignMode?:
+    | "PROBE_OPENED"
+    | "BASKET_CAMPAIGN_ACTIVE"
+    | "ACCUMULATING_CONTINUATION"
+    | "UNBALANCED_CAMPAIGN_RESIDUAL"
+    | "RESIDUAL_COMPLETION_ACTIVE"
+    | undefined;
+  campaignBaseLot?: number | undefined;
+  executedProbeQty?: number | undefined;
+  plannedContinuationQty?: number | undefined;
+  currentBasketEffectiveAvg?: number | undefined;
+  deltaAverageCost?: number | undefined;
+  deltaAbsoluteDebt?: number | undefined;
+  deltaTerminalEV?: number | undefined;
+  residualCompletionFairValueFallback?: boolean | undefined;
+  residualCompletionFallbackReason?: string | undefined;
+  candidateEffectivePair?: number | undefined;
+  edgePerPair?: number | undefined;
+  qtyNeededToRepayDebt?: number | undefined;
+  deltaBasketDebt?: number | undefined;
+  continuationRejectedReason?: string | undefined;
+  terminalCarryMode?: boolean | undefined;
+  deltaTerminalMinPnl?: number | undefined;
+  deltaTerminalExpectedPnl?: number | undefined;
+  fairValueEVBefore?: number | undefined;
+  fairValueEVAfter?: number | undefined;
+  addedDebtUSDC?: number | undefined;
+  continuationClass?: MarketBasketContinuationClass | undefined;
+  campaignClipType?: MarketBasketClipType | undefined;
+  avgImprovingBudgetRemainingUSDC?: number | undefined;
+  avgImprovingClipBudgetRemaining?: number | undefined;
   cycleSkippedReason?: string | undefined;
   xuanBorderlinePhase?: XuanBorderlineEntryPhase | undefined;
   fairValueFallbackReason?: string | undefined;
@@ -153,6 +189,11 @@ export interface SingleLegSeedCandidateTrace {
   marketBasketDebtBeforeUSDC?: number | undefined;
   marketBasketDebtAfterUSDC?: number | undefined;
   marketBasketDebtDeltaUSDC?: number | undefined;
+  continuationClass?: MarketBasketContinuationClass | undefined;
+  campaignClipType?: MarketBasketClipType | undefined;
+  avgImprovingBudgetRemainingUSDC?: number | undefined;
+  avgImprovingClipBudgetRemaining?: number | undefined;
+  addedDebtUSDC?: number | undefined;
   cycleSkippedReason?: string | undefined;
   xuanBorderlinePhase?: XuanBorderlineEntryPhase | undefined;
   fairValueFallbackReason?: string | undefined;
@@ -197,6 +238,42 @@ export interface EntryDecisionTrace {
   marketBasketEffectiveAvg?: number;
   marketBasketDebtUSDC?: number;
   marketBasketNeedsContinuation?: boolean;
+  balancedButDebted?: boolean;
+  campaignMode?:
+    | "PROBE_OPENED"
+    | "BASKET_CAMPAIGN_ACTIVE"
+    | "ACCUMULATING_CONTINUATION"
+    | "UNBALANCED_CAMPAIGN_RESIDUAL"
+    | "RESIDUAL_COMPLETION_ACTIVE";
+  campaignBaseLot?: number;
+  executedProbeQty?: number;
+  plannedContinuationQty?: number;
+  currentBasketEffectiveAvg?: number;
+  deltaAverageCost?: number;
+  deltaAbsoluteDebt?: number;
+  deltaTerminalEV?: number;
+  residualCompletionFairValueFallback?: boolean;
+  residualCompletionFallbackReason?: string;
+  candidateEffectivePair?: number;
+  edgePerPair?: number;
+  qtyNeededToRepayDebt?: number;
+  deltaBasketDebt?: number;
+  continuationRejectedReason?: string;
+  terminalCarryMode?: boolean;
+  deltaTerminalMinPnl?: number;
+  deltaTerminalExpectedPnl?: number;
+  fairValueEVBefore?: number;
+  fairValueEVAfter?: number;
+  addedDebtUSDC?: number;
+  continuationClass?: MarketBasketContinuationClass;
+  avgImprovingBudgetRemainingUSDC?: number;
+  avgImprovingClipBudgetRemaining?: number;
+  initialBasketRecoveryPlan?: "none" | "weak" | "medium" | "strong";
+  initialBasketRecoveryScore?: number;
+  initialBasketEffectivePair?: number;
+  initialBasketDebtUSDC?: number;
+  initialBasketQtyCap?: number;
+  initialBasketRecoveryReason?: string;
   terminalPnlIfUp?: number;
   terminalPnlIfDown?: number;
   stateBefore?: InventoryTraceState;
@@ -204,6 +281,7 @@ export interface EntryDecisionTrace {
   cycleQualityLabel?: CycleQualityLabel;
   cycleOpenedReason?: EntryBuyReason | "controlled_overlap_pair" | "protected_residual_overlap_seed";
   cycleSkippedReason?: string;
+  fairValueFallbackReason?: string;
   stagedEntry?: boolean;
   plannedOppositeSide?: OutcomeSide;
   plannedOppositeQty?: number;
@@ -229,6 +307,10 @@ export interface EntryDecisionTrace {
   repairOppositeAveragePrice?: number;
   repairHighLowMismatch?: boolean;
   repairSizingMode?: "standard" | "micro_fallback" | undefined;
+  campaignClipType?: MarketBasketClipType | undefined;
+  campaignMinClipQty?: number | undefined;
+  campaignDefaultClipQty?: number | undefined;
+  microRepairMaxQty?: number | undefined;
   completionReleaseRole?: CompletionReleaseRole | undefined;
   completionCalibrationPatienceMultiplier?: number | undefined;
   completionRolePatienceMultiplier?: number | undefined;
@@ -307,6 +389,37 @@ interface BalancedPairCandidate {
   marketBasketDebtDeltaUSDC?: number | undefined;
   marketBasketBootstrap?: boolean | undefined;
   marketBasketContinuation?: boolean | undefined;
+  fairValueFallbackReason?: string | undefined;
+  balancedButDebted?: boolean | undefined;
+  campaignMode?:
+    | "PROBE_OPENED"
+    | "BASKET_CAMPAIGN_ACTIVE"
+    | "ACCUMULATING_CONTINUATION"
+    | "UNBALANCED_CAMPAIGN_RESIDUAL"
+    | "RESIDUAL_COMPLETION_ACTIVE"
+    | undefined;
+  campaignBaseLot?: number | undefined;
+  executedProbeQty?: number | undefined;
+  plannedContinuationQty?: number | undefined;
+  currentBasketEffectiveAvg?: number | undefined;
+  deltaAverageCost?: number | undefined;
+  deltaAbsoluteDebt?: number | undefined;
+  deltaTerminalEV?: number | undefined;
+  candidateEffectivePair?: number | undefined;
+  edgePerPair?: number | undefined;
+  qtyNeededToRepayDebt?: number | undefined;
+  deltaBasketDebt?: number | undefined;
+  continuationRejectedReason?: string | undefined;
+  terminalCarryMode?: boolean | undefined;
+  deltaTerminalMinPnl?: number | undefined;
+  deltaTerminalExpectedPnl?: number | undefined;
+  fairValueEVBefore?: number | undefined;
+  fairValueEVAfter?: number | undefined;
+  addedDebtUSDC?: number | undefined;
+  continuationClass?: MarketBasketContinuationClass | undefined;
+  campaignClipType?: MarketBasketClipType | undefined;
+  avgImprovingBudgetRemainingUSDC?: number | undefined;
+  avgImprovingClipBudgetRemaining?: number | undefined;
   feeUSDC: number;
   expectedNetIfMerged: number;
   cycleQualityLabel: CycleQualityLabel;
@@ -750,6 +863,9 @@ interface MarketBasketStateTrace {
   terminalPnlIfUp: number;
   terminalPnlIfDown: number;
   needsContinuation: boolean;
+  balancedButDebted: boolean;
+  campaignActive: boolean;
+  campaignMode?: "BASKET_CAMPAIGN_ACTIVE";
 }
 
 function effectiveInventoryCost(state: XuanMarketState, side: OutcomeSide, feeRate: number): number {
@@ -772,6 +888,20 @@ function marketBasketStateTrace(config: XuanStrategyConfig, state: XuanMarketSta
   const upEffectiveCost = effectiveInventoryCost(state, "UP", config.cryptoTakerFeeRate);
   const downEffectiveCost = effectiveInventoryCost(state, "DOWN", config.cryptoTakerFeeRate);
   const totalEffectiveCost = upEffectiveCost + downEffectiveCost;
+  const basketDebtUSDC = Math.max(0, basketEffectiveAvg - 1) * mergeableQty;
+  const balancedButDebted =
+    config.balancedDebtContinuationEnabled &&
+    config.marketBasketContinuationEnabled &&
+    mergeableQty >= config.marketBasketContinuationMinMatchedShares - 1e-9 &&
+    residualQty <= Math.max(config.postMergeFlatDustShares, 1e-6) + 1e-9 &&
+    basketDebtUSDC > config.marketBasketMinDebtUsdc + 1e-9;
+  const campaignActive =
+    config.xuanBasketCampaignEnabled &&
+    config.marketBasketContinuationEnabled &&
+    mergeableQty >= config.xuanBasketCampaignMinMatchedShares - 1e-9 &&
+    residualQty <= Math.max(config.postMergeFlatDustShares, 1e-6) + 1e-9 &&
+    basketDebtUSDC > config.marketBasketMinDebtUsdc + 1e-9 &&
+    basketEffectiveAvg > config.marketBasketGoodAvgCap + 1e-9;
   return {
     totalUp: normalizeTraceNumber(state.upShares),
     totalDown: normalizeTraceNumber(state.downShares),
@@ -779,10 +909,16 @@ function marketBasketStateTrace(config: XuanStrategyConfig, state: XuanMarketSta
     residualSide,
     residualQty: normalizeTraceNumber(residualQty),
     basketEffectiveAvg: normalizeTraceNumber(basketEffectiveAvg),
-    basketDebtUSDC: normalizeTraceNumber(Math.max(0, basketEffectiveAvg - 1) * mergeableQty),
+    basketDebtUSDC: normalizeTraceNumber(basketDebtUSDC),
     terminalPnlIfUp: normalizeTraceNumber(state.upShares - totalEffectiveCost),
     terminalPnlIfDown: normalizeTraceNumber(state.downShares - totalEffectiveCost),
-    needsContinuation: mergeableQty > 1e-6 && basketEffectiveAvg > config.marketBasketGoodAvgCap + 1e-9,
+    needsContinuation:
+      balancedButDebted ||
+      campaignActive ||
+      (mergeableQty > 1e-6 && basketEffectiveAvg > config.marketBasketGoodAvgCap + 1e-9),
+    balancedButDebted,
+    campaignActive,
+    ...(campaignActive ? { campaignMode: "BASKET_CAMPAIGN_ACTIVE" } : {}),
   };
 }
 
@@ -800,9 +936,78 @@ function basketTraceFields(config: XuanStrategyConfig, state: XuanMarketState): 
     marketBasketEffectiveAvg: basket.basketEffectiveAvg,
     marketBasketDebtUSDC: basket.basketDebtUSDC,
     marketBasketNeedsContinuation: basket.needsContinuation,
+    balancedButDebted: basket.balancedButDebted,
+    ...(basket.campaignMode
+      ? {
+          campaignMode: basket.campaignMode,
+          campaignBaseLot: config.liveSmallLotLadder[0] ?? config.defaultLot,
+        }
+      : {}),
     terminalPnlIfUp: basket.terminalPnlIfUp,
     terminalPnlIfDown: basket.terminalPnlIfDown,
   };
+}
+
+function isUnbalancedCampaignResidual(
+  config: XuanStrategyConfig,
+  state: XuanMarketState,
+  shareGap: number,
+): boolean {
+  if (
+    !config.xuanBasketCampaignEnabled ||
+    !config.marketBasketContinuationEnabled ||
+    config.xuanCloneMode !== "PUBLIC_FOOTPRINT" ||
+    shareGap <= Math.max(config.repairMinQty, config.completionMinQty) + 1e-9
+  ) {
+    return false;
+  }
+  const matchedQty = mergeableShares(state);
+  if (matchedQty < config.xuanBasketCampaignMinMatchedShares - 1e-9) {
+    return false;
+  }
+  return state.fillHistory.some(
+    (fill) =>
+      fill.side === "BUY" &&
+      (
+        fill.executionMode === "TEMPORAL_SINGLE_LEG_SEED" ||
+        fill.executionMode === "PAIRGROUP_COVERED_SEED" ||
+        fill.executionMode === "XUAN_HARD_PAIR_SWEEP" ||
+        fill.executionMode === "XUAN_SOFT_PAIR_SWEEP" ||
+        fill.executionMode === "STRICT_PAIR_SWEEP"
+      ),
+  );
+}
+
+function residualCompletionFairValueFallback(args: {
+  config: XuanStrategyConfig;
+  state: XuanMarketState;
+  unbalancedCampaignResidual: boolean;
+  repairCost: number;
+  currentMatchedEffectivePair: number;
+  executableSize: number;
+  oldGap: number;
+  newGap: number;
+}): { allowed: boolean; reason?: string | undefined } {
+  if (
+    !args.config.allowResidualCompletionWithoutFairValue ||
+    !args.unbalancedCampaignResidual ||
+    args.executableSize <= 0 ||
+    args.executableSize > args.oldGap + 1e-9 ||
+    args.newGap >= args.oldGap - 1e-9
+  ) {
+    return { allowed: false };
+  }
+  if (args.repairCost <= args.config.residualCompletionCostBasisCap + 1e-9) {
+    return { allowed: true, reason: "residual_cost_basis_cap" };
+  }
+  if (
+    Number.isFinite(args.currentMatchedEffectivePair) &&
+    args.repairCost <= args.config.softResidualCompletionCap + 1e-9 &&
+    args.repairCost < args.currentMatchedEffectivePair - args.config.residualCompletionImprovementThreshold + 1e-9
+  ) {
+    return { allowed: true, reason: "residual_average_improvement" };
+  }
+  return { allowed: false };
 }
 
 function marketBasketProjection(
@@ -843,6 +1048,121 @@ function marketBasketProjection(
     debtAfterUSDC: normalizeTraceNumber(debtAfterUSDC),
     debtDeltaUSDC: normalizeTraceNumber(debtBeforeUSDC - debtAfterUSDC),
   };
+}
+
+interface TerminalCarryProjection {
+  terminalMinPnlBefore: number;
+  terminalMinPnlAfter: number;
+  deltaTerminalMinPnl: number;
+  fairValueEVBefore?: number | undefined;
+  fairValueEVAfter?: number | undefined;
+  deltaTerminalExpectedPnl?: number | undefined;
+  addedDebtUSDC: number;
+  allowed: boolean;
+}
+
+function terminalCarryProjectionForPair(args: {
+  config: XuanStrategyConfig;
+  state: XuanMarketState;
+  fairValueSnapshot?: FairValueSnapshot | undefined;
+  upQty: number;
+  downQty: number;
+  upPrice: number;
+  downPrice: number;
+  effectivePair: number;
+}): TerminalCarryProjection {
+  const beforeUpCost = effectiveInventoryCost(args.state, "UP", args.config.cryptoTakerFeeRate);
+  const beforeDownCost = effectiveInventoryCost(args.state, "DOWN", args.config.cryptoTakerFeeRate);
+  const beforeTotalCost = beforeUpCost + beforeDownCost;
+  const beforeUpShares = args.state.upShares;
+  const beforeDownShares = args.state.downShares;
+  const afterUpShares = beforeUpShares + args.upQty;
+  const afterDownShares = beforeDownShares + args.downQty;
+  const addedUpCost = args.upQty * (args.upPrice + takerFeePerShare(args.upPrice, args.config.cryptoTakerFeeRate));
+  const addedDownCost = args.downQty * (args.downPrice + takerFeePerShare(args.downPrice, args.config.cryptoTakerFeeRate));
+  const afterTotalCost = beforeTotalCost + addedUpCost + addedDownCost;
+  const terminalMinPnlBefore = Math.min(beforeUpShares - beforeTotalCost, beforeDownShares - beforeTotalCost);
+  const terminalMinPnlAfter = Math.min(afterUpShares - afterTotalCost, afterDownShares - afterTotalCost);
+  const fairUp = fairValueForOrphanSide(args.fairValueSnapshot, "UP");
+  const fairDown = fairValueForOrphanSide(args.fairValueSnapshot, "DOWN");
+  const fairValueEVBefore =
+    fairUp !== undefined && fairDown !== undefined
+      ? beforeUpShares * fairUp + beforeDownShares * fairDown - beforeTotalCost
+      : undefined;
+  const fairValueEVAfter =
+    fairUp !== undefined && fairDown !== undefined
+      ? afterUpShares * fairUp + afterDownShares * fairDown - afterTotalCost
+      : undefined;
+  const deltaTerminalExpectedPnl =
+    fairValueEVBefore !== undefined && fairValueEVAfter !== undefined
+      ? fairValueEVAfter - fairValueEVBefore
+      : undefined;
+  const addedDebtUSDC = Math.max(0, args.effectivePair - 1) * Math.max(Math.min(args.upQty, args.downQty), 0);
+  const deltaTerminalMinPnl = terminalMinPnlAfter - terminalMinPnlBefore;
+  const evBeatsAddedDebt =
+    deltaTerminalExpectedPnl !== undefined &&
+    deltaTerminalExpectedPnl >= args.config.terminalCarryMinEvGainUsdc - 1e-9 &&
+    deltaTerminalExpectedPnl > addedDebtUSDC + 1e-9;
+  const minPnlImproves =
+    deltaTerminalMinPnl >= args.config.terminalCarryMinMinPnlImprovementUsdc - 1e-9;
+
+  return {
+    terminalMinPnlBefore: normalizeTraceNumber(terminalMinPnlBefore),
+    terminalMinPnlAfter: normalizeTraceNumber(terminalMinPnlAfter),
+    deltaTerminalMinPnl: normalizeTraceNumber(deltaTerminalMinPnl),
+    ...(fairValueEVBefore !== undefined ? { fairValueEVBefore: normalizeTraceNumber(fairValueEVBefore) } : {}),
+    ...(fairValueEVAfter !== undefined ? { fairValueEVAfter: normalizeTraceNumber(fairValueEVAfter) } : {}),
+    ...(deltaTerminalExpectedPnl !== undefined
+      ? { deltaTerminalExpectedPnl: normalizeTraceNumber(deltaTerminalExpectedPnl) }
+      : {}),
+    addedDebtUSDC: normalizeTraceNumber(addedDebtUSDC),
+    allowed:
+      args.config.terminalCarryImprovementEnabled &&
+      addedDebtUSDC <= args.config.terminalCarryMaxAddedDebtUsdc + 1e-9 &&
+      (evBeatsAddedDebt || minPnlImproves),
+  };
+}
+
+function balancedDebtContinuationQtyCap(
+  config: XuanStrategyConfig,
+  state: XuanMarketState,
+  books: OrderBookState,
+  basketState: MarketBasketStateTrace,
+  maxCandidateSize: number,
+): number | undefined {
+  if (
+    !basketState.balancedButDebted ||
+    maxCandidateSize <= 0 ||
+    basketState.basketDebtUSDC <= config.marketBasketMinDebtUsdc + 1e-9
+  ) {
+    return undefined;
+  }
+
+  const probeSize = normalizeOrderSize(state.market.minOrderSize, state.market.minOrderSize);
+  if (probeSize <= 0) {
+    return undefined;
+  }
+  const upProbe = books.quoteForSize("UP", "ask", probeSize);
+  const downProbe = books.quoteForSize("DOWN", "ask", probeSize);
+  if (!upProbe.fullyFilled || !downProbe.fullyFilled) {
+    return undefined;
+  }
+
+  const probeEffectivePair = pairCostWithBothTaker(
+    upProbe.averagePrice,
+    downProbe.averagePrice,
+    config.cryptoTakerFeeRate,
+  );
+  const edgePerPair = 1 - probeEffectivePair;
+  if (edgePerPair <= 1e-9) {
+    return undefined;
+  }
+
+  const qtyNeeded = basketState.basketDebtUSDC / edgePerPair;
+  return normalizeOrderSize(
+    Math.min(maxCandidateSize, config.marketBasketContinuationMaxQty, qtyNeeded),
+    state.market.minOrderSize,
+  );
 }
 
 function shouldBlockLowSideUnpairedBasketDebtSeed(args: {
@@ -914,6 +1234,9 @@ function marketBasketContinuationAllowed(
       costWithFees: effectivePair,
       candidateSize: candidateContext.requestedSize,
       secsToClose: candidateContext.ctx.secsToClose,
+      ...(candidateContext.highSidePrice !== undefined && candidateContext.lowSidePrice !== undefined
+        ? { priceSpread: Math.abs(candidateContext.highSidePrice - candidateContext.lowSidePrice) }
+        : {}),
     })?.allowed,
   );
 }
@@ -958,6 +1281,46 @@ function basketTraceFromCandidate(candidate: BalancedPairCandidate): Partial<Ent
       : {}),
     ...(candidate.marketBasketBootstrap ? { marketBasketBootstrap: true } : {}),
     ...(candidate.marketBasketContinuation ? { marketBasketContinuation: true } : {}),
+    ...(candidate.fairValueFallbackReason ? { fairValueFallbackReason: candidate.fairValueFallbackReason } : {}),
+    ...(candidate.balancedButDebted ? { balancedButDebted: true } : {}),
+    ...(candidate.campaignMode ? { campaignMode: candidate.campaignMode } : {}),
+    ...(candidate.campaignBaseLot !== undefined ? { campaignBaseLot: candidate.campaignBaseLot } : {}),
+    ...(candidate.executedProbeQty !== undefined ? { executedProbeQty: candidate.executedProbeQty } : {}),
+    ...(candidate.plannedContinuationQty !== undefined
+      ? { plannedContinuationQty: candidate.plannedContinuationQty }
+      : {}),
+    ...(candidate.currentBasketEffectiveAvg !== undefined
+      ? { currentBasketEffectiveAvg: candidate.currentBasketEffectiveAvg }
+      : {}),
+    ...(candidate.deltaAverageCost !== undefined ? { deltaAverageCost: candidate.deltaAverageCost } : {}),
+    ...(candidate.deltaAbsoluteDebt !== undefined ? { deltaAbsoluteDebt: candidate.deltaAbsoluteDebt } : {}),
+    ...(candidate.deltaTerminalEV !== undefined ? { deltaTerminalEV: candidate.deltaTerminalEV } : {}),
+    ...(candidate.candidateEffectivePair !== undefined ? { candidateEffectivePair: candidate.candidateEffectivePair } : {}),
+    ...(candidate.edgePerPair !== undefined ? { edgePerPair: candidate.edgePerPair } : {}),
+    ...(candidate.qtyNeededToRepayDebt !== undefined
+      ? { qtyNeededToRepayDebt: candidate.qtyNeededToRepayDebt }
+      : {}),
+    ...(candidate.deltaBasketDebt !== undefined ? { deltaBasketDebt: candidate.deltaBasketDebt } : {}),
+    ...(candidate.continuationRejectedReason
+      ? { continuationRejectedReason: candidate.continuationRejectedReason }
+      : {}),
+    ...(candidate.terminalCarryMode ? { terminalCarryMode: true } : {}),
+    ...(candidate.deltaTerminalMinPnl !== undefined ? { deltaTerminalMinPnl: candidate.deltaTerminalMinPnl } : {}),
+    ...(candidate.deltaTerminalExpectedPnl !== undefined
+      ? { deltaTerminalExpectedPnl: candidate.deltaTerminalExpectedPnl }
+      : {}),
+    ...(candidate.fairValueEVBefore !== undefined ? { fairValueEVBefore: candidate.fairValueEVBefore } : {}),
+    ...(candidate.fairValueEVAfter !== undefined ? { fairValueEVAfter: candidate.fairValueEVAfter } : {}),
+    ...(candidate.addedDebtUSDC !== undefined ? { addedDebtUSDC: candidate.addedDebtUSDC } : {}),
+    ...(candidate.continuationClass !== undefined ? { continuationClass: candidate.continuationClass } : {}),
+    ...(candidate.campaignClipType !== undefined ? { campaignClipType: candidate.campaignClipType } : {}),
+    ...(candidate.avgImprovingBudgetRemainingUSDC !== undefined
+      ? { avgImprovingBudgetRemainingUSDC: candidate.avgImprovingBudgetRemainingUSDC }
+      : {}),
+    ...(candidate.avgImprovingClipBudgetRemaining !== undefined
+      ? { avgImprovingClipBudgetRemaining: candidate.avgImprovingClipBudgetRemaining }
+      : {}),
+    ...(candidate.addedDebtUSDC !== undefined ? { addedDebtUSDC: candidate.addedDebtUSDC } : {}),
   };
 }
 
@@ -983,6 +1346,14 @@ function basketTraceFromSeedCandidate(candidate: SingleLegSeedCandidateTrace | u
       : {}),
     ...(candidate.marketBasketDebtDeltaUSDC !== undefined
       ? { marketBasketDebtDeltaUSDC: candidate.marketBasketDebtDeltaUSDC }
+      : {}),
+    ...(candidate.continuationClass !== undefined ? { continuationClass: candidate.continuationClass } : {}),
+    ...(candidate.campaignClipType !== undefined ? { campaignClipType: candidate.campaignClipType } : {}),
+    ...(candidate.avgImprovingBudgetRemainingUSDC !== undefined
+      ? { avgImprovingBudgetRemainingUSDC: candidate.avgImprovingBudgetRemainingUSDC }
+      : {}),
+    ...(candidate.avgImprovingClipBudgetRemaining !== undefined
+      ? { avgImprovingClipBudgetRemaining: candidate.avgImprovingClipBudgetRemaining }
       : {}),
   };
 }
@@ -1108,28 +1479,147 @@ function freshCycleRequestedLotCap(
   return Math.max(0, Math.min(requestedLot, cap));
 }
 
+interface InitialBasketRecoveryPlan {
+  strength: "none" | "weak" | "medium" | "strong";
+  score: number;
+  initialEffectivePair: number;
+  initialDebtUSDC: number;
+  qtyCap: number;
+  reason: string;
+}
+
+function initialBasketRecoveryPlanForBooks(args: {
+  config: XuanStrategyConfig;
+  state: XuanMarketState;
+  books: OrderBookState;
+  ctx: EntryLadderContext;
+  requestedLot: number;
+  rawPair: number;
+  effectivePair: number;
+  upPrice: number;
+  downPrice: number;
+}): InitialBasketRecoveryPlan {
+  const noCap = normalizeOrderSize(args.requestedLot, args.state.market.minOrderSize);
+  const initialDebtUSDC = Math.max(0, args.effectivePair - 1) * Math.max(args.requestedLot, 0);
+  if (
+    !args.config.initialBasketRecoveryPlanEnabled ||
+    args.state.upShares + args.state.downShares > Math.max(args.config.postMergeFlatDustShares, 1e-6) ||
+    args.effectivePair <= args.config.initialBasketDebtSoftEffectiveCap + 1e-9
+  ) {
+    return {
+      strength: "strong",
+      score: normalizeTraceNumber(Math.max(0, 1 - args.effectivePair)),
+      initialEffectivePair: normalizeTraceNumber(args.effectivePair),
+      initialDebtUSDC: normalizeTraceNumber(initialDebtUSDC),
+      qtyCap: noCap,
+      reason: "initial_basket_soft_or_disabled",
+    };
+  }
+
+  const highSidePrice = Math.max(args.upPrice, args.downPrice);
+  const lowSidePrice = Math.min(args.upPrice, args.downPrice);
+  const spread = highSidePrice - lowSidePrice;
+  const visibleDebtReducer =
+    args.effectivePair <= args.config.marketBasketGoodAvgCap + 1e-9 ||
+    (spread >= args.config.openingFollowupMinSpread - 1e-9 &&
+      highSidePrice >= args.config.openingFollowupHighSideMinPrice - 1e-9 &&
+      args.effectivePair <= args.config.openingFollowupMaxEffectivePair + 1e-9);
+  const upFair = fairValueForOrphanSide(args.ctx.fairValueSnapshot, "UP");
+  const downFair = fairValueForOrphanSide(args.ctx.fairValueSnapshot, "DOWN");
+  const upEffective = args.upPrice + takerFeePerShare(args.upPrice, args.config.cryptoTakerFeeRate);
+  const downEffective = args.downPrice + takerFeePerShare(args.downPrice, args.config.cryptoTakerFeeRate);
+  const bestTerminalFairEdge = Math.max(
+    upFair !== undefined ? upFair - upEffective : Number.NEGATIVE_INFINITY,
+    downFair !== undefined ? downFair - downEffective : Number.NEGATIVE_INFINITY,
+  );
+  const terminalPairProjection = terminalCarryProjectionForPair({
+    config: args.config,
+    state: args.state,
+    fairValueSnapshot: args.ctx.fairValueSnapshot,
+    upQty: args.requestedLot,
+    downQty: args.requestedLot,
+    upPrice: args.upPrice,
+    downPrice: args.downPrice,
+    effectivePair: args.effectivePair,
+  });
+  const strongTerminalEdge =
+    bestTerminalFairEdge >= args.config.initialBasketStrongTerminalFairValueEdge - 1e-9 ||
+    terminalPairProjection.allowed;
+  const mediumTerminalEdge =
+    bestTerminalFairEdge >= args.config.initialBasketMediumTerminalFairValueEdge - 1e-9 ||
+    (terminalPairProjection.deltaTerminalExpectedPnl ?? 0) >= args.config.terminalCarryMinEvGainUsdc - 1e-9;
+
+  let strength: InitialBasketRecoveryPlan["strength"] = "none";
+  let reason = "no_visible_recovery_plan";
+  if (visibleDebtReducer || strongTerminalEdge) {
+    strength = "strong";
+    reason = visibleDebtReducer ? "visible_debt_reducer" : "strong_terminal_fair_value_edge";
+  } else if (mediumTerminalEdge) {
+    strength = "medium";
+    reason = "medium_terminal_fair_value_edge";
+  } else if (args.effectivePair <= args.config.initialBasketDebtHardEffectiveCap + 1e-9) {
+    strength = "weak";
+    reason = "soft_debt_without_recovery_plan";
+  }
+
+  const score = normalizeTraceNumber(
+    (visibleDebtReducer ? 1 : 0) +
+      Math.max(0, Number.isFinite(bestTerminalFairEdge) ? bestTerminalFairEdge : 0) * 10 +
+      Math.max(0, terminalPairProjection.deltaTerminalExpectedPnl ?? 0) / Math.max(args.requestedLot, 1),
+  );
+  const noRecoveryProbeQty =
+    args.config.initialNoRecoveryProbeMode === "XUAN_FOOTPRINT"
+      ? normalizeOrderSize(args.requestedLot * args.config.initialNoRecoveryProbePct, args.state.market.minOrderSize)
+      : normalizeOrderSize(
+          Math.min(args.requestedLot, args.config.initialBasketHardDebtNoPlanMaxQty),
+          args.state.market.minOrderSize,
+        );
+  const qtyCap =
+    strength === "strong"
+      ? noCap
+      : strength === "medium"
+        ? normalizeOrderSize(args.requestedLot * args.config.initialBasketMediumRecoveryQtyMultiplier, args.state.market.minOrderSize)
+        : args.effectivePair > args.config.initialBasketDebtHardEffectiveCap + 1e-9
+          ? Math.max(args.state.market.minOrderSize, Math.min(args.requestedLot, noRecoveryProbeQty))
+          : normalizeOrderSize(args.requestedLot * args.config.initialBasketWeakRecoveryQtyMultiplier, args.state.market.minOrderSize);
+
+  return {
+    strength,
+    score,
+    initialEffectivePair: normalizeTraceNumber(args.effectivePair),
+    initialDebtUSDC: normalizeTraceNumber(initialDebtUSDC),
+    qtyCap,
+    reason,
+  };
+}
+
 function freshCycleRequestedLotCapForBooks(
   config: XuanStrategyConfig,
   state: XuanMarketState,
   books: OrderBookState,
-  requestedLot: number,
+  ctx: EntryLadderContext,
   referencePriorActive: boolean,
-): number {
+): { lot: number; recoveryPlan?: InitialBasketRecoveryPlan | undefined } {
+  const requestedLot = ctx.lot;
   const baseCap = freshCycleRequestedLotCap(config, state, requestedLot, referencePriorActive);
   if (!config.marketBasketScoringEnabled || referencePriorActive || baseCap >= requestedLot - 1e-9) {
-    return baseCap;
+    return { lot: baseCap };
+  }
+  const basketState = marketBasketStateTrace(config, state);
+  if (basketState.campaignActive) {
+    return { lot: requestedLot };
   }
   if (
     config.marketBasketContinuationEnabled &&
     mergeableShares(state) >= config.marketBasketContinuationMinMatchedShares - 1e-9
   ) {
-    return requestedLot;
+    return { lot: requestedLot };
   }
   const probeSize = normalizeOrderSize(state.market.minOrderSize, state.market.minOrderSize);
   const upProbe = books.quoteForSize("UP", "ask", probeSize);
   const downProbe = books.quoteForSize("DOWN", "ask", probeSize);
   if (!upProbe.fullyFilled || !downProbe.fullyFilled) {
-    return baseCap;
+    return { lot: baseCap };
   }
   const rawPair = upProbe.averagePrice + downProbe.averagePrice;
   const effectivePair = pairCostWithBothTaker(upProbe.averagePrice, downProbe.averagePrice, config.cryptoTakerFeeRate);
@@ -1138,9 +1628,21 @@ function freshCycleRequestedLotCapForBooks(
     state.upShares + state.downShares <= Math.max(config.postMergeFlatDustShares, 1e-6) &&
     effectivePair <= config.marketBasketBootstrapMaxEffectivePair + 1e-9
   ) {
-    return requestedLot;
+    const recoveryPlan = initialBasketRecoveryPlanForBooks({
+      config,
+      state,
+      books,
+      ctx,
+      requestedLot,
+      rawPair,
+      effectivePair,
+      upPrice: upProbe.averagePrice,
+      downPrice: downProbe.averagePrice,
+    });
+    return { lot: Math.min(requestedLot, recoveryPlan.qtyCap), recoveryPlan };
   }
-  return isStrongMarketBasketPair(config, rawPair, effectivePair) ? requestedLot : baseCap;
+  const lot = isStrongMarketBasketPair(config, rawPair, effectivePair) ? requestedLot : baseCap;
+  return { lot };
 }
 
 function newCyclePacingSkipReason(
@@ -1157,23 +1659,38 @@ function newCyclePacingSkipReason(
   if (protectedResidualShares > Math.max(config.repairMinQty, config.completionMinQty)) {
     return undefined;
   }
+  const nowTs = state.market.startTs + ctx.secsFromOpen;
+  const matchedQty = mergeableShares(state);
+  const currentBasketEffectivePair = matchedEffectivePairCost(state, config.cryptoTakerFeeRate);
+  const basketState = marketBasketStateTrace(config, state);
+  const basketContinuationReady =
+    config.marketBasketContinuationEnabled &&
+    basketState.needsContinuation &&
+    (matchedQty >= config.marketBasketContinuationMinMatchedShares - 1e-9 || basketState.campaignActive) &&
+    Number.isFinite(currentBasketEffectivePair) &&
+    (basketState.balancedButDebted
+      ? ctx.secsToClose > config.finalWindowCompletionOnlySec
+      : basketState.campaignActive
+        ? ctx.secsToClose > config.finalWindowCompletionOnlySec
+      : ctx.secsToClose > config.xuanMinTimeLeftForHardSweep);
+  if (
+    config.forbidFlatBadCycleSpam &&
+    config.badCycleMode === "COMPLETION_ONLY" &&
+    stats.recentBadCycleCount >= config.maxConsecutiveBadCycles &&
+    stats.lastBadCycle &&
+    nowTs - stats.lastBadCycle.closedAt <= config.badCycleCooldownSec
+  ) {
+    return "bad_cycle_completion_only";
+  }
+  if (basketContinuationReady) {
+    return undefined;
+  }
   if (
     !referencePriorActive &&
     config.freshSeedHardCutoffSec > 0 &&
     ctx.secsFromOpen > config.freshSeedHardCutoffSec + 1e-9
   ) {
     return "late_fresh_seed_cutoff";
-  }
-  const nowTs = state.market.startTs + ctx.secsFromOpen;
-  const matchedQty = mergeableShares(state);
-  const currentBasketEffectivePair = matchedEffectivePairCost(state, config.cryptoTakerFeeRate);
-  const basketContinuationReady =
-    config.marketBasketContinuationEnabled &&
-    matchedQty >= config.marketBasketContinuationMinMatchedShares - 1e-9 &&
-    Number.isFinite(currentBasketEffectivePair) &&
-    ctx.secsToClose > config.xuanMinTimeLeftForHardSweep;
-  if (basketContinuationReady) {
-    return undefined;
   }
   if (
     config.requireReevaluationAfterEachCycle &&
@@ -1187,15 +1704,6 @@ function newCyclePacingSkipReason(
     stats.closedCycles.filter((cycle) => nowTs - cycle.closedAt <= 30).length >= config.maxNewCyclesPer30Sec
   ) {
     return "new_cycle_30s_cap";
-  }
-  if (
-    config.forbidFlatBadCycleSpam &&
-    config.badCycleMode === "COMPLETION_ONLY" &&
-    stats.recentBadCycleCount >= config.maxConsecutiveBadCycles &&
-    stats.lastBadCycle &&
-    nowTs - stats.lastBadCycle.closedAt <= config.badCycleCooldownSec
-  ) {
-    return "bad_cycle_completion_only";
   }
   return shouldThrottleNewCycleDensity(config, state, ctx);
 }
@@ -1275,6 +1783,8 @@ export function evaluateEntryBuys(
     });
   const freshCycleStats = buildFreshCycleStats(config, state);
   const referencePriorActive = referenceFreshCyclePriorActive(config, state, ctx);
+  const currentBasketState = marketBasketStateTrace(config, state);
+  const useBalancedPairPath = shareGap === 0 || currentBasketState.balancedButDebted;
 
   if (!config.entryTakerBuyEnabled) {
     return {
@@ -1294,7 +1804,7 @@ export function evaluateEntryBuys(
     };
   }
 
-  if (shareGap === 0) {
+  if (useBalancedPairPath) {
     const cycleDensitySkipReason = newCyclePacingSkipReason(
       config,
       state,
@@ -1322,7 +1832,8 @@ export function evaluateEntryBuys(
         },
       };
     }
-    const freshRequestedLot = freshCycleRequestedLotCapForBooks(config, state, books, ctx.lot, referencePriorActive);
+    const freshLotResolution = freshCycleRequestedLotCapForBooks(config, state, books, ctx, referencePriorActive);
+    const freshRequestedLot = freshLotResolution.lot;
     const freshCtx: EntryLadderContext = { ...ctx, lot: freshRequestedLot };
     const inspected = inspectBalancedPairCandidates(
       config,
@@ -1347,6 +1858,23 @@ export function evaluateEntryBuys(
       shareGap,
       pairCap,
       freshCycleRequestedLotCap: freshRequestedLot,
+      ...(freshLotResolution.recoveryPlan
+        ? {
+            initialBasketRecoveryPlan: freshLotResolution.recoveryPlan.strength,
+            initialBasketRecoveryScore: freshLotResolution.recoveryPlan.score,
+            initialBasketEffectivePair: freshLotResolution.recoveryPlan.initialEffectivePair,
+            initialBasketDebtUSDC: freshLotResolution.recoveryPlan.initialDebtUSDC,
+            initialBasketQtyCap: freshLotResolution.recoveryPlan.qtyCap,
+            initialBasketRecoveryReason: freshLotResolution.recoveryPlan.reason,
+            ...(freshRequestedLot < ctx.lot - 1e-9
+              ? {
+                  campaignMode: "PROBE_OPENED" as const,
+                  campaignBaseLot: ctx.lot,
+                  executedProbeQty: freshRequestedLot,
+                }
+              : {}),
+          }
+        : {}),
       stateBefore: inventoryTraceState(state),
       ...basketTraceFields(config, state),
       recentBadCycleCount: freshCycleStats.recentBadCycleCount,
@@ -1538,7 +2066,22 @@ export function evaluateEntryBuys(
       };
     }
 
+    const marketBasketContinuationCycleSkippedReason =
+      [...seedEvaluation.trace, ...temporalSeedEvaluation.trace, ...inspected.traces].find((trace) => {
+        const reason = trace.cycleSkippedReason;
+        return (
+          reason === "avg_improving_pair_too_expensive" ||
+          reason === "avg_improving_spread_too_small" ||
+          reason === "avg_improving_clip_budget_exhausted" ||
+          reason === "avg_improving_budget_exhausted" ||
+          reason === "avg_improving_qty_cap" ||
+          reason === "debt_reducing_qty_cap" ||
+          reason === "continuation_not_debt_reducing_or_avg_improving" ||
+          reason === "market_basket_continuation_rejected"
+        );
+      })?.cycleSkippedReason;
     const cycleSkippedReason =
+      marketBasketContinuationCycleSkippedReason ??
       seedEvaluation.trace.find((seedTrace) => seedTrace.cycleSkippedReason === "low_side_unpaired_basket_debt")
         ?.cycleSkippedReason ??
       temporalSeedEvaluation.trace.find((seedTrace) => seedTrace.cycleSkippedReason)?.cycleSkippedReason ??
@@ -1750,6 +2293,11 @@ export function evaluateEntryBuys(
     Math.min(repairRequestedQty, repairEffectiveQtyCap),
     config.repairMinQty,
   );
+  const unbalancedCampaignResidual = isUnbalancedCampaignResidual(config, state, shareGap);
+  const campaignCompletionSizing =
+    unbalancedCampaignResidual && !exactCompletionQtyPrior
+      ? resolveCampaignCompletionSizing(config, shareGap)
+      : undefined;
   const trace: EntryDecisionTrace = {
     mode: "lagging_rebalance",
     requestedLot: ctx.lot,
@@ -1765,6 +2313,21 @@ export function evaluateEntryBuys(
     repairSize,
     repairRequestedQty,
     repairMissingQty: shareGap,
+    ...(campaignCompletionSizing
+      ? {
+          campaignClipType: campaignCompletionSizing.clipType,
+          campaignMinClipQty: campaignCompletionSizing.minCampaignClipQty,
+          campaignDefaultClipQty: campaignCompletionSizing.defaultCampaignClipQty,
+          microRepairMaxQty: config.microRepairMaxQty,
+        }
+      : {}),
+    ...(unbalancedCampaignResidual
+      ? {
+          campaignMode: "UNBALANCED_CAMPAIGN_RESIDUAL",
+          campaignBaseLot: config.liveSmallLotLadder[0] ?? config.defaultLot,
+          marketBasketMergeableQty: normalizeTraceNumber(mergeableShares(state)),
+        }
+      : {}),
   };
 
   const residualJanitorPair = buildResidualJanitorPairEvaluation({
@@ -1875,8 +2438,17 @@ export function evaluateEntryBuys(
       : highLowRepairOvershootQty !== undefined && Number.isFinite(phase.maxQty)
         ? Math.max(phase.maxQty, highLowRepairOvershootQty)
       : phase.maxQty;
+  const campaignPhaseMaxQty =
+    unbalancedCampaignResidual &&
+    ctx.secsToClose > config.finalWindowCompletionOnlySec &&
+    !exactCompletionQtyPrior
+      ? Math.max(
+          Number.isFinite(phaseMaxQty) ? phaseMaxQty : repairSize,
+          campaignCompletionSizing?.targetQty ?? repairSize,
+        )
+      : phaseMaxQty;
   const phasedRepairSize = normalizeOrderSize(
-    Math.min(repairSize, Number.isFinite(phaseMaxQty) ? phaseMaxQty : repairSize),
+    Math.min(repairSize, Number.isFinite(campaignPhaseMaxQty) ? campaignPhaseMaxQty : repairSize),
     config.repairMinQty,
   );
   if (phasedRepairSize <= 0) {
@@ -1909,6 +2481,7 @@ export function evaluateEntryBuys(
     standardSize: effectiveRepairSize,
     shareGap,
     exactPriorActive: Boolean(exactCompletionQtyPrior),
+    campaignCompletionSizing,
   });
   let lastBlockedRepairEvaluation: EntryEvaluation | undefined;
   let bestRepairEvaluation: EntryEvaluation | undefined;
@@ -1974,7 +2547,25 @@ export function evaluateEntryBuys(
       missingSidePrice: execution.averagePrice,
     });
     const highLowPhaseCapOverride = Boolean(allowance.highLowMismatch && allowance.allowed);
-    if ((repairCost > phaseCap && !highLowPhaseCapOverride) || executableSize > phaseMaxQty) {
+    const currentMatchedEffectivePair =
+      mergeableShares(state) > 1e-6
+        ? matchedEffectivePairCost(state, config.cryptoTakerFeeRate)
+        : Number.POSITIVE_INFINITY;
+    const campaignResidualFallback = residualCompletionFairValueFallback({
+      config,
+      state,
+      unbalancedCampaignResidual,
+      repairCost,
+      currentMatchedEffectivePair,
+      executableSize,
+      oldGap,
+      newGap,
+    });
+    const campaignPhaseCapOverride = campaignResidualFallback.allowed;
+    if (
+      (repairCost > phaseCap && !highLowPhaseCapOverride && !campaignPhaseCapOverride) ||
+      executableSize > campaignPhaseMaxQty
+    ) {
       lastBlockedRepairEvaluation = {
       decisions: [],
       trace: {
@@ -1992,7 +2583,7 @@ export function evaluateEntryBuys(
         repairOppositeAveragePrice: oppositeAveragePrice,
         repairHighLowMismatch: allowance.highLowMismatch ?? false,
         completionReleaseRole: blockedCompletionReleaseRole,
-        skipReason: executableSize > phaseMaxQty ? "repair_phase_qty_cap" : "repair_phase_cap",
+        skipReason: executableSize > campaignPhaseMaxQty ? "repair_phase_qty_cap" : "repair_phase_cap",
       },
       };
       continue;
@@ -2004,7 +2595,7 @@ export function evaluateEntryBuys(
       repairCost <= config.temporalRepairUltraFastMissingFairValueCap &&
       allowance.allowed;
     const fairValueRequired =
-      ultraFastCloneFairValueFallback
+      ultraFastCloneFairValueFallback || campaignResidualFallback.allowed
         ? false
         : allowance.highLowMismatch && allowance.allowed && !allowance.requiresFairValue
           ? false
@@ -2012,7 +2603,7 @@ export function evaluateEntryBuys(
               config.allowStrictResidualCompletionWithoutFairValue &&
               repairCost <= config.strictResidualCompletionCap
             ) || Boolean(allowance.requiresFairValue);
-    const fairValueDecision = ultraFastCloneFairValueFallback
+    const fairValueDecision = ultraFastCloneFairValueFallback || campaignResidualFallback.allowed
       ? { allowed: true as const }
       : fairValueGate({
           config,
@@ -2076,7 +2667,7 @@ export function evaluateEntryBuys(
       oppositeAveragePrice,
       missingSidePrice: execution.averagePrice,
       exactPriorActive: Boolean(exactCompletionQtyPrior),
-      exceptionalMode: Boolean(allowance.highLowMismatch) || cheapLateCompletionChase,
+      exceptionalMode: Boolean(allowance.highLowMismatch) || cheapLateCompletionChase || campaignResidualFallback.allowed,
       ...(ctx.recentSeedFlowCount !== undefined ? { recentSeedFlowCount: ctx.recentSeedFlowCount } : {}),
       ...(ctx.activeIndependentFlowCount !== undefined ? { activeIndependentFlowCount: ctx.activeIndependentFlowCount } : {}),
       ...(ctx.completionPatienceMultiplier !== undefined
@@ -2099,6 +2690,16 @@ export function evaluateEntryBuys(
       repairOppositeAveragePrice: oppositeAveragePrice,
       repairHighLowMismatch: allowance.highLowMismatch ?? false,
       completionReleaseRole,
+      ...(campaignResidualFallback.allowed
+        ? {
+            campaignMode: "RESIDUAL_COMPLETION_ACTIVE",
+            residualCompletionFairValueFallback: true,
+            ...(campaignResidualFallback.reason
+              ? { residualCompletionFallbackReason: campaignResidualFallback.reason }
+              : {}),
+            currentBasketEffectiveAvg: normalizeTraceNumber(currentMatchedEffectivePair),
+          }
+        : {}),
       completionCalibrationPatienceMultiplier: completionDelayProfile.calibrationPatienceMultiplier,
       completionRolePatienceMultiplier: completionDelayProfile.rolePatienceMultiplier,
       completionEffectivePatienceMultiplier: completionDelayProfile.effectivePatienceMultiplier,
@@ -2119,7 +2720,7 @@ export function evaluateEntryBuys(
       };
       continue;
     }
-    if (!allowance.allowed || !fairValueDecision.allowed) {
+    if (!allowance.allowed || (!fairValueDecision.allowed && !campaignResidualFallback.allowed)) {
       lastBlockedRepairEvaluation = {
       decisions: [],
       trace: {
@@ -2152,7 +2753,7 @@ export function evaluateEntryBuys(
       };
       continue;
     }
-    if (completionDelayProfile.shouldDelay) {
+    if (completionDelayProfile.shouldDelay && !campaignResidualFallback.allowed) {
       lastBlockedRepairEvaluation = {
       decisions: [],
       trace: {
@@ -2300,6 +2901,7 @@ function buildResidualJanitorPairEvaluation(args: {
     costWithFees: pairCost,
     candidateSize: targetPairQty,
     secsToClose: args.ctx.secsToClose,
+    priceSpread: Math.abs(upExecution.averagePrice - downExecution.averagePrice),
     dailyNegativeEdgeSpentUsdc: args.dailyNegativeEdgeSpentUsdc,
     carryFlowConfidence: args.carryFlowConfidence,
     matchedInventoryQuality: args.matchedInventoryQuality,
@@ -3060,6 +3662,7 @@ function buildResidualRepairCandidateSizes(args: {
   standardSize: number;
   shareGap: number;
   exactPriorActive: boolean;
+  campaignCompletionSizing?: CampaignCompletionSizing | undefined;
 }): number[] {
   if (args.standardSize <= 0) {
     return [];
@@ -3069,7 +3672,12 @@ function buildResidualRepairCandidateSizes(args: {
   }
   const baseLot = args.config.liveSmallLotLadder[0] ?? args.config.defaultLot;
   const microFloor = args.config.repairMinQty;
+  const campaignMinAllowed =
+    args.campaignCompletionSizing?.clipType === "CAMPAIGN_COMPLETION"
+      ? Math.min(args.shareGap, Math.max(args.config.microRepairMaxQty, args.campaignCompletionSizing.minCampaignClipQty))
+      : 0;
   const sizes = [
+    ...(args.campaignCompletionSizing ? [args.campaignCompletionSizing.targetQty] : []),
     args.standardSize,
     args.standardSize * 0.7,
     args.standardSize * 0.5,
@@ -3077,7 +3685,8 @@ function buildResidualRepairCandidateSizes(args: {
     Math.min(args.standardSize, baseLot * 0.5),
   ]
     .map((size) => normalizeOrderSize(size, microFloor))
-    .filter((size) => size > 0);
+    .filter((size) => size > 0)
+    .filter((size) => campaignMinAllowed <= 0 || size + 1e-9 >= campaignMinAllowed);
   return [...new Set(sizes)].sort((left, right) => right - left);
 }
 
@@ -3902,13 +4511,25 @@ function inspectBalancedPairCandidates(
   bestRawPair?: number;
   bestEffectivePair?: number;
 } {
-  const maxCandidateSize = normalizeOrderSize(
+  const basketState = marketBasketStateTrace(config, state);
+  const baseMaxCandidateSize = normalizeOrderSize(
     Math.min(
       requestedMaxLot,
       Math.max(0, config.maxMarketSharesPerSide - state.upShares),
       Math.max(0, config.maxMarketSharesPerSide - state.downShares),
       Math.max(0, config.maxMarketExposureShares - Math.max(state.upShares, state.downShares)),
     ),
+    state.market.minOrderSize,
+  );
+  const balancedDebtQtyCap = balancedDebtContinuationQtyCap(
+    config,
+    state,
+    books,
+    basketState,
+    baseMaxCandidateSize,
+  );
+  const maxCandidateSize = normalizeOrderSize(
+    Math.min(baseMaxCandidateSize, balancedDebtQtyCap ?? baseMaxCandidateSize),
     state.market.minOrderSize,
   );
 
@@ -3936,6 +4557,21 @@ function inspectBalancedPairCandidates(
     );
     const cycleTrace = cycleTraceFromPair(config, rawPairCost, pairCost, requestedSize);
     const basketProjection = marketBasketProjection(config, state, pairCost, requestedSize);
+    const edgePerPair = 1 - pairCost;
+    const terminalCarryProjection = terminalCarryProjectionForPair({
+      config,
+      state,
+      fairValueSnapshot,
+      upQty: requestedSize,
+      downQty: requestedSize,
+      upPrice: upExecution.averagePrice,
+      downPrice: downExecution.averagePrice,
+      effectivePair: pairCost,
+    });
+    const qtyNeededToRepayDebt =
+      basketState.balancedButDebted && edgePerPair > 1e-9
+        ? normalizeTraceNumber(basketState.basketDebtUSDC / edgePerPair)
+        : undefined;
     const freshCycleSkipReason = freshCycleGate
       ? freshCycleCandidateSkipReason(
           config,
@@ -3965,6 +4601,7 @@ function inspectBalancedPairCandidates(
             costWithFees: pairCost,
             candidateSize: requestedSize,
             secsToClose,
+            priceSpread: Math.abs(upExecution.averagePrice - downExecution.averagePrice),
             dailyNegativeEdgeSpentUsdc,
             carryFlowConfidence,
             matchedInventoryQuality,
@@ -3998,6 +4635,26 @@ function inspectBalancedPairCandidates(
         allowance.mode !== "STRICT_PAIR_SWEEP" &&
         config.fairValueFailClosedForNegativePair,
     });
+    const marketBasketFairValueFallbackEligible =
+      allowance?.marketBasketContinuation === true &&
+      upExecution.fullyFilled &&
+      downExecution.fullyFilled &&
+      basketProjection !== undefined &&
+      basketProjection.improvement >= config.marketBasketMinAvgImprovement - 1e-9;
+    const basketContinuationPairOverride =
+      marketBasketFairValueFallbackEligible &&
+      basketProjection !== undefined &&
+      basketProjection.projectedEffectivePair <= config.marketBasketBorderlineAvgCap + 1e-9;
+    const fairValueReasons = [upFairValue.reason, downFairValue.reason].filter((reason): reason is string =>
+      Boolean(reason),
+    );
+    const marketBasketContinuationFairValueFallback = shouldAllowMarketBasketContinuationFairValueFallback({
+      config,
+      allowance,
+      marketBasketFairValueFallbackEligible,
+      secsToClose,
+      reasons: fairValueReasons,
+    });
     const fairValueAllowed =
       (upFairValue.allowed && downFairValue.allowed) ||
       shouldAllowPairedHighLowFairValueOverride(
@@ -4006,8 +4663,9 @@ function inspectBalancedPairCandidates(
         upExecution.averagePrice,
         downExecution.averagePrice,
         pairCost,
-        [upFairValue.reason, downFairValue.reason].filter((reason): reason is string => Boolean(reason)),
-      );
+        fairValueReasons,
+      ) ||
+      marketBasketContinuationFairValueFallback;
     const staleCheapOppositeQuote =
       allowance !== undefined &&
       allowance.allowed &&
@@ -4037,28 +4695,29 @@ function inspectBalancedPairCandidates(
       candidateSize: requestedSize,
       fairValueSnapshot,
     });
-    const basketContinuationPairOverride =
-      allowance?.marketBasketContinuation === true &&
+    const terminalCarryPairOverride =
+      (basketState.balancedButDebted || basketState.campaignActive) &&
       upExecution.fullyFilled &&
       downExecution.fullyFilled &&
-      basketProjection !== undefined &&
-      basketProjection.improvement >= config.marketBasketMinAvgImprovement - 1e-9 &&
-      basketProjection.projectedEffectivePair <= config.marketBasketBorderlineAvgCap + 1e-9;
+      terminalCarryProjection.allowed;
+    const effectiveFreshCycleSkipReason = terminalCarryPairOverride ? undefined : freshCycleSkipReason;
     const orphanRiskAllowed = (upOrphanRisk.allowed && downOrphanRisk.allowed) || basketContinuationPairOverride;
+    const allowanceAllowed = Boolean(allowance?.allowed || terminalCarryPairOverride);
+    const selectedMode = allowance?.mode ?? (terminalCarryPairOverride ? "XUAN_HARD_PAIR_SWEEP" : undefined);
     const verdict =
       !upExecution.fullyFilled
         ? "up_depth"
         : !downExecution.fullyFilled
           ? "down_depth"
-          : allowance?.allowed && fairValueAllowed && !staleCheapOppositeQuote && orphanRiskAllowed && !freshCycleSkipReason
+          : allowanceAllowed && fairValueAllowed && !staleCheapOppositeQuote && orphanRiskAllowed && !effectiveFreshCycleSkipReason
             ? "ok"
-            : allowance?.allowed && fairValueAllowed && !staleCheapOppositeQuote && !freshCycleSkipReason && !orphanRiskAllowed
+            : allowanceAllowed && fairValueAllowed && !staleCheapOppositeQuote && !effectiveFreshCycleSkipReason && !orphanRiskAllowed
               ? "orphan_risk"
               : "pair_cap";
     const gateReason =
       verdict === "pair_cap"
-        ? freshCycleSkipReason
-          ? freshCycleSkipReason
+        ? effectiveFreshCycleSkipReason
+          ? effectiveFreshCycleSkipReason
           : staleCheapOppositeQuote
           ? "pair_stale_cheap_quote"
           : fairValueAllowed
@@ -4066,6 +4725,23 @@ function inspectBalancedPairCandidates(
           : upFairValue.reason ?? downFairValue.reason ?? "pair_fair_value"
         : verdict === "orphan_risk"
           ? orphanGateReason("UP", upOrphanRisk) ?? orphanGateReason("DOWN", downOrphanRisk)
+        : undefined;
+    const continuationDutyActive = basketState.balancedButDebted || basketState.campaignActive;
+    const continuationRejectedReason =
+      continuationDutyActive && verdict !== "ok"
+        ? allowance?.continuationRejectedReason ??
+          effectiveFreshCycleSkipReason ??
+          (gateReason === "fair_value_missing" || gateReason === "fair_value_missing_side" || gateReason === "pair_fair_value"
+            ? gateReason
+            : edgePerPair <= 0
+            ? basketState.campaignActive
+              ? "average_improvement_not_allowed"
+              : "non_positive_edge"
+            : basketProjection === undefined
+              ? "no_basket_projection"
+              : basketProjection.debtDeltaUSDC <= 0
+                ? "debt_not_reduced"
+                : gateReason)
         : undefined;
 
     traces.push({
@@ -4095,11 +4771,60 @@ function inspectBalancedPairCandidates(
           }
         : {}),
       ...(allowance?.marketBasketBootstrap ? { marketBasketBootstrap: true } : {}),
-      ...(allowance?.marketBasketContinuation ? { marketBasketContinuation: true } : {}),
-      ...(freshCycleSkipReason ? { cycleSkippedReason: freshCycleSkipReason } : {}),
+      ...(allowance?.marketBasketContinuation || terminalCarryPairOverride ? { marketBasketContinuation: true } : {}),
+      ...(marketBasketContinuationFairValueFallback
+        ? { fairValueFallbackReason: "market_basket_continuation" }
+        : {}),
+      ...(basketState.balancedButDebted ? { balancedButDebted: true } : {}),
+      ...(basketState.campaignActive
+        ? {
+            campaignMode: verdict === "ok" ? "ACCUMULATING_CONTINUATION" : "BASKET_CAMPAIGN_ACTIVE",
+            campaignBaseLot: normalizeTraceNumber(requestedMaxLot),
+            plannedContinuationQty: normalizeTraceNumber(requestedSize),
+          }
+        : {}),
+      ...(basketProjection
+        ? {
+            currentBasketEffectiveAvg: basketState.basketEffectiveAvg,
+            deltaAverageCost: basketProjection.improvement,
+            deltaAbsoluteDebt: basketProjection.debtDeltaUSDC,
+          }
+        : {}),
+      candidateEffectivePair: cycleTrace.effectivePair,
+      edgePerPair: normalizeTraceNumber(edgePerPair),
+      ...(qtyNeededToRepayDebt !== undefined ? { qtyNeededToRepayDebt } : {}),
+      ...(basketProjection ? { deltaBasketDebt: basketProjection.debtDeltaUSDC } : {}),
+      ...(continuationRejectedReason ? { continuationRejectedReason } : {}),
+      ...(continuationRejectedReason ? { cycleSkippedReason: continuationRejectedReason } : {}),
+      ...(terminalCarryPairOverride ? { terminalCarryMode: true } : {}),
+      deltaTerminalMinPnl: terminalCarryProjection.deltaTerminalMinPnl,
+      ...(terminalCarryProjection.deltaTerminalExpectedPnl !== undefined
+        ? {
+            deltaTerminalExpectedPnl: terminalCarryProjection.deltaTerminalExpectedPnl,
+            deltaTerminalEV: terminalCarryProjection.deltaTerminalExpectedPnl,
+          }
+        : {}),
+      ...(terminalCarryProjection.fairValueEVBefore !== undefined
+        ? { fairValueEVBefore: terminalCarryProjection.fairValueEVBefore }
+        : {}),
+      ...(terminalCarryProjection.fairValueEVAfter !== undefined
+        ? { fairValueEVAfter: terminalCarryProjection.fairValueEVAfter }
+        : {}),
+      addedDebtUSDC: terminalCarryProjection.addedDebtUSDC,
+      ...(allowance?.continuationClass ? { continuationClass: allowance.continuationClass } : {}),
+      ...(allowance?.campaignClipType ? { campaignClipType: allowance.campaignClipType } : {}),
+      ...(allowance?.avgImprovingBudgetRemainingUSDC !== undefined
+        ? { avgImprovingBudgetRemainingUSDC: allowance.avgImprovingBudgetRemainingUSDC }
+        : {}),
+      ...(allowance?.avgImprovingClipBudgetRemaining !== undefined
+        ? { avgImprovingClipBudgetRemaining: allowance.avgImprovingClipBudgetRemaining }
+        : {}),
+      ...(effectiveFreshCycleSkipReason && !continuationRejectedReason
+        ? { cycleSkippedReason: effectiveFreshCycleSkipReason }
+        : {}),
       negativeEdgeUsdc: allowance?.negativeEdgeUsdc ?? 0,
       verdict,
-      ...(allowance?.mode ? { selectedMode: allowance.mode } : {}),
+      ...(selectedMode ? { selectedMode } : {}),
       ...(gateReason ? { gateReason } : {}),
       upOrphanRisk,
       downOrphanRisk,
@@ -4131,12 +4856,58 @@ function inspectBalancedPairCandidates(
             }
           : {}),
         ...(allowance!.marketBasketBootstrap ? { marketBasketBootstrap: true } : {}),
-        ...(allowance!.marketBasketContinuation ? { marketBasketContinuation: true } : {}),
+        ...(allowance?.marketBasketContinuation || terminalCarryPairOverride ? { marketBasketContinuation: true } : {}),
+        ...(marketBasketContinuationFairValueFallback
+          ? { fairValueFallbackReason: "market_basket_continuation" }
+          : {}),
+        ...(basketState.balancedButDebted ? { balancedButDebted: true } : {}),
+        ...(basketState.campaignActive
+          ? {
+              campaignMode: "ACCUMULATING_CONTINUATION",
+              campaignBaseLot: normalizeTraceNumber(requestedMaxLot),
+              plannedContinuationQty: normalizeTraceNumber(requestedSize),
+            }
+          : {}),
+        ...(basketProjection
+          ? {
+              currentBasketEffectiveAvg: basketState.basketEffectiveAvg,
+              deltaAverageCost: basketProjection.improvement,
+              deltaAbsoluteDebt: basketProjection.debtDeltaUSDC,
+            }
+          : {}),
+        candidateEffectivePair: cycleTrace.effectivePair,
+        edgePerPair: normalizeTraceNumber(edgePerPair),
+        ...(qtyNeededToRepayDebt !== undefined ? { qtyNeededToRepayDebt } : {}),
+        ...(basketProjection ? { deltaBasketDebt: basketProjection.debtDeltaUSDC } : {}),
+        ...(continuationRejectedReason ? { continuationRejectedReason } : {}),
+        ...(terminalCarryPairOverride ? { terminalCarryMode: true } : {}),
+        deltaTerminalMinPnl: terminalCarryProjection.deltaTerminalMinPnl,
+        ...(terminalCarryProjection.deltaTerminalExpectedPnl !== undefined
+          ? {
+              deltaTerminalExpectedPnl: terminalCarryProjection.deltaTerminalExpectedPnl,
+              deltaTerminalEV: terminalCarryProjection.deltaTerminalExpectedPnl,
+            }
+          : {}),
+        ...(terminalCarryProjection.fairValueEVBefore !== undefined
+          ? { fairValueEVBefore: terminalCarryProjection.fairValueEVBefore }
+          : {}),
+        ...(terminalCarryProjection.fairValueEVAfter !== undefined
+          ? { fairValueEVAfter: terminalCarryProjection.fairValueEVAfter }
+          : {}),
+        addedDebtUSDC: terminalCarryProjection.addedDebtUSDC,
+        ...(allowance?.continuationClass ? { continuationClass: allowance.continuationClass } : {}),
+        ...(allowance?.campaignClipType ? { campaignClipType: allowance.campaignClipType } : {}),
+        ...(allowance?.avgImprovingBudgetRemainingUSDC !== undefined
+          ? { avgImprovingBudgetRemainingUSDC: allowance.avgImprovingBudgetRemainingUSDC }
+          : {}),
+        ...(allowance?.avgImprovingClipBudgetRemaining !== undefined
+          ? { avgImprovingClipBudgetRemaining: allowance.avgImprovingClipBudgetRemaining }
+          : {}),
         feeUSDC: cycleTrace.feeUSDC,
         expectedNetIfMerged: cycleTrace.expectedNetIfMerged,
         cycleQualityLabel: cycleTrace.cycleQualityLabel,
-        mode: allowance!.mode!,
-        negativeEdgeUsdc: allowance!.negativeEdgeUsdc,
+        mode: selectedMode!,
+        negativeEdgeUsdc: terminalCarryPairOverride ? 0 : allowance!.negativeEdgeUsdc,
         upExecution,
         downExecution,
       };
@@ -4221,7 +4992,7 @@ function evaluateSingleLegSeed(
     config.marketBasketScoringEnabled &&
     config.marketBasketContinuationEnabled &&
     basketState.needsContinuation &&
-    basketState.mergeableQty >= config.marketBasketContinuationMinMatchedShares - 1e-9 &&
+    (basketState.mergeableQty >= config.marketBasketContinuationMinMatchedShares - 1e-9 || basketState.campaignActive) &&
     ctx.secsToClose > config.xuanMinTimeLeftForHardSweep;
   const ageAwareBorderlineCoveredSeedCap =
     !referencePriorActive &&
@@ -4332,6 +5103,17 @@ function evaluateSingleLegSeed(
       pairExecutableSize > 0
         ? marketBasketProjection(config, state, referencePairCost, pairExecutableSize)
         : undefined;
+    const continuationProjection =
+      pairExecutableSize > 0
+        ? projectMarketBasketContinuation({
+            config,
+            state,
+            costWithFees: referencePairCost,
+            candidateSize: pairExecutableSize,
+            secsToClose: ctx.secsToClose,
+            priceSpread: Math.abs(seedQuote.averagePrice - oppositeQuote.averagePrice),
+          })
+        : undefined;
     const negativeEdgeUsdc =
       pairExecutableSize > 0
         ? Math.max(0, referencePairCost - 1) * Math.max(pairExecutableSize, candidateSize)
@@ -4419,6 +5201,18 @@ function evaluateSingleLegSeed(
       } else if (dailyNegativeEdgeSpentUsdc + negativeEdgeUsdc > config.maxNegativeDailyBudgetUsdc) {
         skipReason = "seed_daily_budget";
       }
+    }
+
+    const continuationDutyActive = basketState.campaignActive || basketState.balancedButDebted;
+    if (
+      continuationDutyActive &&
+      continuationProjection !== undefined &&
+      !continuationProjection.allowed &&
+      (skipReason === undefined ||
+        skipReason === "fresh_cycle_borderline_pair" ||
+        skipReason === "fresh_cycle_bad_pair")
+    ) {
+      skipReason = continuationProjection.rejectedReason ?? "market_basket_continuation_rejected";
     }
 
     const selectedMode: StrategyExecutionMode = "PAIRGROUP_COVERED_SEED";
@@ -4509,6 +5303,15 @@ function evaluateSingleLegSeed(
             marketBasketDebtDeltaUSDC: basketProjection.debtDeltaUSDC,
           }
         : {}),
+      ...(continuationProjection
+        ? {
+            continuationClass: continuationProjection.continuationClass,
+            campaignClipType: continuationProjection.campaignClipType,
+            avgImprovingBudgetRemainingUSDC: continuationProjection.avgImprovingBudgetRemainingUSDC,
+            avgImprovingClipBudgetRemaining: continuationProjection.avgImprovingClipBudgetRemaining,
+            addedDebtUSDC: continuationProjection.addedDebtUSDC,
+          }
+        : {}),
       ...(borderlinePolicy ? { xuanBorderlinePhase: borderlinePolicy.phase } : {}),
       ...(fairValueFallbackReason ? { fairValueFallbackReason } : {}),
       ...(useStagedBorderlineEntry
@@ -4523,7 +5326,15 @@ function evaluateSingleLegSeed(
       skipReason === "borderline_same_pattern_repeat" ||
       skipReason === "opening_weak_pair_no_followup_plan" ||
       skipReason === "early_mid_pair_repeat_fee_guard" ||
-      skipReason === "low_side_unpaired_basket_debt"
+      skipReason === "low_side_unpaired_basket_debt" ||
+      skipReason === "avg_improving_pair_too_expensive" ||
+      skipReason === "avg_improving_spread_too_small" ||
+      skipReason === "avg_improving_clip_budget_exhausted" ||
+      skipReason === "avg_improving_budget_exhausted" ||
+      skipReason === "avg_improving_qty_cap" ||
+      skipReason === "debt_reducing_qty_cap" ||
+      skipReason === "continuation_not_debt_reducing_or_avg_improving" ||
+      skipReason === "market_basket_continuation_rejected"
         ? { cycleSkippedReason: skipReason }
         : {}),
       negativeEdgeUsdc,
@@ -4615,8 +5426,14 @@ function buildCandidateSizes(
 
 function buildXuanClipSizeCandidates(maxCandidateSize: number, minOrderSize: number): number[] {
   const candidates: number[] = [];
+  for (const tier of [5, 10, 20, 40, 80, 160]) {
+    if (maxCandidateSize >= tier) {
+      candidates.push(tier);
+    }
+  }
   if (maxCandidateSize >= 30) {
     candidates.push(10, 15);
+    candidates.push(maxCandidateSize * 0.25, maxCandidateSize * 0.5);
   } else if (maxCandidateSize >= 15) {
     candidates.push(5);
   } else if (maxCandidateSize >= 12) {
@@ -4992,6 +5809,27 @@ function shouldAllowPairedHighLowFairValueOverride(
 
   const cap = allowance.mode === "XUAN_HARD_PAIR_SWEEP" ? config.xuanPairSweepHardCap : config.xuanPairSweepSoftCap;
   return pairCost <= cap;
+}
+
+function shouldAllowMarketBasketContinuationFairValueFallback(args: {
+  config: XuanStrategyConfig;
+  allowance: ReturnType<typeof pairSweepAllowance> | undefined;
+  marketBasketFairValueFallbackEligible: boolean;
+  secsToClose: number;
+  reasons: string[];
+}): boolean {
+  if (
+    !args.config.allowMarketBasketContinuationWithoutFairValue ||
+    !args.allowance?.allowed ||
+    !args.allowance.marketBasketContinuation ||
+    !args.marketBasketFairValueFallbackEligible ||
+    args.secsToClose <= args.config.finalWindowCompletionOnlySec ||
+    args.reasons.length === 0
+  ) {
+    return false;
+  }
+
+  return args.reasons.every((reason) => reason === "fair_value_missing" || reason === "fair_value_missing_side");
 }
 
 function normalizeOrderSize(size: number, minOrderSize: number): number {

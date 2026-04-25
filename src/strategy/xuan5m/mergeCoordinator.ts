@@ -28,6 +28,9 @@ export interface MergeBatchMetrics {
 export interface MergeGateDecision extends MergeBatchMetrics {
   allow: boolean;
   forced: boolean;
+  mergeVsCarryDecision?: "MERGE_NOW" | "CARRY_TO_SETTLEMENT" | "NOT_APPLICABLE" | undefined;
+  mergeVsCarryReason?: string | undefined;
+  basketEffectivePair?: number | undefined;
   reason:
     | "disabled"
     | "not_ready"
@@ -344,10 +347,18 @@ export function evaluateDelayedMergeGate(
   }
 
   if (config.forceMergeInLast30S && args.secsToClose <= config.finalWindowCompletionOnlySec) {
+    const debtPositiveFinalWindow =
+      basketEffectivePair !== undefined &&
+      basketEffectivePair > config.marketBasketMergeEffectivePairCap + 1e-9;
     return {
       allow: true,
       forced: true,
       reason: "final_window",
+      ...(basketEffectivePair !== undefined ? { basketEffectivePair: normalize(basketEffectivePair) } : {}),
+      mergeVsCarryDecision: debtPositiveFinalWindow ? "MERGE_NOW" : "NOT_APPLICABLE",
+      ...(debtPositiveFinalWindow
+        ? { mergeVsCarryReason: "debt_positive_final_window_forced_merge" }
+        : {}),
       ...metrics,
     };
   }

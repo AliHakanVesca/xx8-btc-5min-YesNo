@@ -4298,7 +4298,7 @@ describe("xuan mode and pair order groups", () => {
     expect(evaluation.trace.marketBasketProjectedEffectivePair).toBeLessThan(1);
   });
 
-  it("opens a public-footprint bootstrap basket at xuan size for early 1.01 raw pairs", () => {
+  it("caps a recovery-less public-footprint bootstrap basket to a xuan footprint probe", () => {
     const market = buildOfflineMarket(1713696000);
     const state = createMarketState(market);
     const books = new OrderBookState(
@@ -4332,14 +4332,177 @@ describe("xuan mode and pair order groups", () => {
     );
 
     expect(evaluation.decisions).toHaveLength(2);
-    expect(evaluation.decisions.every((decision) => decision.size >= 90)).toBe(true);
-    expect(evaluation.decisions.every((decision) => decision.mode === "XUAN_HARD_PAIR_SWEEP")).toBe(true);
-    expect(evaluation.trace.marketBasketBootstrap).toBe(true);
+    expect(evaluation.decisions.every((decision) => decision.size >= 15 && decision.size <= 25)).toBe(true);
+    expect(evaluation.trace.initialBasketRecoveryPlan).toBe("none");
+    expect(evaluation.trace.initialBasketQtyCap).toBeCloseTo(19, 6);
+    expect(evaluation.trace.campaignMode).toBe("PROBE_OPENED");
+    expect(evaluation.trace.campaignBaseLot).toBe(95);
+    expect(evaluation.trace.executedProbeQty).toBeCloseTo(19, 6);
     expect(evaluation.trace.effectivePair).toBeCloseTo(1.04582, 6);
     expect(evaluation.trace.cycleQualityLabel).toBe("BORDERLINE_PAIR");
   });
 
-  it("allows a large xuan continuation clip when it keeps the market basket positive", () => {
+  it("turns a debt-positive probe into an average-improving basket campaign", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      size: 5,
+      price: 0.46,
+      timestamp: market.startTs,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 5,
+      price: 0.61,
+      timestamp: market.startTs + 1,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.19, size: 240 }], [{ price: 0.2, size: 240 }]),
+      buildBook(
+        market.tokens.DOWN.tokenId,
+        market.conditionId,
+        [{ price: 0.77, size: 240 }],
+        [{ price: 0.78, size: 240 }],
+      ),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 18,
+        secsToClose: 282,
+        lot: 95,
+        fairValueSnapshot: {
+          status: "valid",
+          estimatedThreshold: false,
+          fairUp: 0.52,
+          fairDown: 0.52,
+        },
+      },
+    );
+
+    expect(evaluation.decisions).toHaveLength(2);
+    expect(evaluation.decisions.every((decision) => decision.size >= 20 && decision.size <= 40)).toBe(true);
+    expect(evaluation.trace.campaignMode).toBe("ACCUMULATING_CONTINUATION");
+    expect(evaluation.trace.campaignBaseLot).toBe(95);
+    expect(evaluation.trace.marketBasketContinuation).toBe(true);
+    expect(evaluation.trace.continuationClass).toBe("AVG_IMPROVING");
+    expect(evaluation.trace.currentBasketEffectiveAvg).toBeGreaterThan(evaluation.trace.candidateEffectivePair ?? 0);
+    expect(evaluation.trace.deltaAverageCost).toBeGreaterThan(0);
+    expect(evaluation.trace.deltaAbsoluteDebt).toBeLessThan(0);
+    expect(evaluation.trace.addedDebtUSDC).toBeLessThanOrEqual(2);
+  });
+
+  it("completes an unbalanced campaign residual without fair value when cost basis improves", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      size: 19,
+      price: 0.48,
+      timestamp: market.startTs,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 5,
+      price: 0.53,
+      timestamp: market.startTs + 1,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.45, size: 120 }], [{ price: 0.46, size: 120 }]),
+      buildBook(
+        market.tokens.DOWN.tokenId,
+        market.conditionId,
+        [{ price: 0.53, size: 120 }],
+        [{ price: 0.54, size: 120 }],
+      ),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 45,
+        secsToClose: 255,
+        lot: 95,
+      },
+    );
+
+    expect(evaluation.decisions).toHaveLength(1);
+    expect(evaluation.decisions[0]!.side).toBe("UP");
+    expect(evaluation.decisions[0]!.size).toBe(14);
+    expect(evaluation.trace.campaignMode).toBe("RESIDUAL_COMPLETION_ACTIVE");
+    expect(evaluation.trace.campaignClipType).toBe("CAMPAIGN_COMPLETION");
+    expect(evaluation.trace.campaignMinClipQty).toBeCloseTo(16, 6);
+    expect(evaluation.trace.microRepairMaxQty).toBe(5);
+    expect(evaluation.trace.residualCompletionFairValueFallback).toBe(true);
+    expect(evaluation.trace.residualCompletionFallbackReason).toBe("residual_cost_basis_cap");
+    expect(evaluation.trace.repairCost).toBeLessThanOrEqual(1.005);
+    expect(evaluation.trace.repairNewGap).toBeLessThan(evaluation.trace.repairOldGap ?? Infinity);
+  });
+
+  it("keeps full bootstrap size when a strong terminal fair-value edge exists", () => {
+    const market = buildOfflineMarket(1713696000);
+    const state = createMarketState(market);
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.53, size: 240 }], [{ price: 0.54, size: 240 }]),
+      buildBook(
+        market.tokens.DOWN.tokenId,
+        market.conditionId,
+        [{ price: 0.46, size: 240 }],
+        [{ price: 0.47, size: 240 }],
+      ),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 5,
+        secsToClose: 295,
+        lot: 95,
+        fairValueSnapshot: {
+          status: "valid",
+          estimatedThreshold: false,
+          fairUp: 0.62,
+          fairDown: 0.38,
+        },
+      },
+    );
+
+    expect(evaluation.decisions.length).toBeGreaterThan(0);
+    expect(evaluation.decisions[0]!.size).toBeGreaterThanOrEqual(90);
+    expect(evaluation.trace.initialBasketRecoveryPlan).toBe("strong");
+    expect(evaluation.trace.initialBasketRecoveryReason).toBe("strong_terminal_fair_value_edge");
+  });
+
+  it("allows a large xuan continuation clip when it reduces basket debt", () => {
     const market = buildOfflineMarket(1713696000);
     let state = createMarketState(market);
     state = applyFill(state, {
@@ -4361,12 +4524,12 @@ describe("xuan mode and pair order groups", () => {
       executionMode: "STRICT_PAIR_SWEEP",
     });
     const books = new OrderBookState(
-      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.53, size: 220 }], [{ price: 0.54, size: 220 }]),
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.19, size: 220 }], [{ price: 0.2, size: 220 }]),
       buildBook(
         market.tokens.DOWN.tokenId,
         market.conditionId,
-        [{ price: 0.57, size: 220 }],
-        [{ price: 0.58, size: 220 }],
+        [{ price: 0.75, size: 220 }],
+        [{ price: 0.76, size: 220 }],
       ),
     );
 
@@ -4384,20 +4547,21 @@ describe("xuan mode and pair order groups", () => {
         fairValueSnapshot: {
           status: "valid",
           estimatedThreshold: false,
-          fairUp: 0.54,
-          fairDown: 0.58,
+          fairUp: 0.2,
+          fairDown: 0.76,
         },
       },
     );
 
     expect(evaluation.decisions).toHaveLength(2);
-    expect(evaluation.decisions.every((decision) => decision.size >= 120)).toBe(true);
+    expect(evaluation.decisions.every((decision) => decision.size >= 80)).toBe(true);
     expect(evaluation.decisions.every((decision) => decision.mode === "XUAN_HARD_PAIR_SWEEP")).toBe(true);
     expect(evaluation.decisions.every((decision) => decision.negativeEdgeUsdc === 0)).toBe(true);
     expect(evaluation.trace.marketBasketContinuation).toBe(true);
-    expect(evaluation.trace.marketBasketProjectedMatchedQty).toBeCloseTo(360, 6);
+    expect(evaluation.trace.continuationClass).toBe("DEBT_REDUCING");
+    expect(evaluation.trace.marketBasketProjectedMatchedQty).toBeGreaterThanOrEqual(320);
     expect(evaluation.trace.marketBasketProjectedEffectivePair).toBeLessThan(1);
-    expect(evaluation.trace.cycleQualityLabel).toBe("BAD_PAIR");
+    expect(evaluation.trace.cycleQualityLabel).toBe("STRONG_PAIR");
   });
 
   it("allows a high-low continuation clip when it rescues a weak bootstrap basket", () => {
@@ -4439,8 +4603,8 @@ describe("xuan mode and pair order groups", () => {
       state,
       books,
       {
-        secsFromOpen: 64,
-        secsToClose: 236,
+        secsFromOpen: 259,
+        secsToClose: 41,
         lot: 120,
         fairValueSnapshot: {
           status: "valid",
@@ -4452,12 +4616,221 @@ describe("xuan mode and pair order groups", () => {
     );
 
     expect(evaluation.decisions).toHaveLength(2);
-    expect(evaluation.decisions.every((decision) => decision.size >= 120)).toBe(true);
+    expect(evaluation.trace.balancedButDebted).toBe(true);
+    expect(evaluation.trace.qtyNeededToRepayDebt).toBeGreaterThan(80);
+    const continuationSize = evaluation.decisions[0]!.size;
+    expect(continuationSize).toBeGreaterThan(80);
+    expect(evaluation.decisions.every((decision) => decision.size === continuationSize)).toBe(true);
+    expect(continuationSize).toBeLessThanOrEqual((evaluation.trace.qtyNeededToRepayDebt ?? 0) + 1e-6);
     expect(evaluation.decisions.every((decision) => decision.mode === "XUAN_HARD_PAIR_SWEEP")).toBe(true);
     expect(evaluation.trace.marketBasketContinuation).toBe(true);
+    expect(evaluation.trace.continuationClass).toBe("DEBT_REDUCING");
     expect(evaluation.trace.marketBasketImprovement).toBeGreaterThan(0.04);
-    expect(evaluation.trace.marketBasketProjectedMatchedQty).toBeCloseTo(215, 6);
-    expect(evaluation.trace.marketBasketProjectedEffectivePair).toBeLessThan(1);
+    expect(evaluation.trace.marketBasketProjectedMatchedQty).toBeGreaterThan(175);
+    expect(evaluation.trace.marketBasketProjectedEffectivePair).toBeLessThanOrEqual(1.000001);
+    expect(evaluation.trace.deltaBasketDebt).toBeGreaterThan(4);
+  });
+
+  it("allows an average-improving basket campaign continuation without fair value", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      size: 19,
+      price: 0.49,
+      timestamp: market.startTs,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 5,
+      price: 0.51,
+      timestamp: market.startTs + 1,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 14,
+      price: 0.5,
+      timestamp: market.startTs + 2,
+      makerTaker: "taker",
+      executionMode: "PARTIAL_FAST_COMPLETION",
+    });
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.19, size: 220 }], [{ price: 0.2, size: 220 }]),
+      buildBook(
+        market.tokens.DOWN.tokenId,
+        market.conditionId,
+        [{ price: 0.77, size: 220 }],
+        [{ price: 0.78, size: 220 }],
+      ),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 258,
+        secsToClose: 42,
+        lot: 95,
+      },
+    );
+
+    expect(evaluation.decisions).toHaveLength(2);
+    expect(evaluation.trace.marketBasketContinuation).toBe(true);
+    expect(evaluation.trace.fairValueFallbackReason).toBe("market_basket_continuation");
+    expect(evaluation.trace.campaignMode).toBe("ACCUMULATING_CONTINUATION");
+    expect(evaluation.trace.continuationClass).toBe("AVG_IMPROVING");
+    expect(evaluation.trace.currentBasketEffectiveAvg).toBeGreaterThan(evaluation.trace.candidateEffectivePair ?? 0);
+    expect(evaluation.trace.deltaAverageCost).toBeGreaterThanOrEqual(0.002);
+    expect(evaluation.decisions.every((decision) => decision.size >= 20 && decision.size <= 40)).toBe(true);
+  });
+
+  it("blocks repeated average-improving high-low continuations after the market budget is spent", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      size: 5,
+      price: 0.46,
+      timestamp: market.startTs,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 5,
+      price: 0.61,
+      timestamp: market.startTs + 1,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+    for (const [offset, upPrice, downPrice] of [
+      [36, 0.2, 0.78],
+      [102, 0.19, 0.79],
+    ] as const) {
+      state = applyFill(state, {
+        outcome: "UP",
+        side: "BUY",
+        size: 5,
+        price: upPrice,
+        timestamp: market.startTs + offset,
+        makerTaker: "taker",
+        executionMode: "PAIRGROUP_COVERED_SEED",
+      });
+      state = applyFill(state, {
+        outcome: "DOWN",
+        side: "BUY",
+        size: 5,
+        price: downPrice,
+        timestamp: market.startTs + offset,
+        makerTaker: "taker",
+        executionMode: "PAIRGROUP_COVERED_SEED",
+      });
+    }
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.18, size: 220 }], [{ price: 0.19, size: 220 }]),
+      buildBook(
+        market.tokens.DOWN.tokenId,
+        market.conditionId,
+        [{ price: 0.79, size: 220 }],
+        [{ price: 0.8, size: 220 }],
+      ),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 133,
+        secsToClose: 167,
+        lot: 95,
+        fairValueSnapshot: {
+          status: "valid",
+          estimatedThreshold: false,
+          fairUp: 0.19,
+          fairDown: 0.8,
+        },
+      },
+    );
+
+    expect(evaluation.decisions).toEqual([]);
+    expect(evaluation.trace.cycleSkippedReason).toBe("avg_improving_clip_budget_exhausted");
+    expect(evaluation.trace.candidates.some((candidate) => candidate.continuationClass === "AVG_IMPROVING")).toBe(true);
+    expect(evaluation.trace.candidates.some((candidate) => candidate.avgImprovingClipBudgetRemaining === 0)).toBe(true);
+  });
+
+  it("allows a bounded negative continuation only when terminal fair-value EV beats added debt", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      size: 95,
+      price: 0.5,
+      timestamp: market.startTs + 2,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 95,
+      price: 0.51,
+      timestamp: market.startTs + 3,
+      makerTaker: "taker",
+      executionMode: "PARTIAL_FAST_COMPLETION",
+    });
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.49, size: 220 }], [{ price: 0.5, size: 220 }]),
+      buildBook(
+        market.tokens.DOWN.tokenId,
+        market.conditionId,
+        [{ price: 0.49, size: 220 }],
+        [{ price: 0.5, size: 220 }],
+      ),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 120,
+        secsToClose: 180,
+        lot: 80,
+        fairValueSnapshot: {
+          status: "valid",
+          estimatedThreshold: false,
+          fairUp: 0.57,
+          fairDown: 0.57,
+        },
+      },
+    );
+
+    expect(evaluation.decisions).toHaveLength(2);
+    expect(evaluation.trace.balancedButDebted).toBe(true);
+    expect(evaluation.trace.terminalCarryMode).toBe(true);
+    expect(evaluation.trace.edgePerPair).toBeLessThan(0);
+    expect(evaluation.trace.deltaTerminalExpectedPnl).toBeGreaterThan(evaluation.trace.addedDebtUSDC ?? 0);
   });
 
   it("blocks a low-side covered seed when a debt-positive basket would not be improved", () => {
@@ -4518,12 +4891,12 @@ describe("xuan mode and pair order groups", () => {
 
     expect(evaluation.decisions).toEqual([]);
     expect(evaluation.trace.marketBasketDebtUSDC).toBeGreaterThan(3);
-    expect(evaluation.trace.cycleSkippedReason).toBe("low_side_unpaired_basket_debt");
+    expect(evaluation.trace.cycleSkippedReason).toBe("avg_improving_pair_too_expensive");
     expect(
       evaluation.trace.seedCandidates?.some(
         (candidate) =>
           candidate.side === "UP" &&
-          candidate.skipReason === "low_side_unpaired_basket_debt" &&
+          candidate.skipReason === "avg_improving_pair_too_expensive" &&
           (candidate.marketBasketDebtDeltaUSDC ?? 0) < 0,
       ),
     ).toBe(true);

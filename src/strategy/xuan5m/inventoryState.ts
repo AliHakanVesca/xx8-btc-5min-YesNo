@@ -189,6 +189,46 @@ export function averageEffectiveCost(state: XuanMarketState, outcome: OutcomeSid
   return safeDivide(totalEffectiveCost, totalShares);
 }
 
+export function matchedEffectiveAverageCost(
+  state: XuanMarketState,
+  outcome: OutcomeSide,
+  feeRate = 0.072,
+  matchedQty = mergeableShares(state),
+): number {
+  const requestedQty = normalize(Math.max(0, matchedQty));
+  if (requestedQty <= 1e-6) {
+    return 0;
+  }
+  const lots = outcome === "UP" ? state.upLots : state.downLots;
+  let remaining = requestedQty;
+  let consumedSize = 0;
+  let consumedEffectiveCost = 0;
+  for (const lot of lots) {
+    if (remaining <= 1e-6) {
+      break;
+    }
+    const takeSize = Math.min(lot.size, remaining);
+    consumedSize += takeSize;
+    consumedEffectiveCost += takeSize * (lot.price + takerFeePerShare(lot.price, feeRate));
+    remaining = normalize(remaining - takeSize);
+  }
+  if (consumedSize > 1e-6) {
+    return safeDivide(consumedEffectiveCost, consumedSize);
+  }
+  return averageEffectiveCost(state, outcome, feeRate);
+}
+
+export function matchedEffectivePairCost(state: XuanMarketState, feeRate = 0.072): number {
+  const matchedQty = mergeableShares(state);
+  if (matchedQty <= 1e-6) {
+    return 0;
+  }
+  return (
+    matchedEffectiveAverageCost(state, "UP", feeRate, matchedQty) +
+    matchedEffectiveAverageCost(state, "DOWN", feeRate, matchedQty)
+  );
+}
+
 export function pairVwapSum(state: XuanMarketState): number {
   return averageCost(state, "UP") + averageCost(state, "DOWN");
 }

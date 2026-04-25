@@ -61,6 +61,32 @@ export interface XuanStrategyConfig {
   xuanBorderlineMidEffectivePairCap: number;
   xuanBorderlineLateRawPairCap: number;
   xuanBorderlineLateEffectivePairCap: number;
+  marketBasketScoringEnabled: boolean;
+  marketBasketStrongRawPairCap: number;
+  marketBasketStrongEffectivePairCap: number;
+  marketBasketStrongMaxDegradation: number;
+  marketBasketStrongAvgCap: number;
+  marketBasketGoodAvgCap: number;
+  marketBasketBorderlineAvgCap: number;
+  marketBasketMinAvgImprovement: number;
+  marketBasketMinMergeShares: number;
+  marketBasketMergeEffectivePairCap: number;
+  marketBasketMergeTargetMultiplier: number;
+  marketBasketMergeTargetMaxShares: number;
+  marketBasketContinuationEnabled: boolean;
+  marketBasketContinuationMinMatchedShares: number;
+  marketBasketContinuationMaxEffectivePair: number;
+  marketBasketContinuationProjectedEffectivePairCap: number;
+  marketBasketContinuationMaxQty: number;
+  marketBasketBootstrapEnabled: boolean;
+  marketBasketBootstrapMaxAgeSec: number;
+  marketBasketBootstrapMaxEffectivePair: number;
+  marketBasketBootstrapMaxQty: number;
+  openingWeakPairRawThreshold: number;
+  openingFollowupPlanMaxAgeSec: number;
+  openingFollowupMinSpread: number;
+  openingFollowupHighSideMinPrice: number;
+  openingFollowupMaxEffectivePair: number;
   borderlinePairStagedEntryEnabled: boolean;
   borderlinePairInitialQty: number;
   borderlinePairFollowupQty: number;
@@ -148,6 +174,7 @@ export interface XuanStrategyConfig {
   highSideEmergencyRequiresHardImbalance: boolean;
   highSideEmergencyCap: number;
   highSideCompletionMaxQty: number;
+  highSideCompletionSoftPriceThreshold: number;
   highSideCompletionMaxCost: number;
   highSideCompletionRequiresFairValue: boolean;
   highSideCompletionRequiresHardImbalance: boolean;
@@ -165,6 +192,8 @@ export interface XuanStrategyConfig {
   residualJanitorMaxShareGap: number;
   residualJanitorMaxInventoryShares: number;
   residualJanitorMaxEffectivePair: number;
+  residualJanitorUnlockMaxEffectivePair: number;
+  residualJanitorMinUnlockNetUsdc: number;
   enableResidualSell: boolean;
   allowUnresolvedSell: boolean;
   allowEmergencySell: boolean;
@@ -382,6 +411,32 @@ export function buildStrategyConfig(env: AppEnv): XuanStrategyConfig {
     xuanBorderlineMidEffectivePairCap: env.XUAN_BORDERLINE_MID_EFFECTIVE_PAIR_CAP,
     xuanBorderlineLateRawPairCap: env.XUAN_BORDERLINE_LATE_RAW_PAIR_CAP,
     xuanBorderlineLateEffectivePairCap: env.XUAN_BORDERLINE_LATE_EFFECTIVE_PAIR_CAP,
+    marketBasketScoringEnabled: env.MARKET_BASKET_SCORING_ENABLED,
+    marketBasketStrongRawPairCap: env.MARKET_BASKET_STRONG_RAW_PAIR_CAP,
+    marketBasketStrongEffectivePairCap: env.MARKET_BASKET_STRONG_EFFECTIVE_PAIR_CAP,
+    marketBasketStrongMaxDegradation: env.MARKET_BASKET_STRONG_MAX_DEGRADATION,
+    marketBasketStrongAvgCap: env.MARKET_BASKET_STRONG_AVG_CAP,
+    marketBasketGoodAvgCap: env.MARKET_BASKET_GOOD_AVG_CAP,
+    marketBasketBorderlineAvgCap: env.MARKET_BASKET_BORDERLINE_AVG_CAP,
+    marketBasketMinAvgImprovement: env.MARKET_BASKET_MIN_AVG_IMPROVEMENT,
+    marketBasketMinMergeShares: env.MARKET_BASKET_MIN_MERGE_SHARES,
+    marketBasketMergeEffectivePairCap: env.MARKET_BASKET_MERGE_EFFECTIVE_PAIR_CAP,
+    marketBasketMergeTargetMultiplier: env.MARKET_BASKET_MERGE_TARGET_MULTIPLIER,
+    marketBasketMergeTargetMaxShares: env.MARKET_BASKET_MERGE_TARGET_MAX_SHARES,
+    marketBasketContinuationEnabled: env.MARKET_BASKET_CONTINUATION_ENABLED,
+    marketBasketContinuationMinMatchedShares: env.MARKET_BASKET_CONTINUATION_MIN_MATCHED_SHARES,
+    marketBasketContinuationMaxEffectivePair: env.MARKET_BASKET_CONTINUATION_MAX_EFFECTIVE_PAIR,
+    marketBasketContinuationProjectedEffectivePairCap: env.MARKET_BASKET_CONTINUATION_PROJECTED_EFFECTIVE_PAIR_CAP,
+    marketBasketContinuationMaxQty: env.MARKET_BASKET_CONTINUATION_MAX_QTY,
+    marketBasketBootstrapEnabled: env.MARKET_BASKET_BOOTSTRAP_ENABLED,
+    marketBasketBootstrapMaxAgeSec: env.MARKET_BASKET_BOOTSTRAP_MAX_AGE_SEC,
+    marketBasketBootstrapMaxEffectivePair: env.MARKET_BASKET_BOOTSTRAP_MAX_EFFECTIVE_PAIR,
+    marketBasketBootstrapMaxQty: env.MARKET_BASKET_BOOTSTRAP_MAX_QTY,
+    openingWeakPairRawThreshold: env.OPENING_WEAK_PAIR_RAW_THRESHOLD,
+    openingFollowupPlanMaxAgeSec: env.OPENING_FOLLOWUP_PLAN_MAX_AGE_SEC,
+    openingFollowupMinSpread: env.OPENING_FOLLOWUP_MIN_SPREAD,
+    openingFollowupHighSideMinPrice: env.OPENING_FOLLOWUP_HIGH_SIDE_MIN_PRICE,
+    openingFollowupMaxEffectivePair: env.OPENING_FOLLOWUP_MAX_EFFECTIVE_PAIR,
     borderlinePairStagedEntryEnabled: env.BORDERLINE_PAIR_STAGED_ENTRY_ENABLED,
     borderlinePairInitialQty: env.BORDERLINE_PAIR_INITIAL_QTY,
     borderlinePairFollowupQty: env.BORDERLINE_PAIR_FOLLOWUP_QTY,
@@ -476,6 +531,7 @@ export function buildStrategyConfig(env: AppEnv): XuanStrategyConfig {
     highSideEmergencyRequiresHardImbalance: env.HIGH_SIDE_EMERGENCY_REQUIRES_HARD_IMBALANCE,
     highSideEmergencyCap: env.HIGH_SIDE_EMERGENCY_CAP,
     highSideCompletionMaxQty: env.HIGH_SIDE_COMPLETION_MAX_QTY,
+    highSideCompletionSoftPriceThreshold: env.HIGH_SIDE_COMPLETION_SOFT_PRICE_THRESHOLD,
     highSideCompletionMaxCost: env.HIGH_SIDE_COMPLETION_MAX_COST,
     highSideCompletionRequiresFairValue: env.HIGH_SIDE_COMPLETION_REQUIRES_FAIR_VALUE,
     highSideCompletionRequiresHardImbalance: env.HIGH_SIDE_COMPLETION_REQUIRES_HARD_IMBALANCE,
@@ -493,6 +549,8 @@ export function buildStrategyConfig(env: AppEnv): XuanStrategyConfig {
     residualJanitorMaxShareGap: env.RESIDUAL_JANITOR_MAX_SHARE_GAP,
     residualJanitorMaxInventoryShares: env.RESIDUAL_JANITOR_MAX_INVENTORY_SHARES,
     residualJanitorMaxEffectivePair: env.RESIDUAL_JANITOR_MAX_EFFECTIVE_PAIR,
+    residualJanitorUnlockMaxEffectivePair: env.RESIDUAL_JANITOR_UNLOCK_MAX_EFFECTIVE_PAIR,
+    residualJanitorMinUnlockNetUsdc: env.RESIDUAL_JANITOR_MIN_UNLOCK_NET_USDC,
     enableResidualSell: env.ENABLE_RESIDUAL_SELL,
     allowUnresolvedSell: env.ALLOW_UNRESOLVED_SELL,
     allowEmergencySell: env.ALLOW_EMERGENCY_SELL,
@@ -681,6 +739,18 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     maxNegativePairEdgePerMarketUsdc: Math.max(config.maxNegativePairEdgePerMarketUsdc, 20),
     maxNegativeDailyBudgetUsdc: Math.max(config.maxNegativeDailyBudgetUsdc, 25),
     maxNegativeEdgePerMarketUsdc: Math.max(config.maxNegativeEdgePerMarketUsdc, 25),
+    marketBasketBootstrapMaxQty: Math.max(config.marketBasketBootstrapMaxQty, maxLadderLot),
+    marketBasketBootstrapMaxEffectivePair: Math.max(config.marketBasketBootstrapMaxEffectivePair, 1.055),
+    marketBasketContinuationMaxQty: Math.max(config.marketBasketContinuationMaxQty, maxLadderLot),
+    marketBasketContinuationMinMatchedShares: Math.min(config.marketBasketContinuationMinMatchedShares, 40),
+    marketBasketContinuationMaxEffectivePair: Math.max(config.marketBasketContinuationMaxEffectivePair, 1.2),
+    marketBasketContinuationProjectedEffectivePairCap: Math.max(
+      config.marketBasketContinuationProjectedEffectivePairCap,
+      1.01,
+    ),
+    marketBasketBorderlineAvgCap: Math.max(config.marketBasketBorderlineAvgCap, 1.02),
+    marketBasketMergeTargetMultiplier: Math.max(config.marketBasketMergeTargetMultiplier, 8),
+    marketBasketMergeTargetMaxShares: Math.max(config.marketBasketMergeTargetMaxShares, 320),
     maxMarketExposureShares: Math.max(config.maxMarketExposureShares, 500),
     maxMarketSharesPerSide: Math.max(config.maxMarketSharesPerSide, 500),
     maxOneSidedExposureShares: Math.max(config.maxOneSidedExposureShares, 150),
@@ -741,7 +811,7 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     mergeBatchMode: "HYBRID_DELAYED",
     minCompletedCyclesBeforeFirstMerge: config.minCompletedCyclesBeforeFirstMerge,
     minFirstMatchedAgeBeforeMergeSec: config.minFirstMatchedAgeBeforeMergeSec,
-    maxMatchedAgeBeforeForcedMergeSec: config.maxMatchedAgeBeforeForcedMergeSec,
+    maxMatchedAgeBeforeForcedMergeSec: Math.max(config.maxMatchedAgeBeforeForcedMergeSec, 180),
     mergeShieldSecFromOpen: config.mergeShieldSecFromOpen,
     forceMergeInLast30S: true,
     forceMergeOnHardImbalance: true,

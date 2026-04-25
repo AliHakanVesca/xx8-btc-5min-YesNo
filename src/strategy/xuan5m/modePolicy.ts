@@ -1,6 +1,7 @@
 import type { XuanStrategyConfig } from "../../config/strategyPresets.js";
 import type { XuanMarketState } from "./marketState.js";
 import type { StrategyExecutionMode } from "./executionModes.js";
+import { matchedEffectivePairCost, mergeableShares } from "./inventoryState.js";
 
 export interface CompletionAllowance {
   allowed: boolean;
@@ -19,6 +20,20 @@ export interface PairSweepAllowance {
   negativeEdgeUsdc: number;
   projectedMarketBudget: number;
   projectedDailyBudget: number;
+  marketBasketBootstrap?: boolean;
+  marketBasketContinuation?: boolean;
+  marketBasketProjectedEffectivePair?: number;
+  marketBasketProjectedMatchedQty?: number;
+}
+
+export interface MarketBasketContinuationProjection {
+  allowed: boolean;
+  projectedEffectivePair: number;
+  projectedMatchedQty: number;
+  currentMatchedQty: number;
+  currentEffectivePair: number;
+  improvement: number;
+  quality: "STRONG_BASKET" | "GOOD_BASKET" | "BORDERLINE_BASKET" | "BAD_BASKET";
 }
 
 export interface PartialCompletionPhase {
@@ -72,6 +87,95 @@ export interface FlowPressureBudgetState {
 
 export function estimateNegativeEdgeUsdc(costWithFees: number, size: number): number {
   return Math.max(0, costWithFees - 1) * size;
+}
+
+function normalizeTraceNumber(value: number): number {
+  return Number(value.toFixed(6));
+}
+
+export function marketBasketContinuationProjection(args: {
+  config: XuanStrategyConfig;
+  state: XuanMarketState;
+  costWithFees: number;
+  candidateSize: number;
+  secsToClose: number;
+}): MarketBasketContinuationProjection | undefined {
+  if (
+    !args.config.marketBasketScoringEnabled ||
+    !args.config.marketBasketContinuationEnabled ||
+    args.candidateSize <= 0 ||
+    !Number.isFinite(args.costWithFees)
+  ) {
+    return undefined;
+  }
+  const currentMatchedQty = mergeableShares(args.state);
+  if (currentMatchedQty < args.config.marketBasketContinuationMinMatchedShares - 1e-9) {
+    return undefined;
+  }
+  const currentEffectivePair = matchedEffectivePairCost(args.state, args.config.cryptoTakerFeeRate);
+  const projectedMatchedQty = currentMatchedQty + args.candidateSize;
+  const projectedEffectivePair =
+    (currentMatchedQty * currentEffectivePair + args.candidateSize * args.costWithFees) /
+    Math.max(projectedMatchedQty, 1e-9);
+  const improvement = currentEffectivePair - projectedEffectivePair;
+  const currentDebtUSDC = Math.max(0, currentEffectivePair - 1) * currentMatchedQty;
+  const projectedDebtUSDC = Math.max(0, projectedEffectivePair - 1) * projectedMatchedQty;
+  const deltaBasketDebtUSDC = currentDebtUSDC - projectedDebtUSDC;
+  const quality =
+    projectedEffectivePair <= args.config.marketBasketStrongAvgCap + 1e-9
+      ? "STRONG_BASKET"
+      : projectedEffectivePair <= args.config.marketBasketGoodAvgCap + 1e-9
+        ? "GOOD_BASKET"
+        : projectedEffectivePair <= args.config.marketBasketBorderlineAvgCap + 1e-9
+          ? "BORDERLINE_BASKET"
+          : "BAD_BASKET";
+  const improvesBorderlineBasket =
+    projectedEffectivePair <= args.config.marketBasketBorderlineAvgCap + 1e-9 &&
+    deltaBasketDebtUSDC >= args.config.marketBasketMinAvgImprovement * Math.max(args.candidateSize, 1);
+  const keepsGoodBasket = projectedEffectivePair <= args.config.marketBasketContinuationProjectedEffectivePairCap + 1e-9;
+  const allowed =
+    args.secsToClose > args.config.xuanMinTimeLeftForHardSweep &&
+    args.candidateSize <= args.config.marketBasketContinuationMaxQty + 1e-9 &&
+    args.costWithFees <= args.config.marketBasketContinuationMaxEffectivePair + 1e-9 &&
+    (keepsGoodBasket || improvesBorderlineBasket);
+
+  return {
+    allowed,
+    projectedEffectivePair: normalizeTraceNumber(projectedEffectivePair),
+    projectedMatchedQty: normalizeTraceNumber(projectedMatchedQty),
+    currentMatchedQty: normalizeTraceNumber(currentMatchedQty),
+    currentEffectivePair: normalizeTraceNumber(currentEffectivePair),
+    improvement: normalizeTraceNumber(improvement),
+    quality,
+  };
+}
+
+export function marketBasketBootstrapAllowed(args: {
+  config: XuanStrategyConfig;
+  state: XuanMarketState;
+  costWithFees: number;
+  candidateSize: number;
+  secsToClose: number;
+}): boolean {
+  if (
+    !args.config.marketBasketScoringEnabled ||
+    !args.config.marketBasketBootstrapEnabled ||
+    args.config.xuanCloneMode !== "PUBLIC_FOOTPRINT" ||
+    args.candidateSize <= 0 ||
+    !Number.isFinite(args.costWithFees)
+  ) {
+    return false;
+  }
+  const secsFromOpen = Math.max(0, args.config.marketDurationSec - args.secsToClose);
+  const flat =
+    args.state.upShares + args.state.downShares <= Math.max(args.config.postMergeFlatDustShares, 1e-6) &&
+    Math.abs(args.state.upShares - args.state.downShares) <= Math.max(args.config.postMergeFlatDustShares, 1e-6);
+  return (
+    flat &&
+    secsFromOpen <= args.config.marketBasketBootstrapMaxAgeSec + 1e-9 &&
+    args.candidateSize <= args.config.marketBasketBootstrapMaxQty + 1e-9 &&
+    args.costWithFees <= args.config.marketBasketBootstrapMaxEffectivePair + 1e-9
+  );
 }
 
 export function pairEntryCap(config: XuanStrategyConfig): number {
@@ -602,6 +706,8 @@ export function pairSweepAllowance(args: {
   const imbalanceRatio = imbalanceShares / Math.max(args.state.upShares + args.state.downShares, 1);
   const projectedMarketBudget = args.state.negativePairEdgeConsumedUsdc + negativeEdgeUsdc;
   const projectedDailyBudget = (args.dailyNegativeEdgeSpentUsdc ?? 0) + negativeEdgeUsdc;
+  const bootstrapAllowed = marketBasketBootstrapAllowed(args);
+  const basketContinuation = marketBasketContinuationProjection(args);
 
   if (args.secsToClose <= args.config.finalWindowNoChaseSec && !args.config.allowAnyNewBuyInLast10S) {
     return {
@@ -627,6 +733,19 @@ export function pairSweepAllowance(args: {
       negativeEdgeUsdc,
       projectedMarketBudget,
       projectedDailyBudget,
+    };
+  }
+
+  if (basketContinuation?.allowed) {
+    return {
+      allowed: true,
+      mode: "XUAN_HARD_PAIR_SWEEP",
+      negativeEdgeUsdc: 0,
+      projectedMarketBudget: args.state.negativePairEdgeConsumedUsdc,
+      projectedDailyBudget: args.dailyNegativeEdgeSpentUsdc ?? 0,
+      marketBasketContinuation: true,
+      marketBasketProjectedEffectivePair: basketContinuation.projectedEffectivePair,
+      marketBasketProjectedMatchedQty: basketContinuation.projectedMatchedQty,
     };
   }
 
@@ -703,11 +822,28 @@ export function pairSweepAllowance(args: {
     };
   }
 
+  if (bootstrapAllowed && withinCycleBudget && withinMarketBudget && withinDailyBudget) {
+    return {
+      allowed: true,
+      mode: "XUAN_HARD_PAIR_SWEEP",
+      negativeEdgeUsdc,
+      projectedMarketBudget,
+      projectedDailyBudget,
+      marketBasketBootstrap: true,
+    };
+  }
+
   return {
     allowed: false,
     negativeEdgeUsdc,
     projectedMarketBudget,
     projectedDailyBudget,
+    ...(basketContinuation
+      ? {
+          marketBasketProjectedEffectivePair: basketContinuation.projectedEffectivePair,
+          marketBasketProjectedMatchedQty: basketContinuation.projectedMatchedQty,
+        }
+      : {}),
   };
 }
 

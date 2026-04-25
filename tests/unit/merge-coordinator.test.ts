@@ -3,6 +3,7 @@ import { parseEnv } from "../../src/config/env.js";
 import { buildStrategyConfig } from "../../src/config/strategyPresets.js";
 import { buildOfflineMarket } from "../../src/infra/gamma/marketDiscovery.js";
 import { resolveBundledMergeClusterPrior } from "../../src/analytics/xuanExactReference.js";
+import { applyFill } from "../../src/strategy/xuan5m/inventoryState.js";
 import { createMarketState } from "../../src/strategy/xuan5m/marketState.js";
 import { classifyFlowPressureBudget } from "../../src/strategy/xuan5m/modePolicy.js";
 import {
@@ -91,6 +92,126 @@ describe("merge coordinator", () => {
     expect(gate.forced).toBe(true);
     expect(gate.reason).toBe("forced_age");
     expect(gate.oldestMatchedAgeSec).toBe(76);
+  });
+
+  it("releases a large high-quality matched basket before the generic age target", () => {
+    const config = buildConfig({
+      MARKET_BASKET_MIN_MERGE_SHARES: "40",
+      MARKET_BASKET_MERGE_EFFECTIVE_PAIR_CAP: "1",
+    });
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      price: 0.39,
+      size: 80,
+      timestamp: market.startTs + 10,
+      makerTaker: "taker",
+    });
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.5,
+      size: 80,
+      timestamp: market.startTs + 11,
+      makerTaker: "taker",
+    });
+    let tracker = createMergeBatchTracker();
+    tracker = syncMergeBatchTracker(tracker, 80, market.startTs + 11);
+
+    const gate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 46,
+      secsFromOpen: 46,
+      secsToClose: 254,
+      usdcBalance: 100,
+      tracker,
+    });
+
+    expect(gate.allow).toBe(true);
+    expect(gate.forced).toBe(false);
+    expect(gate.reason).toBe("basket_target");
+    expect(gate.pendingMatchedQty).toBe(80);
+  });
+
+  it("holds public-footprint age merges until the market basket reaches the xuan target", () => {
+    const config = buildConfig({
+      BOT_MODE: "XUAN",
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+    });
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.48,
+      size: 95,
+      timestamp: market.startTs,
+      makerTaker: "taker",
+    });
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      price: 0.531934,
+      size: 95,
+      timestamp: market.startTs + 1,
+      makerTaker: "taker",
+    });
+    let tracker = createMergeBatchTracker();
+    tracker = syncMergeBatchTracker(tracker, 95, market.startTs + 1);
+
+    const gate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 46,
+      secsFromOpen: 46,
+      secsToClose: 254,
+      usdcBalance: 100,
+      tracker,
+    });
+
+    expect(gate.allow).toBe(false);
+    expect(gate.forced).toBe(false);
+    expect(gate.reason).toBe("basket_debt_hold");
+    expect(gate.pendingMatchedQty).toBe(95);
+  });
+
+  it("releases a public-footprint basket once the xuan-sized merge target is reached", () => {
+    const config = buildConfig({
+      BOT_MODE: "XUAN",
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+    });
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      price: 0.39,
+      size: 320,
+      timestamp: market.startTs + 10,
+      makerTaker: "taker",
+    });
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.5,
+      size: 320,
+      timestamp: market.startTs + 11,
+      makerTaker: "taker",
+    });
+    let tracker = createMergeBatchTracker();
+    tracker = syncMergeBatchTracker(tracker, 320, market.startTs + 11);
+
+    const gate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 46,
+      secsFromOpen: 46,
+      secsToClose: 254,
+      usdcBalance: 100,
+      tracker,
+    });
+
+    expect(gate.allow).toBe(true);
+    expect(gate.forced).toBe(false);
+    expect(gate.reason).toBe("basket_target");
+    expect(gate.pendingMatchedQty).toBe(320);
   });
 
   it("forces merge in the final window and under low collateral", () => {
@@ -225,7 +346,7 @@ describe("merge coordinator", () => {
     expect(releasedGate.reason).toBe("hard_imbalance");
   });
 
-  it("uses generic age and forced-age merge gates when clone mode has no exact merge prior", () => {
+  it("holds generic age merges in public-footprint mode below the basket target", () => {
     const config = buildConfig({
       BOT_MODE: "XUAN",
       XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
@@ -242,7 +363,7 @@ describe("merge coordinator", () => {
       usdcBalance: 100,
       tracker,
     });
-    const releasedGate = evaluateDelayedMergeGate(config, state, {
+    const stillHeldGate = evaluateDelayedMergeGate(config, state, {
       nowTs: market.startTs + 76,
       secsFromOpen: 76,
       secsToClose: 224,
@@ -250,13 +371,149 @@ describe("merge coordinator", () => {
       tracker,
     });
 
-    expect(shieldedGate.allow).toBe(true);
-    expect(shieldedGate.reason).toBe("age_target");
-    expect(releasedGate.allow).toBe(true);
-    expect(releasedGate.reason).toBe("forced_age");
+    expect(shieldedGate.allow).toBe(false);
+    expect(shieldedGate.reason).toBe("public_footprint_hold");
+    expect(stillHeldGate.allow).toBe(false);
+    expect(stillHeldGate.reason).toBe("public_footprint_hold");
   });
 
-  it("uses generic cycle-target merge when clone mode has no exact merge prior", () => {
+  it("does not forced-age merge a debt-positive public-footprint basket before the final window", () => {
+    const config = buildConfig({
+      BOT_MODE: "XUAN",
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+    });
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.5,
+      size: 95,
+      timestamp: market.startTs,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      price: 0.48,
+      size: 95,
+      timestamp: market.startTs + 1,
+      makerTaker: "taker",
+      executionMode: "PARTIAL_FAST_COMPLETION",
+    });
+    let tracker = createMergeBatchTracker();
+    tracker = syncMergeBatchTracker(tracker, 95, market.startTs + 1);
+
+    const heldGate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 181,
+      secsFromOpen: 181,
+      secsToClose: 119,
+      usdcBalance: 100,
+      tracker,
+    });
+    const finalGate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 281,
+      secsFromOpen: 281,
+      secsToClose: 19,
+      usdcBalance: 100,
+      tracker,
+    });
+
+    expect(heldGate.allow).toBe(false);
+    expect(heldGate.forced).toBe(false);
+    expect(heldGate.reason).toBe("basket_debt_hold");
+    expect(finalGate.allow).toBe(true);
+    expect(finalGate.reason).toBe("final_window");
+  });
+
+  it("does not hard-imbalance merge a tiny debt-positive matched basket while residual completion can continue", () => {
+    const config = buildConfig({
+      BOT_MODE: "XUAN",
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+    });
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.47,
+      size: 95,
+      timestamp: market.startTs,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      price: 0.6,
+      size: 5,
+      timestamp: market.startTs + 1,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+    let tracker = createMergeBatchTracker();
+    tracker = syncMergeBatchTracker(tracker, 5, market.startTs + 1);
+
+    const gate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 1,
+      secsFromOpen: 1,
+      secsToClose: 299,
+      usdcBalance: 100,
+      tracker,
+    });
+
+    expect(gate.allow).toBe(false);
+    expect(gate.forced).toBe(false);
+    expect(gate.reason).toBe("basket_debt_hold");
+  });
+
+  it("holds public-footprint hard-imbalance merges below the normalized base-lot basket target", () => {
+    const config = buildConfig({
+      BOT_MODE: "XUAN",
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      DEFAULT_LOT: "95",
+      LIVE_SMALL_LOT_LADDER: "95,190",
+      FORCE_MERGE_ON_HARD_IMBALANCE: "true",
+    });
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.47,
+      size: 95,
+      timestamp: market.startTs,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      price: 0.35,
+      size: 65,
+      timestamp: market.startTs + 80,
+      makerTaker: "taker",
+      executionMode: "PARTIAL_FAST_COMPLETION",
+    });
+    let tracker = createMergeBatchTracker();
+    tracker = syncMergeBatchTracker(tracker, 65, market.startTs + 80);
+
+    const gate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 125,
+      secsFromOpen: 125,
+      secsToClose: 175,
+      usdcBalance: 100,
+      tracker,
+    });
+
+    expect(gate.allow).toBe(false);
+    expect(gate.forced).toBe(false);
+    expect(gate.reason).toBe("public_footprint_hold");
+    expect(gate.pendingMatchedQty).toBe(65);
+  });
+
+  it("holds generic cycle-target merges in public-footprint mode below the basket target", () => {
     const config = buildConfig({
       BOT_MODE: "XUAN",
       XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
@@ -278,9 +535,9 @@ describe("merge coordinator", () => {
       tracker,
     });
 
-    expect(gate.allow).toBe(true);
+    expect(gate.allow).toBe(false);
     expect(gate.forced).toBe(false);
-    expect(gate.reason).toBe("cycle_target");
+    expect(gate.reason).toBe("public_footprint_hold");
     expect(gate.completedCycles).toBe(5);
   });
 
@@ -317,10 +574,10 @@ describe("merge coordinator", () => {
       activeIndependentFlowCount: 2,
     });
 
-    expect(delayedGate.allow).toBe(true);
-    expect(delayedGate.reason).toBe("forced_age");
-    expect(releasedGate.allow).toBe(true);
-    expect(releasedGate.reason).toBe("forced_age");
+    expect(delayedGate.allow).toBe(false);
+    expect(delayedGate.reason).toBe("public_footprint_hold");
+    expect(releasedGate.allow).toBe(false);
+    expect(releasedGate.reason).toBe("public_footprint_hold");
   });
 
   it("coalesces nearby matched windows when strong multi-flow pressure is still active", () => {
@@ -386,8 +643,8 @@ describe("merge coordinator", () => {
       flowPressureState,
     });
 
-    expect(delayedGate.allow).toBe(true);
-    expect(delayedGate.reason).toBe("forced_age");
+    expect(delayedGate.allow).toBe(false);
+    expect(delayedGate.reason).toBe("public_footprint_hold");
   });
 
   it("uses the exact 1776253500 first merge cluster timing and qty envelope", () => {

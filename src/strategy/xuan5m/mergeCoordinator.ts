@@ -1,5 +1,5 @@
 import type { XuanStrategyConfig } from "../../config/strategyPresets.js";
-import { imbalance, mergeableShares } from "./inventoryState.js";
+import { imbalance, matchedEffectivePairCost, mergeableShares } from "./inventoryState.js";
 import type { XuanMarketState } from "./marketState.js";
 import { resolveBundledMergeClusterPrior, resolveBundledMergeTimingPrior } from "../../analytics/xuanExactReference.js";
 import { classifyFlowPressureBudget, type FlowPressureBudgetState } from "./modePolicy.js";
@@ -34,7 +34,9 @@ export interface MergeGateDecision extends MergeBatchMetrics {
     | "entry_shield"
     | "cluster_window"
     | "public_footprint_hold"
+    | "basket_debt_hold"
     | "cycle_target"
+    | "basket_target"
     | "age_target"
     | "forced_age"
     | "final_window"
@@ -159,7 +161,16 @@ export function evaluateDelayedMergeGate(
     | "hardImbalanceMergeOverlapGraceSec"
     | "hardImbalanceMergeMaxDeferrableShares"
     | "controlledOverlapSeedMaxQty"
+    | "defaultLot"
+    | "liveSmallLotLadder"
     | "minUsdcBalanceForNewEntry"
+    | "marketBasketScoringEnabled"
+    | "marketBasketStrongAvgCap"
+    | "marketBasketMinMergeShares"
+    | "marketBasketMergeEffectivePairCap"
+    | "marketBasketMergeTargetMultiplier"
+    | "marketBasketMergeTargetMaxShares"
+    | "cryptoTakerFeeRate"
   >,
   state: XuanMarketState,
   args: {
@@ -215,6 +226,28 @@ export function evaluateDelayedMergeGate(
     preserveMultiFlowBudget ? minCompletedCyclesBeforeFirstMerge + 1 : minCompletedCyclesBeforeFirstMerge;
   const effectiveMinFirstMatchedAgeBeforeMergeSec =
     preserveMultiFlowBudget ? minFirstMatchedAgeBeforeMergeSec + 12 : minFirstMatchedAgeBeforeMergeSec;
+  const baseBasketLot = Math.max(
+    config.controlledOverlapSeedMaxQty,
+    config.marketBasketMinMergeShares,
+    config.liveSmallLotLadder[0] ?? config.defaultLot,
+  );
+  const basketMergeTargetShares = normalize(
+    config.xuanCloneMode === "PUBLIC_FOOTPRINT"
+      ? Math.max(
+          config.marketBasketMinMergeShares,
+          Math.min(
+            config.marketBasketMergeTargetMaxShares,
+            baseBasketLot * Math.max(1, config.marketBasketMergeTargetMultiplier),
+          ),
+        )
+      : config.marketBasketMinMergeShares,
+  );
+  const publicHardImbalanceBatchFloor = normalize(
+    Math.min(
+      basketMergeTargetShares,
+      Math.max(config.marketBasketMinMergeShares, baseBasketLot * 2),
+    ),
+  );
 
   if (config.mergeMode !== "AUTO" || metrics.pendingMatchedQty <= 1e-6) {
     return {
@@ -234,6 +267,11 @@ export function evaluateDelayedMergeGate(
     };
   }
 
+  const basketEffectivePair =
+    config.marketBasketScoringEnabled && metrics.pendingMatchedQty > 1e-6
+      ? matchedEffectivePairCost(state, config.cryptoTakerFeeRate)
+      : undefined;
+
   if (config.forceMergeOnHardImbalance && imbalance(state) >= config.hardImbalanceRatio) {
     const hardImbalanceShareGap = Math.abs(state.upShares - state.downShares);
     const oldestMatchedAgeSec = metrics.oldestMatchedAgeSec ?? 0;
@@ -248,6 +286,33 @@ export function evaluateDelayedMergeGate(
       multiFlowGraceActive
         ? Math.max(config.hardImbalanceMergeMinAgeSec, config.hardImbalanceMergeOverlapGraceSec)
         : config.hardImbalanceMergeMinAgeSec;
+    const shouldHoldDebtPositiveHardImbalance =
+      publicFootprintHoldWithoutPrior &&
+      basketEffectivePair !== undefined &&
+      basketEffectivePair > config.marketBasketMergeEffectivePairCap + 1e-9 &&
+      metrics.pendingMatchedQty < publicHardImbalanceBatchFloor - 1e-9 &&
+      args.secsToClose > config.finalWindowCompletionOnlySec;
+    if (shouldHoldDebtPositiveHardImbalance) {
+      return {
+        allow: false,
+        forced: false,
+        reason: "basket_debt_hold",
+        ...metrics,
+      };
+    }
+    const shouldHoldPublicHardImbalanceForBatch =
+      publicFootprintHoldWithoutPrior &&
+      basketEffectivePair !== undefined &&
+      metrics.pendingMatchedQty < publicHardImbalanceBatchFloor - 1e-9 &&
+      args.secsToClose > config.finalWindowCompletionOnlySec;
+    if (shouldHoldPublicHardImbalanceForBatch) {
+      return {
+        allow: false,
+        forced: false,
+        reason: "public_footprint_hold",
+        ...metrics,
+      };
+    }
     const canDeferSmallHardImbalance =
       config.botMode === "XUAN" &&
       args.secsToClose > config.finalWindowCompletionOnlySec &&
@@ -299,10 +364,24 @@ export function evaluateDelayedMergeGate(
     };
   }
 
+  const basketDebtHoldActive =
+    publicFootprintHoldWithoutPrior &&
+    basketEffectivePair !== undefined &&
+    basketEffectivePair > config.marketBasketMergeEffectivePairCap + 1e-9 &&
+    args.secsToClose > config.finalWindowCompletionOnlySec;
+
   if (
     metrics.oldestMatchedAgeSec !== undefined &&
     metrics.oldestMatchedAgeSec >= maxMatchedAgeBeforeForcedMergeSec
   ) {
+    if (basketDebtHoldActive) {
+      return {
+        allow: false,
+        forced: false,
+        reason: "basket_debt_hold",
+        ...metrics,
+      };
+    }
     return {
       allow: true,
       forced: true,
@@ -320,6 +399,30 @@ export function evaluateDelayedMergeGate(
     };
   }
 
+  const strongEarlyBasketMerge =
+    basketEffectivePair !== undefined &&
+    metrics.pendingMatchedQty >= config.marketBasketMinMergeShares - 1e-9 &&
+    basketEffectivePair <= config.marketBasketStrongAvgCap + 1e-9;
+  if (
+    !exactMergePriorActive &&
+    basketEffectivePair !== undefined &&
+    (metrics.pendingMatchedQty >= basketMergeTargetShares - 1e-9 || strongEarlyBasketMerge) &&
+    basketEffectivePair <= config.marketBasketMergeEffectivePairCap + 1e-9
+  ) {
+    return {
+      allow: true,
+      forced: false,
+      reason: "basket_target",
+      ...metrics,
+    };
+  }
+
+  const shouldHoldForPublicFootprintBasket =
+    publicFootprintHoldWithoutPrior &&
+    basketEffectivePair !== undefined &&
+    !strongEarlyBasketMerge &&
+    metrics.pendingMatchedQty < basketMergeTargetShares - 1e-9;
+
   if (
     metrics.completedCycles >= effectiveMinCompletedCyclesBeforeFirstMerge &&
     (!config.requireMinAgeForCycleTargetMerge ||
@@ -327,6 +430,22 @@ export function evaluateDelayedMergeGate(
       metrics.oldestMatchedAgeSec === undefined ||
       metrics.oldestMatchedAgeSec >= effectiveMinFirstMatchedAgeBeforeMergeSec)
   ) {
+    if (basketDebtHoldActive) {
+      return {
+        allow: false,
+        forced: false,
+        reason: "basket_debt_hold",
+        ...metrics,
+      };
+    }
+    if (shouldHoldForPublicFootprintBasket) {
+      return {
+        allow: false,
+        forced: false,
+        reason: "public_footprint_hold",
+        ...metrics,
+      };
+    }
     return {
       allow: true,
       forced: false,
@@ -351,6 +470,22 @@ export function evaluateDelayedMergeGate(
     metrics.oldestMatchedAgeSec !== undefined &&
     metrics.oldestMatchedAgeSec >= effectiveMinFirstMatchedAgeBeforeMergeSec
   ) {
+    if (basketDebtHoldActive) {
+      return {
+        allow: false,
+        forced: false,
+        reason: "basket_debt_hold",
+        ...metrics,
+      };
+    }
+    if (shouldHoldForPublicFootprintBasket) {
+      return {
+        allow: false,
+        forced: false,
+        reason: "public_footprint_hold",
+        ...metrics,
+      };
+    }
     return {
       allow: true,
       forced: false,

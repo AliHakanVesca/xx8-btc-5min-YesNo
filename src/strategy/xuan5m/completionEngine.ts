@@ -3,7 +3,10 @@ import type { MarketOrderArgs, OutcomeSide } from "../../infra/clob/types.js";
 import { resolveBundledCompletionSequencePrior } from "../../analytics/xuanExactReference.js";
 import {
   absoluteShareGap,
+  applyFill,
   averageEffectiveCost,
+  matchedEffectivePairCost,
+  mergeableShares,
   oldestResidualLotTimestamp,
   projectedShareGapAfterBuy,
 } from "./inventoryState.js";
@@ -58,6 +61,13 @@ export interface CompletionDecision {
   completionRolePatienceMultiplier?: number;
   completionEffectivePatienceMultiplier?: number;
   completionWaitUntilSec?: number;
+  marketBasketContinuationDuty?: boolean;
+  marketBasketProjectedEffectivePair?: number;
+  marketBasketProjectedMatchedQty?: number;
+  marketBasketDebtBeforeUSDC?: number;
+  marketBasketDebtAfterUSDC?: number;
+  marketBasketDebtDeltaUSDC?: number;
+  marketBasketPhaseOverride?: boolean;
   overlapRepairArbitration?: "no_overlap_lock" | "standard_pair_reentry" | "favor_independent_overlap" | "favor_residual_repair";
   arbitrationOutcome?: "completion" | "hold";
 }
@@ -247,6 +257,14 @@ function chooseCompletion(
     missingShares,
     exactPriorActive: Boolean(exactCompletionQtyPrior),
   });
+  const basketContinuationCandidateSizes = buildMarketBasketContinuationCandidateSizes({
+    config,
+    state,
+    sideToBuy,
+    missingShares,
+    missingSideBestAsk: books.bestAsk(sideToBuy),
+    exactPriorActive: Boolean(exactCompletionQtyPrior),
+  });
   const phaseMaxQty =
     exactCompletionQtyPrior && Number.isFinite(phase.maxQty)
       ? Math.max(phase.maxQty, exactCompletionQtyPrior.qty)
@@ -262,16 +280,11 @@ function chooseCompletion(
         [
           ...(exactCompletionQtyPrior ? [exactCompletionQtyPrior.qty] : []),
           ...highLowOvershootCandidates,
+          ...basketContinuationCandidateSizes,
+          ...(Number.isFinite(phaseMaxQty) ? [phaseMaxQty] : []),
         ],
       )
-        .map((size) =>
-          normalizeSize(
-            Math.min(
-              size,
-              Number.isFinite(phaseMaxQty) ? phaseMaxQty : size,
-            ),
-          ),
-        )
+        .map((size) => normalizeSize(size))
         .filter((size) => size >= config.completionMinQty),
     ),
   ).sort((left, right) => right - left);
@@ -300,9 +313,6 @@ function chooseCompletion(
     ) {
       continue;
     }
-    if (candidateSize > phaseMaxQty) {
-      continue;
-    }
     const execution = books.quoteForSize(sideToBuy, "ask", candidateSize);
     if (!execution.fullyFilled) {
       continue;
@@ -317,6 +327,20 @@ function chooseCompletion(
     }
 
     const costWithFees = completionCost(existingAverage, execution.averagePrice, config.cryptoTakerFeeRate);
+    const marketBasketProjection = projectMarketBasketCompletion({
+      config,
+      state,
+      sideToBuy,
+      candidateSize,
+      missingSidePrice: execution.averagePrice,
+      nowTs: ctx.nowTs,
+    });
+    if (
+      candidateSize > phaseMaxQty &&
+      !marketBasketProjection?.phaseMaxOverrideAllowed
+    ) {
+      continue;
+    }
     const allowance = completionAllowance(config, state, {
       costWithFees,
       candidateSize,
@@ -325,7 +349,8 @@ function chooseCompletion(
       partialAgeSec,
     });
     const highLowPhaseCapOverride = Boolean(allowance.highLowMismatch && allowance.allowed);
-    if (costWithFees > phase.cap && !highLowPhaseCapOverride) {
+    const marketBasketPhaseCapOverride = Boolean(marketBasketProjection?.phaseMaxOverrideAllowed);
+    if (costWithFees > phase.cap && !highLowPhaseCapOverride && !marketBasketPhaseCapOverride) {
       continue;
     }
     const ultraFastCloneFairValueFallback =
@@ -519,6 +544,17 @@ function chooseCompletion(
       completionRolePatienceMultiplier: completionDelayProfile.rolePatienceMultiplier,
       completionEffectivePatienceMultiplier: completionDelayProfile.effectivePatienceMultiplier,
       completionWaitUntilSec: completionDelayProfile.waitUntilSec,
+      ...(marketBasketProjection
+        ? {
+            marketBasketContinuationDuty: marketBasketProjection.continuationDuty,
+            marketBasketProjectedEffectivePair: marketBasketProjection.projectedEffectivePair,
+            marketBasketProjectedMatchedQty: marketBasketProjection.projectedMatchedQty,
+            marketBasketDebtBeforeUSDC: marketBasketProjection.debtBeforeUSDC,
+            marketBasketDebtAfterUSDC: marketBasketProjection.debtAfterUSDC,
+            marketBasketDebtDeltaUSDC: marketBasketProjection.debtDeltaUSDC,
+            marketBasketPhaseOverride: marketBasketProjection.phaseMaxOverrideAllowed,
+          }
+        : {}),
       overlapRepairArbitration,
       arbitrationOutcome: "completion",
       order: buildTakerBuyOrder({
@@ -542,6 +578,9 @@ function chooseCompletion(
       residualAfter: projectedGap,
       exactQtyMatch:
         prioritizedExactQty !== undefined && Math.abs(candidateSize - prioritizedExactQty) <= 1e-6,
+      marketBasketDebtDeltaUSDC: marketBasketProjection?.debtDeltaUSDC,
+      marketBasketProjectedEffectivePair: marketBasketProjection?.projectedEffectivePair,
+      marketBasketPhaseOverride: marketBasketProjection?.phaseMaxOverrideAllowed,
     });
     if (score < bestCompletionScore) {
       bestCompletion = decision;
@@ -631,6 +670,9 @@ function completionCandidateScore(
     oldGap?: number | undefined;
     residualAfter?: number | undefined;
     exactQtyMatch?: boolean | undefined;
+    marketBasketDebtDeltaUSDC?: number | undefined;
+    marketBasketProjectedEffectivePair?: number | undefined;
+    marketBasketPhaseOverride?: boolean | undefined;
   },
 ): number {
   if (config.botMode !== "XUAN") {
@@ -649,7 +691,141 @@ function completionCandidateScore(
   const cleanupBonus =
     (args.residualAfter ?? Number.POSITIVE_INFINITY) <= config.residualJanitorMaxShareGap + 1e-9 ? 0.06 : 0;
   const exactQtyBonus = args.exactQtyMatch ? 0.5 : 0;
-  return Number((costPenalty - resolutionBonus - depthBonus - inventoryShapeBonus - cleanupBonus - exactQtyBonus).toFixed(9));
+  const basketDebtBonus = Math.min(0.35, Math.max(0, args.marketBasketDebtDeltaUSDC ?? 0) * 0.08);
+  const basketAvgBonus =
+    args.marketBasketProjectedEffectivePair !== undefined && args.marketBasketProjectedEffectivePair <= config.marketBasketGoodAvgCap + 1e-9
+      ? 0.12
+      : args.marketBasketProjectedEffectivePair !== undefined &&
+          args.marketBasketProjectedEffectivePair <= config.marketBasketContinuationProjectedEffectivePairCap + 1e-9
+        ? 0.06
+        : 0;
+  const basketPhaseBonus = args.marketBasketPhaseOverride ? 0.08 : 0;
+  return Number((
+    costPenalty -
+    resolutionBonus -
+    depthBonus -
+    inventoryShapeBonus -
+    cleanupBonus -
+    exactQtyBonus -
+    basketDebtBonus -
+    basketAvgBonus -
+    basketPhaseBonus
+  ).toFixed(9));
+}
+
+function buildMarketBasketContinuationCandidateSizes(args: {
+  config: XuanStrategyConfig;
+  state: XuanMarketState;
+  sideToBuy: OutcomeSide;
+  missingShares: number;
+  missingSideBestAsk: number;
+  exactPriorActive: boolean;
+}): number[] {
+  if (
+    args.exactPriorActive ||
+    args.config.xuanCloneMode !== "PUBLIC_FOOTPRINT" ||
+    !args.config.marketBasketScoringEnabled ||
+    !args.config.marketBasketContinuationEnabled
+  ) {
+    return [];
+  }
+  const baseLot = args.config.liveSmallLotLadder[0] ?? args.config.defaultLot;
+  const leadingShares = args.sideToBuy === "UP" ? args.state.downShares : args.state.upShares;
+  const currentMatchedQty = mergeableShares(args.state);
+  const currentPair = currentMatchedQty > 1e-6
+    ? matchedEffectivePairCost(args.state, args.config.cryptoTakerFeeRate)
+    : 0;
+  const continuationDuty =
+    leadingShares >= args.config.marketBasketContinuationMinMatchedShares - 1e-9 &&
+    (currentMatchedQty <= 1e-6 || currentPair > args.config.marketBasketGoodAvgCap + 1e-9);
+  if (!continuationDuty) {
+    return [];
+  }
+
+  const sizeCap = Math.min(args.missingShares, args.config.marketBasketContinuationMaxQty);
+  const qualityMultipliers =
+    args.missingSideBestAsk <= 0.12
+      ? [2, 1.5, 1, 0.5, 0.25]
+      : [1.5, 1, 0.5, 0.25];
+  return qualityMultipliers
+    .map((multiplier) => normalizeSize(Math.min(sizeCap, baseLot * multiplier)))
+    .filter((size) => size >= args.config.completionMinQty);
+}
+
+function projectMarketBasketCompletion(args: {
+  config: XuanStrategyConfig;
+  state: XuanMarketState;
+  sideToBuy: OutcomeSide;
+  candidateSize: number;
+  missingSidePrice: number;
+  nowTs?: number | undefined;
+}): {
+  continuationDuty: boolean;
+  projectedEffectivePair: number;
+  projectedMatchedQty: number;
+  debtBeforeUSDC: number;
+  debtAfterUSDC: number;
+  debtDeltaUSDC: number;
+  phaseMaxOverrideAllowed: boolean;
+} | undefined {
+  if (
+    args.config.xuanCloneMode !== "PUBLIC_FOOTPRINT" ||
+    !args.config.marketBasketScoringEnabled ||
+    !args.config.marketBasketContinuationEnabled
+  ) {
+    return undefined;
+  }
+  const beforeMatchedQty = mergeableShares(args.state);
+  const beforeEffectivePair =
+    beforeMatchedQty > 1e-6
+      ? matchedEffectivePairCost(args.state, args.config.cryptoTakerFeeRate)
+      : 0;
+  const debtBeforeUSDC = normalizeSize(Math.max(0, beforeEffectivePair - 1) * beforeMatchedQty);
+  const leadingShares = args.sideToBuy === "UP" ? args.state.downShares : args.state.upShares;
+  const continuationDuty =
+    leadingShares >= args.config.marketBasketContinuationMinMatchedShares - 1e-9 &&
+    (beforeMatchedQty <= 1e-6 || beforeEffectivePair > args.config.marketBasketGoodAvgCap + 1e-9);
+  if (!continuationDuty) {
+    return undefined;
+  }
+
+  const projectedState = applyFill(args.state, {
+    outcome: args.sideToBuy,
+    side: "BUY",
+    price: args.missingSidePrice,
+    size: args.candidateSize,
+    timestamp: args.nowTs ?? args.state.market.startTs,
+    makerTaker: "taker",
+    executionMode: "PARTIAL_FAST_COMPLETION",
+  });
+  const projectedMatchedQty = mergeableShares(projectedState);
+  if (projectedMatchedQty <= beforeMatchedQty + 1e-9) {
+    return undefined;
+  }
+  const projectedEffectivePair = matchedEffectivePairCost(projectedState, args.config.cryptoTakerFeeRate);
+  const debtAfterUSDC = normalizeSize(Math.max(0, projectedEffectivePair - 1) * projectedMatchedQty);
+  const debtDeltaUSDC = normalizeSize(debtBeforeUSDC - debtAfterUSDC);
+  const projectedKeepsBasketInContinuationBand =
+    projectedEffectivePair <= args.config.marketBasketContinuationProjectedEffectivePairCap + 1e-9;
+  const projectedGoodBasket = projectedEffectivePair <= args.config.marketBasketGoodAvgCap + 1e-9;
+  const strongDebtReducer =
+    debtDeltaUSDC >= args.config.marketBasketMinAvgImprovement * Math.max(args.candidateSize, 1);
+  const lowSideStrongContinuation =
+    args.missingSidePrice <= 0.12 &&
+    (projectedKeepsBasketInContinuationBand || debtDeltaUSDC > 0);
+  const phaseMaxOverrideAllowed =
+    args.candidateSize <= args.config.marketBasketContinuationMaxQty + 1e-9 &&
+    (projectedGoodBasket || projectedKeepsBasketInContinuationBand || strongDebtReducer || lowSideStrongContinuation);
+
+  return {
+    continuationDuty,
+    projectedEffectivePair,
+    projectedMatchedQty,
+    debtBeforeUSDC,
+    debtAfterUSDC,
+    debtDeltaUSDC,
+    phaseMaxOverrideAllowed,
+  };
 }
 
 function shouldDeferNibbleCompletionUnderFlowPressure(args: {

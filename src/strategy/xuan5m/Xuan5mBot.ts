@@ -298,8 +298,13 @@ export class Xuan5mBot {
       flowRotationRetrySelected && flowRotationEntryEvaluation
         ? flowRotationEntryEvaluation
         : initialEntryEvaluation;
+    const janitorEntryAllowed =
+      !risk.hardCancel &&
+      risk.tradable &&
+      config.residualJanitorEnabled &&
+      entryEvaluation.trace.skipReason === "micro_residual_janitor_pair";
     const entryBuys =
-      risk.allowNewEntries
+      risk.allowNewEntries || janitorEntryAllowed
         ? entryEvaluation.decisions
         : [];
     const sameWindowCompletionAndOverlap =

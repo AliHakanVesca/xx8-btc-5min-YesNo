@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { parseEnv } from "../../src/config/env.js";
 import { buildStrategyConfig } from "../../src/config/strategyPresets.js";
 import { buildOfflineMarket } from "../../src/infra/gamma/marketDiscovery.js";
+import { applyFill } from "../../src/strategy/xuan5m/inventoryState.js";
 import { createMarketState } from "../../src/strategy/xuan5m/marketState.js";
 import { chooseInventoryAdjustment } from "../../src/strategy/xuan5m/completionEngine.js";
 import { classifyFlowPressureBudget } from "../../src/strategy/xuan5m/modePolicy.js";
@@ -272,6 +273,55 @@ describe("entry and inventory adjustment", () => {
       arbitrationOutcome: "completion",
     });
     expect(adjustment?.unwind).toBeUndefined();
+  });
+
+  it("scales continuation completion from the basket base lot when it rescues a debt-prone seed", () => {
+    const xuanConfig = buildStrategyConfig(
+      parseEnv({
+        DRY_RUN: "true",
+        POLY_STACK_MODE: "current-prod-v1",
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        DEFAULT_LOT: "95",
+        LIVE_SMALL_LOT_LADDER: "95,190",
+        MARKET_BASKET_CONTINUATION_MAX_QTY: "190",
+        MARKET_BASKET_CONTINUATION_PROJECTED_EFFECTIVE_PAIR_CAP: "1.01",
+        MARKET_BASKET_GOOD_AVG_CAP: "1",
+      }),
+    );
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.47,
+      size: 95,
+      timestamp: market.startTs,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.35, size: 120 }], [{ price: 0.36, size: 120 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.46, size: 120 }], [{ price: 0.47, size: 120 }]),
+    );
+
+    const adjustment = chooseInventoryAdjustment(xuanConfig, state, books, {
+      secsToClose: 215,
+      nowTs: market.startTs + 85,
+      fairValueSnapshot: {
+        status: "valid",
+        estimatedThreshold: false,
+        fairUp: 0.36,
+        fairDown: 0.47,
+      },
+    });
+
+    expect(adjustment?.completion?.sideToBuy).toBe("UP");
+    expect(adjustment?.completion?.missingShares).toBeGreaterThanOrEqual(47.5);
+    expect(adjustment?.completion?.marketBasketContinuationDuty).toBe(true);
+    expect(adjustment?.completion?.marketBasketPhaseOverride).toBe(true);
+    expect(adjustment?.completion?.marketBasketProjectedEffectivePair).toBeLessThan(1);
   });
 
   it("avoids tiny nibble completions while confirmed multi-flow pressure is still active", () => {

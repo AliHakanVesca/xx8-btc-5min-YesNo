@@ -884,9 +884,23 @@ export async function runLivePaperSession(
   const clock = new SystemClock();
   const config = buildStrategyConfig(env);
   const discovery = await discoverCurrentAndNextMarkets({ env, gammaClient: gamma, clob, clock });
-  const secsToCurrentClose = discovery.current.endTs - clock.now();
+  const discoveryNowTs = clock.now();
+  const secsToCurrentClose = discovery.current.endTs - discoveryNowTs;
+  const secsFromCurrentOpen = discoveryNowTs - discovery.current.startTs;
+  const currentMarketAlreadyStarted =
+    env.LIVE_PAPER_START_AT_MARKET_OPEN &&
+    secsFromCurrentOpen > 0 &&
+    discovery.next.startTs > discoveryNowTs;
+  const currentMarketTooOldForEarlyPaper =
+    env.LIVE_PAPER_MAX_CURRENT_MARKET_AGE_SEC > 0 &&
+    secsFromCurrentOpen > env.LIVE_PAPER_MAX_CURRENT_MARKET_AGE_SEC &&
+    discovery.next.startTs > discoveryNowTs;
   const selection: "current" | "next" =
-    secsToCurrentClose <= config.normalEntryCutoffSecToClose ? "next" : "current";
+    secsToCurrentClose <= config.normalEntryCutoffSecToClose ||
+    currentMarketAlreadyStarted ||
+    currentMarketTooOldForEarlyPaper
+      ? "next"
+      : "current";
   const market = selection === "next" ? discovery.next : discovery.current;
   const client = new MarketWsClient(env);
   const startedAt = clock.now();
@@ -910,6 +924,8 @@ export async function runLivePaperSession(
     timestamp: startedAt,
     market: {
       selection,
+      startAtMarketOpen: env.LIVE_PAPER_START_AT_MARKET_OPEN,
+      secsFromCurrentOpen: normalize(secsFromCurrentOpen),
       slug: market.slug,
       conditionId: market.conditionId,
       startTs: market.startTs,
@@ -958,7 +974,8 @@ export async function runLivePaperSession(
       hasDownBook: Boolean(client.getBook(market.tokens.DOWN.tokenId)),
     });
 
-    while (clock.now() - startedAt < resolvedOptions.durationSec && clock.now() < market.endTs) {
+    const durationAnchorTs = Math.max(startedAt, market.startTs);
+    while (clock.now() - durationAnchorTs < resolvedOptions.durationSec && clock.now() < market.endTs) {
       const nowTs = clock.now();
       const tick = buildLivePaperTick({
         config,

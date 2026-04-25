@@ -128,6 +128,8 @@ export interface XuanStrategyConfig {
   highLowContinuationMinSpread: number;
   maxAvgImprovingAddedDebtUsdc: number;
   maxAvgImprovingClipsPerMarket: number;
+  xuanTemporalCompletionMinAgeSec: number;
+  xuanTemporalCompletionEarlyMaxEffectivePair: number;
   marketBasketBootstrapEnabled: boolean;
   marketBasketBootstrapMaxAgeSec: number;
   marketBasketBootstrapMaxEffectivePair: number;
@@ -531,6 +533,8 @@ export function buildStrategyConfig(env: AppEnv): XuanStrategyConfig {
     highLowContinuationMinSpread: env.HIGH_LOW_CONTINUATION_MIN_SPREAD,
     maxAvgImprovingAddedDebtUsdc: env.MAX_AVG_IMPROVING_ADDED_DEBT_USDC,
     maxAvgImprovingClipsPerMarket: env.MAX_AVG_IMPROVING_CLIPS_PER_MARKET,
+    xuanTemporalCompletionMinAgeSec: env.XUAN_TEMPORAL_COMPLETION_MIN_AGE_SEC,
+    xuanTemporalCompletionEarlyMaxEffectivePair: env.XUAN_TEMPORAL_COMPLETION_EARLY_MAX_EFFECTIVE_PAIR,
     marketBasketBootstrapEnabled: env.MARKET_BASKET_BOOTSTRAP_ENABLED,
     marketBasketBootstrapMaxAgeSec: env.MARKET_BASKET_BOOTSTRAP_MAX_AGE_SEC,
     marketBasketBootstrapMaxEffectivePair: env.MARKET_BASKET_BOOTSTRAP_MAX_EFFECTIVE_PAIR,

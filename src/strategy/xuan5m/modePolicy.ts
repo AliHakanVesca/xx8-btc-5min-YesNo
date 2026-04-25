@@ -439,6 +439,10 @@ export function marketBasketContinuationProjection(args: {
     addedDebtUSDC <= flowShapingBudgetRemainingUSDC + 1e-9 &&
     flowShapingClipBudgetRemaining > 0 &&
     args.candidateSize <= campaignBaseLot * args.config.xuanBasketCampaignFlowShapingQtyMultiplier + 1e-9;
+  const flowShapingTraceOnly =
+    campaignFlowShaping &&
+    deltaBasketDebtUSDC <= 0 &&
+    addedDebtUSDC > 0;
   const continuationWindowOpen = balancedButDebted
     ? args.secsToClose > args.config.finalWindowCompletionOnlySec
     : campaignActive
@@ -451,13 +455,15 @@ export function marketBasketContinuationProjection(args: {
     continuationWindowOpen &&
     args.candidateSize <= args.config.marketBasketContinuationMaxQty + 1e-9 &&
     args.costWithFees <= args.config.marketBasketContinuationMaxEffectivePair + 1e-9 &&
-    (debtReducingBasketAllowed || averageImprovesCampaign || campaignFlowShaping);
+    (debtReducingBasketAllowed || averageImprovesCampaign);
   const rejectedReason =
     continuationClass === "BAD"
       ? args.costWithFees > args.config.highLowAvgImprovingMaxEffectivePair + 1e-9 &&
         args.costWithFees < currentEffectivePair - args.config.marketBasketMinAvgImprovement + 1e-9
         ? "avg_improving_pair_too_expensive"
         : "continuation_not_debt_reducing_or_avg_improving"
+      : flowShapingTraceOnly
+        ? "flow_shaping_trace_only"
       : continuationClass === "FLOW_SHAPING" && campaignFlowCount >= campaignFlowTarget
         ? "flow_shaping_flow_target_met"
       : continuationClass === "FLOW_SHAPING" && flowShapingClipBudgetRemaining <= 0

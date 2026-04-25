@@ -2,6 +2,7 @@ import type { XuanStrategyConfig } from "../../config/strategyPresets.js";
 import type { XuanMarketState } from "./marketState.js";
 import type { StrategyExecutionMode } from "./executionModes.js";
 import { matchedEffectivePairCost, mergeableShares } from "./inventoryState.js";
+import { pairCostWithBothTaker } from "./sumAvgEngine.js";
 
 export interface CompletionAllowance {
   allowed: boolean;
@@ -24,6 +25,28 @@ export interface PairSweepAllowance {
   marketBasketContinuation?: boolean;
   marketBasketProjectedEffectivePair?: number;
   marketBasketProjectedMatchedQty?: number;
+  continuationClass?: MarketBasketContinuationClass;
+  campaignClipType?: MarketBasketClipType;
+  avgImprovingBudgetRemainingUSDC?: number;
+  avgImprovingClipBudgetRemaining?: number;
+  continuationRejectedReason?: string;
+}
+
+export type MarketBasketContinuationClass = "DEBT_REDUCING" | "AVG_IMPROVING" | "BAD";
+export type MarketBasketClipType =
+  | "MICRO_REPAIR"
+  | "CAMPAIGN_ENTRY"
+  | "CAMPAIGN_COMPLETION"
+  | "DEBT_REDUCING_CONTINUATION"
+  | "STRONG_HIGH_LOW_CONTINUATION";
+
+export interface CampaignCompletionSizing {
+  campaignBaseLot: number;
+  minCampaignClipQty: number;
+  defaultCampaignClipQty: number;
+  targetQty: number;
+  maxQty: number;
+  clipType: Extract<MarketBasketClipType, "MICRO_REPAIR" | "CAMPAIGN_COMPLETION">;
 }
 
 export interface MarketBasketContinuationProjection {
@@ -33,7 +56,25 @@ export interface MarketBasketContinuationProjection {
   currentMatchedQty: number;
   currentEffectivePair: number;
   improvement: number;
+  campaignMode?: "BASKET_CAMPAIGN_ACTIVE" | "ACCUMULATING_CONTINUATION";
+  campaignBaseLot?: number;
+  plannedContinuationQty?: number;
+  deltaAverageCost: number;
+  edgePerPair: number;
+  qtyNeededToRepayDebt?: number;
+  deltaBasketDebtUSDC: number;
+  addedDebtUSDC: number;
+  continuationClass: MarketBasketContinuationClass;
+  campaignClipType: MarketBasketClipType;
+  avgImprovingBudgetRemainingUSDC: number;
+  avgImprovingClipBudgetRemaining: number;
+  rejectedReason?: string;
   quality: "STRONG_BASKET" | "GOOD_BASKET" | "BORDERLINE_BASKET" | "BAD_BASKET";
+}
+
+interface AverageImprovingUsage {
+  addedDebtUSDC: number;
+  clipCount: number;
 }
 
 export interface PartialCompletionPhase {
@@ -93,12 +134,142 @@ function normalizeTraceNumber(value: number): number {
   return Number(value.toFixed(6));
 }
 
+export function resolveCampaignCompletionSizing(
+  config: XuanStrategyConfig,
+  missingShares: number,
+): CampaignCompletionSizing {
+  const campaignBaseLot = config.liveSmallLotLadder[0] ?? config.defaultLot;
+  const minCampaignPct = Math.max(config.campaignMinClipPct, config.campaignCompletionMinPct);
+  const minCampaignClipQty = Math.max(config.completionMinQty, campaignBaseLot * minCampaignPct);
+  const defaultCampaignClipQty = Math.max(minCampaignClipQty, campaignBaseLot * config.campaignDefaultClipPct);
+  const maxQty = Math.max(config.completionMinQty, config.xuanBasketCampaignCompletionClipMaxQty);
+  const boundedMissing = Math.max(0, missingShares);
+  const campaignTarget =
+    boundedMissing <= config.microRepairMaxQty + 1e-9
+      ? boundedMissing
+      : Math.min(boundedMissing, defaultCampaignClipQty, maxQty);
+  const targetQty = Number(campaignTarget.toFixed(6));
+  const clipType =
+    boundedMissing <= config.microRepairMaxQty + 1e-9 || targetQty <= config.microRepairMaxQty + 1e-9
+      ? "MICRO_REPAIR"
+      : "CAMPAIGN_COMPLETION";
+
+  return {
+    campaignBaseLot: normalizeTraceNumber(campaignBaseLot),
+    minCampaignClipQty: normalizeTraceNumber(minCampaignClipQty),
+    defaultCampaignClipQty: normalizeTraceNumber(defaultCampaignClipQty),
+    targetQty,
+    maxQty: normalizeTraceNumber(maxQty),
+    clipType,
+  };
+}
+
+function isPairedContinuationMode(mode: StrategyExecutionMode | undefined): boolean {
+  return mode === "PAIRGROUP_COVERED_SEED" || mode === "XUAN_HARD_PAIR_SWEEP" || mode === "XUAN_SOFT_PAIR_SWEEP";
+}
+
+function estimateAverageImprovingContinuationUsage(
+  config: XuanStrategyConfig,
+  state: XuanMarketState,
+): AverageImprovingUsage {
+  const buys = state.fillHistory
+    .filter((fill) => fill.side === "BUY" && isPairedContinuationMode(fill.executionMode))
+    .sort((left, right) => left.timestamp - right.timestamp);
+  const used = new Set<number>();
+  let addedDebtUSDC = 0;
+  let clipCount = 0;
+
+  for (let leftIndex = 0; leftIndex < buys.length; leftIndex += 1) {
+    if (used.has(leftIndex)) {
+      continue;
+    }
+    const left = buys[leftIndex]!;
+    let matchIndex = -1;
+    for (let rightIndex = leftIndex + 1; rightIndex < buys.length; rightIndex += 1) {
+      if (used.has(rightIndex)) {
+        continue;
+      }
+      const right = buys[rightIndex]!;
+      if (right.outcome === left.outcome) {
+        continue;
+      }
+      if (Math.abs(right.timestamp - left.timestamp) > 4) {
+        continue;
+      }
+      matchIndex = rightIndex;
+      break;
+    }
+    if (matchIndex < 0) {
+      continue;
+    }
+    const right = buys[matchIndex]!;
+    used.add(leftIndex);
+    used.add(matchIndex);
+    const up = left.outcome === "UP" ? left : right;
+    const down = left.outcome === "DOWN" ? left : right;
+    const spread = Math.abs(up.price - down.price);
+    const effectivePair = pairCostWithBothTaker(up.price, down.price, config.cryptoTakerFeeRate);
+    if (
+      spread + 1e-9 < config.highLowContinuationMinSpread ||
+      effectivePair < config.highLowDebtReducingEffectiveCap - 1e-9 ||
+      effectivePair > config.highLowAvgImprovingMaxEffectivePair + 1e-9
+    ) {
+      continue;
+    }
+    const pairedSize = Math.min(up.size, down.size);
+    addedDebtUSDC += Math.max(0, effectivePair - 1) * pairedSize;
+    clipCount += 1;
+  }
+
+  return {
+    addedDebtUSDC: normalizeTraceNumber(addedDebtUSDC),
+    clipCount,
+  };
+}
+
+function classifyContinuationCandidate(
+  config: XuanStrategyConfig,
+  currentEffectivePair: number,
+  candidateEffectivePair: number,
+): MarketBasketContinuationClass {
+  if (candidateEffectivePair < config.highLowDebtReducingEffectiveCap - 1e-9) {
+    return "DEBT_REDUCING";
+  }
+  if (
+    candidateEffectivePair <= config.highLowAvgImprovingMaxEffectivePair + 1e-9 &&
+    candidateEffectivePair < currentEffectivePair - config.marketBasketMinAvgImprovement + 1e-9
+  ) {
+    return "AVG_IMPROVING";
+  }
+  return "BAD";
+}
+
+function classifyCampaignContinuationClipType(args: {
+  config: XuanStrategyConfig;
+  continuationClass: MarketBasketContinuationClass;
+  candidateEffectivePair: number;
+  priceSpread?: number | undefined;
+}): MarketBasketClipType {
+  if (args.continuationClass === "DEBT_REDUCING") {
+    const strongHighLow =
+      args.priceSpread !== undefined &&
+      args.priceSpread + 1e-9 >= args.config.highLowContinuationMinSpread &&
+      args.candidateEffectivePair <= args.config.marketBasketStrongAvgCap + 1e-9;
+    return strongHighLow ? "STRONG_HIGH_LOW_CONTINUATION" : "DEBT_REDUCING_CONTINUATION";
+  }
+  if (args.continuationClass === "AVG_IMPROVING") {
+    return "CAMPAIGN_COMPLETION";
+  }
+  return "CAMPAIGN_ENTRY";
+}
+
 export function marketBasketContinuationProjection(args: {
   config: XuanStrategyConfig;
   state: XuanMarketState;
   costWithFees: number;
   candidateSize: number;
   secsToClose: number;
+  priceSpread?: number | undefined;
 }): MarketBasketContinuationProjection | undefined {
   if (
     !args.config.marketBasketScoringEnabled ||
@@ -109,18 +280,52 @@ export function marketBasketContinuationProjection(args: {
     return undefined;
   }
   const currentMatchedQty = mergeableShares(args.state);
-  if (currentMatchedQty < args.config.marketBasketContinuationMinMatchedShares - 1e-9) {
+  const currentEffectivePair = matchedEffectivePairCost(args.state, args.config.cryptoTakerFeeRate);
+  const residualQty = Math.abs(args.state.upShares - args.state.downShares);
+  const currentDebtUSDC = Math.max(0, currentEffectivePair - 1) * currentMatchedQty;
+  const campaignActive =
+    args.config.xuanBasketCampaignEnabled &&
+    currentMatchedQty >= args.config.xuanBasketCampaignMinMatchedShares - 1e-9 &&
+    residualQty <= Math.max(args.config.postMergeFlatDustShares, 1e-6) + 1e-9 &&
+    currentDebtUSDC > args.config.marketBasketMinDebtUsdc + 1e-9 &&
+    currentEffectivePair > args.config.marketBasketGoodAvgCap + 1e-9;
+  if (
+    currentMatchedQty < args.config.marketBasketContinuationMinMatchedShares - 1e-9 &&
+    !campaignActive
+  ) {
     return undefined;
   }
-  const currentEffectivePair = matchedEffectivePairCost(args.state, args.config.cryptoTakerFeeRate);
   const projectedMatchedQty = currentMatchedQty + args.candidateSize;
   const projectedEffectivePair =
     (currentMatchedQty * currentEffectivePair + args.candidateSize * args.costWithFees) /
     Math.max(projectedMatchedQty, 1e-9);
   const improvement = currentEffectivePair - projectedEffectivePair;
-  const currentDebtUSDC = Math.max(0, currentEffectivePair - 1) * currentMatchedQty;
   const projectedDebtUSDC = Math.max(0, projectedEffectivePair - 1) * projectedMatchedQty;
   const deltaBasketDebtUSDC = currentDebtUSDC - projectedDebtUSDC;
+  const edgePerPair = 1 - args.costWithFees;
+  const addedDebtUSDC = Math.max(0, args.costWithFees - 1) * args.candidateSize;
+  const campaignBaseLot = args.config.liveSmallLotLadder[0] ?? args.config.defaultLot;
+  const averageImprovingUsage = estimateAverageImprovingContinuationUsage(args.config, args.state);
+  const avgImprovingBudgetRemainingUSDC = Math.max(
+    0,
+    Math.min(
+      args.config.xuanBasketCampaignAvgImprovementMaxAddedDebtUsdc,
+      args.config.maxAvgImprovingAddedDebtUsdc,
+    ) - averageImprovingUsage.addedDebtUSDC,
+  );
+  const avgImprovingClipBudgetRemaining = Math.max(
+    0,
+    args.config.maxAvgImprovingClipsPerMarket - averageImprovingUsage.clipCount,
+  );
+  const balancedButDebted =
+    args.config.balancedDebtContinuationEnabled &&
+    currentMatchedQty >= args.config.marketBasketContinuationMinMatchedShares - 1e-9 &&
+    residualQty <= Math.max(args.config.postMergeFlatDustShares, 1e-6) + 1e-9 &&
+    currentDebtUSDC > args.config.marketBasketMinDebtUsdc + 1e-9;
+  const qtyNeededToRepayDebt =
+    balancedButDebted && edgePerPair > 1e-9
+      ? currentDebtUSDC / edgePerPair
+      : undefined;
   const quality =
     projectedEffectivePair <= args.config.marketBasketStrongAvgCap + 1e-9
       ? "STRONG_BASKET"
@@ -129,15 +334,69 @@ export function marketBasketContinuationProjection(args: {
         : projectedEffectivePair <= args.config.marketBasketBorderlineAvgCap + 1e-9
           ? "BORDERLINE_BASKET"
           : "BAD_BASKET";
+  const continuationClass = classifyContinuationCandidate(args.config, currentEffectivePair, args.costWithFees);
+  const campaignClipType = classifyCampaignContinuationClipType({
+    config: args.config,
+    continuationClass,
+    candidateEffectivePair: args.costWithFees,
+    priceSpread: args.priceSpread,
+  });
+  const spreadEligible =
+    args.priceSpread === undefined || args.priceSpread + 1e-9 >= args.config.highLowContinuationMinSpread;
   const improvesBorderlineBasket =
     projectedEffectivePair <= args.config.marketBasketBorderlineAvgCap + 1e-9 &&
     deltaBasketDebtUSDC >= args.config.marketBasketMinAvgImprovement * Math.max(args.candidateSize, 1);
   const keepsGoodBasket = projectedEffectivePair <= args.config.marketBasketContinuationProjectedEffectivePairCap + 1e-9;
+  const reducesBalancedDebt =
+    balancedButDebted &&
+    edgePerPair > 1e-9 &&
+    args.costWithFees < currentEffectivePair - args.config.marketBasketMinAvgImprovement + 1e-9 &&
+    deltaBasketDebtUSDC >= args.config.marketBasketMinAvgImprovement * Math.max(args.candidateSize, 1);
+  const averageImprovesCampaign =
+    campaignActive &&
+    continuationClass === "AVG_IMPROVING" &&
+    spreadEligible &&
+    args.costWithFees < currentEffectivePair - args.config.marketBasketMinAvgImprovement + 1e-9 &&
+    addedDebtUSDC <= avgImprovingBudgetRemainingUSDC + 1e-9 &&
+    avgImprovingClipBudgetRemaining > 0 &&
+    args.candidateSize <= campaignBaseLot * args.config.xuanBasketCampaignAvgImprovementQtyMultiplier + 1e-9;
+  const campaignDebtReducer =
+    campaignActive &&
+    continuationClass === "DEBT_REDUCING" &&
+    edgePerPair > 1e-9 &&
+    args.candidateSize <= campaignBaseLot * args.config.xuanBasketCampaignDebtReducingQtyMultiplier + 1e-9;
+  const continuationWindowOpen = balancedButDebted
+    ? args.secsToClose > args.config.finalWindowCompletionOnlySec
+    : campaignActive
+      ? args.secsToClose > args.config.finalWindowCompletionOnlySec
+      : args.secsToClose > args.config.xuanMinTimeLeftForHardSweep;
+  const debtReducingBasketAllowed =
+    continuationClass === "DEBT_REDUCING" &&
+    (keepsGoodBasket || improvesBorderlineBasket || reducesBalancedDebt || campaignDebtReducer);
   const allowed =
-    args.secsToClose > args.config.xuanMinTimeLeftForHardSweep &&
+    continuationWindowOpen &&
     args.candidateSize <= args.config.marketBasketContinuationMaxQty + 1e-9 &&
     args.costWithFees <= args.config.marketBasketContinuationMaxEffectivePair + 1e-9 &&
-    (keepsGoodBasket || improvesBorderlineBasket);
+    (debtReducingBasketAllowed || averageImprovesCampaign);
+  const rejectedReason =
+    continuationClass === "BAD"
+      ? args.costWithFees > args.config.highLowAvgImprovingMaxEffectivePair + 1e-9 &&
+        args.costWithFees < currentEffectivePair - args.config.marketBasketMinAvgImprovement + 1e-9
+        ? "avg_improving_pair_too_expensive"
+        : "continuation_not_debt_reducing_or_avg_improving"
+      : continuationClass === "AVG_IMPROVING" && !spreadEligible
+        ? "avg_improving_spread_too_small"
+      : continuationClass === "AVG_IMPROVING" && avgImprovingClipBudgetRemaining <= 0
+        ? "avg_improving_clip_budget_exhausted"
+        : continuationClass === "AVG_IMPROVING" && addedDebtUSDC > avgImprovingBudgetRemainingUSDC + 1e-9
+          ? "avg_improving_budget_exhausted"
+          : continuationClass === "AVG_IMPROVING" &&
+              args.candidateSize > campaignBaseLot * args.config.xuanBasketCampaignAvgImprovementQtyMultiplier + 1e-9
+            ? "avg_improving_qty_cap"
+            : continuationClass === "DEBT_REDUCING" &&
+                args.candidateSize > campaignBaseLot * args.config.xuanBasketCampaignDebtReducingQtyMultiplier + 1e-9
+              ? "debt_reducing_qty_cap"
+              : undefined;
 
   return {
     allowed,
@@ -146,6 +405,25 @@ export function marketBasketContinuationProjection(args: {
     currentMatchedQty: normalizeTraceNumber(currentMatchedQty),
     currentEffectivePair: normalizeTraceNumber(currentEffectivePair),
     improvement: normalizeTraceNumber(improvement),
+    ...(campaignActive
+      ? {
+          campaignMode: allowed ? "ACCUMULATING_CONTINUATION" : "BASKET_CAMPAIGN_ACTIVE",
+          campaignBaseLot: normalizeTraceNumber(campaignBaseLot),
+          plannedContinuationQty: normalizeTraceNumber(args.candidateSize),
+        }
+      : {}),
+    deltaAverageCost: normalizeTraceNumber(improvement),
+    edgePerPair: normalizeTraceNumber(edgePerPair),
+    ...(qtyNeededToRepayDebt !== undefined
+      ? { qtyNeededToRepayDebt: normalizeTraceNumber(qtyNeededToRepayDebt) }
+      : {}),
+    deltaBasketDebtUSDC: normalizeTraceNumber(deltaBasketDebtUSDC),
+    addedDebtUSDC: normalizeTraceNumber(addedDebtUSDC),
+    continuationClass,
+    campaignClipType,
+    avgImprovingBudgetRemainingUSDC: normalizeTraceNumber(avgImprovingBudgetRemainingUSDC),
+    avgImprovingClipBudgetRemaining,
+    ...(rejectedReason && !allowed ? { rejectedReason } : {}),
     quality,
   };
 }
@@ -695,6 +973,7 @@ export function pairSweepAllowance(args: {
   costWithFees: number;
   candidateSize: number;
   secsToClose: number;
+  priceSpread?: number | undefined;
   dailyNegativeEdgeSpentUsdc?: number | undefined;
   carryFlowConfidence?: number | undefined;
   matchedInventoryQuality?: number | undefined;
@@ -727,15 +1006,6 @@ export function pairSweepAllowance(args: {
     };
   }
 
-  if (args.secsToClose <= args.config.finalWindowSoftStartSec && !args.config.allowNewPairInLast60S) {
-    return {
-      allowed: false,
-      negativeEdgeUsdc,
-      projectedMarketBudget,
-      projectedDailyBudget,
-    };
-  }
-
   if (basketContinuation?.allowed) {
     return {
       allowed: true,
@@ -746,6 +1016,38 @@ export function pairSweepAllowance(args: {
       marketBasketContinuation: true,
       marketBasketProjectedEffectivePair: basketContinuation.projectedEffectivePair,
       marketBasketProjectedMatchedQty: basketContinuation.projectedMatchedQty,
+      continuationClass: basketContinuation.continuationClass,
+      campaignClipType: basketContinuation.campaignClipType,
+      avgImprovingBudgetRemainingUSDC: basketContinuation.avgImprovingBudgetRemainingUSDC,
+      avgImprovingClipBudgetRemaining: basketContinuation.avgImprovingClipBudgetRemaining,
+    };
+  }
+
+  if (basketContinuation) {
+    return {
+      allowed: false,
+      negativeEdgeUsdc,
+      projectedMarketBudget,
+      projectedDailyBudget,
+      marketBasketContinuation: true,
+      marketBasketProjectedEffectivePair: basketContinuation.projectedEffectivePair,
+      marketBasketProjectedMatchedQty: basketContinuation.projectedMatchedQty,
+      continuationClass: basketContinuation.continuationClass,
+      campaignClipType: basketContinuation.campaignClipType,
+      avgImprovingBudgetRemainingUSDC: basketContinuation.avgImprovingBudgetRemainingUSDC,
+      avgImprovingClipBudgetRemaining: basketContinuation.avgImprovingClipBudgetRemaining,
+      ...(basketContinuation.rejectedReason
+        ? { continuationRejectedReason: basketContinuation.rejectedReason }
+        : {}),
+    };
+  }
+
+  if (args.secsToClose <= args.config.finalWindowSoftStartSec && !args.config.allowNewPairInLast60S) {
+    return {
+      allowed: false,
+      negativeEdgeUsdc,
+      projectedMarketBudget,
+      projectedDailyBudget,
     };
   }
 
@@ -838,12 +1140,6 @@ export function pairSweepAllowance(args: {
     negativeEdgeUsdc,
     projectedMarketBudget,
     projectedDailyBudget,
-    ...(basketContinuation
-      ? {
-          marketBasketProjectedEffectivePair: basketContinuation.projectedEffectivePair,
-          marketBasketProjectedMatchedQty: basketContinuation.projectedMatchedQty,
-        }
-      : {}),
   };
 }
 

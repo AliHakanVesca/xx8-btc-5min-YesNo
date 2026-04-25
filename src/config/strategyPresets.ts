@@ -74,10 +74,42 @@ export interface XuanStrategyConfig {
   marketBasketMergeTargetMultiplier: number;
   marketBasketMergeTargetMaxShares: number;
   marketBasketContinuationEnabled: boolean;
+  allowMarketBasketContinuationWithoutFairValue: boolean;
   marketBasketContinuationMinMatchedShares: number;
   marketBasketContinuationMaxEffectivePair: number;
   marketBasketContinuationProjectedEffectivePairCap: number;
   marketBasketContinuationMaxQty: number;
+  balancedDebtContinuationEnabled: boolean;
+  marketBasketMinDebtUsdc: number;
+  initialBasketRecoveryPlanEnabled: boolean;
+  initialBasketDebtSoftEffectiveCap: number;
+  initialBasketDebtHardEffectiveCap: number;
+  initialBasketWeakRecoveryQtyMultiplier: number;
+  initialBasketMediumRecoveryQtyMultiplier: number;
+  initialBasketHardDebtNoPlanMaxQty: number;
+  initialNoRecoveryProbeMode: "SAFE" | "XUAN_FOOTPRINT";
+  initialNoRecoveryProbePct: number;
+  initialBasketMediumTerminalFairValueEdge: number;
+  initialBasketStrongTerminalFairValueEdge: number;
+  terminalCarryImprovementEnabled: boolean;
+  terminalCarryMinEvGainUsdc: number;
+  terminalCarryMinMinPnlImprovementUsdc: number;
+  terminalCarryMaxAddedDebtUsdc: number;
+  xuanBasketCampaignEnabled: boolean;
+  xuanBasketCampaignMinMatchedShares: number;
+  xuanBasketCampaignAvgImprovementMaxAddedDebtUsdc: number;
+  xuanBasketCampaignAvgImprovementQtyMultiplier: number;
+  xuanBasketCampaignDebtReducingQtyMultiplier: number;
+  xuanBasketCampaignCompletionClipMaxQty: number;
+  microRepairMaxQty: number;
+  campaignMinClipPct: number;
+  campaignDefaultClipPct: number;
+  campaignCompletionMinPct: number;
+  highLowDebtReducingEffectiveCap: number;
+  highLowAvgImprovingMaxEffectivePair: number;
+  highLowContinuationMinSpread: number;
+  maxAvgImprovingAddedDebtUsdc: number;
+  maxAvgImprovingClipsPerMarket: number;
   marketBasketBootstrapEnabled: boolean;
   marketBasketBootstrapMaxAgeSec: number;
   marketBasketBootstrapMaxEffectivePair: number;
@@ -281,6 +313,9 @@ export interface XuanStrategyConfig {
   fairValueFailClosedForNegativePair: boolean;
   fairValueFailClosedForHighSideChase: boolean;
   allowStrictResidualCompletionWithoutFairValue: boolean;
+  allowResidualCompletionWithoutFairValue: boolean;
+  residualCompletionCostBasisCap: number;
+  residualCompletionImprovementThreshold: number;
   strictResidualCompletionCap: number;
   softResidualCompletionCap: number;
   forbidUnderdogBuyIfFairBelowPrice: boolean;
@@ -424,10 +459,42 @@ export function buildStrategyConfig(env: AppEnv): XuanStrategyConfig {
     marketBasketMergeTargetMultiplier: env.MARKET_BASKET_MERGE_TARGET_MULTIPLIER,
     marketBasketMergeTargetMaxShares: env.MARKET_BASKET_MERGE_TARGET_MAX_SHARES,
     marketBasketContinuationEnabled: env.MARKET_BASKET_CONTINUATION_ENABLED,
+    allowMarketBasketContinuationWithoutFairValue: env.ALLOW_MARKET_BASKET_CONTINUATION_WITHOUT_FAIR_VALUE,
     marketBasketContinuationMinMatchedShares: env.MARKET_BASKET_CONTINUATION_MIN_MATCHED_SHARES,
     marketBasketContinuationMaxEffectivePair: env.MARKET_BASKET_CONTINUATION_MAX_EFFECTIVE_PAIR,
     marketBasketContinuationProjectedEffectivePairCap: env.MARKET_BASKET_CONTINUATION_PROJECTED_EFFECTIVE_PAIR_CAP,
     marketBasketContinuationMaxQty: env.MARKET_BASKET_CONTINUATION_MAX_QTY,
+    balancedDebtContinuationEnabled: env.BALANCED_DEBT_CONTINUATION_ENABLED,
+    marketBasketMinDebtUsdc: env.MARKET_BASKET_MIN_DEBT_USDC,
+    initialBasketRecoveryPlanEnabled: env.INITIAL_BASKET_RECOVERY_PLAN_ENABLED,
+    initialBasketDebtSoftEffectiveCap: env.INITIAL_BASKET_DEBT_SOFT_EFFECTIVE_CAP,
+    initialBasketDebtHardEffectiveCap: env.INITIAL_BASKET_DEBT_HARD_EFFECTIVE_CAP,
+    initialBasketWeakRecoveryQtyMultiplier: env.INITIAL_BASKET_WEAK_RECOVERY_QTY_MULTIPLIER,
+    initialBasketMediumRecoveryQtyMultiplier: env.INITIAL_BASKET_MEDIUM_RECOVERY_QTY_MULTIPLIER,
+    initialBasketHardDebtNoPlanMaxQty: env.INITIAL_BASKET_HARD_DEBT_NO_PLAN_MAX_QTY,
+    initialNoRecoveryProbeMode: env.INITIAL_NO_RECOVERY_PROBE_MODE,
+    initialNoRecoveryProbePct: env.INITIAL_NO_RECOVERY_PROBE_PCT,
+    initialBasketMediumTerminalFairValueEdge: env.INITIAL_BASKET_MEDIUM_TERMINAL_FAIR_VALUE_EDGE,
+    initialBasketStrongTerminalFairValueEdge: env.INITIAL_BASKET_STRONG_TERMINAL_FAIR_VALUE_EDGE,
+    terminalCarryImprovementEnabled: env.TERMINAL_CARRY_IMPROVEMENT_ENABLED,
+    terminalCarryMinEvGainUsdc: env.TERMINAL_CARRY_MIN_EV_GAIN_USDC,
+    terminalCarryMinMinPnlImprovementUsdc: env.TERMINAL_CARRY_MIN_MIN_PNL_IMPROVEMENT_USDC,
+    terminalCarryMaxAddedDebtUsdc: env.TERMINAL_CARRY_MAX_ADDED_DEBT_USDC,
+    xuanBasketCampaignEnabled: env.XUAN_BASKET_CAMPAIGN_ENABLED,
+    xuanBasketCampaignMinMatchedShares: env.XUAN_BASKET_CAMPAIGN_MIN_MATCHED_SHARES,
+    xuanBasketCampaignAvgImprovementMaxAddedDebtUsdc: env.XUAN_BASKET_CAMPAIGN_AVG_IMPROVEMENT_MAX_ADDED_DEBT_USDC,
+    xuanBasketCampaignAvgImprovementQtyMultiplier: env.XUAN_BASKET_CAMPAIGN_AVG_IMPROVEMENT_QTY_MULTIPLIER,
+    xuanBasketCampaignDebtReducingQtyMultiplier: env.XUAN_BASKET_CAMPAIGN_DEBT_REDUCING_QTY_MULTIPLIER,
+    xuanBasketCampaignCompletionClipMaxQty: env.XUAN_BASKET_CAMPAIGN_COMPLETION_CLIP_MAX_QTY,
+    microRepairMaxQty: env.MICRO_REPAIR_MAX_QTY,
+    campaignMinClipPct: env.CAMPAIGN_MIN_CLIP_PCT,
+    campaignDefaultClipPct: env.CAMPAIGN_DEFAULT_CLIP_PCT,
+    campaignCompletionMinPct: env.CAMPAIGN_COMPLETION_MIN_PCT,
+    highLowDebtReducingEffectiveCap: env.HIGH_LOW_DEBT_REDUCING_EFFECTIVE_CAP,
+    highLowAvgImprovingMaxEffectivePair: env.HIGH_LOW_AVG_IMPROVING_MAX_EFFECTIVE_PAIR,
+    highLowContinuationMinSpread: env.HIGH_LOW_CONTINUATION_MIN_SPREAD,
+    maxAvgImprovingAddedDebtUsdc: env.MAX_AVG_IMPROVING_ADDED_DEBT_USDC,
+    maxAvgImprovingClipsPerMarket: env.MAX_AVG_IMPROVING_CLIPS_PER_MARKET,
     marketBasketBootstrapEnabled: env.MARKET_BASKET_BOOTSTRAP_ENABLED,
     marketBasketBootstrapMaxAgeSec: env.MARKET_BASKET_BOOTSTRAP_MAX_AGE_SEC,
     marketBasketBootstrapMaxEffectivePair: env.MARKET_BASKET_BOOTSTRAP_MAX_EFFECTIVE_PAIR,
@@ -642,6 +709,9 @@ export function buildStrategyConfig(env: AppEnv): XuanStrategyConfig {
     fairValueFailClosedForNegativePair: env.FAIR_VALUE_FAIL_CLOSED_FOR_NEGATIVE_PAIR,
     fairValueFailClosedForHighSideChase: env.FAIR_VALUE_FAIL_CLOSED_FOR_HIGH_SIDE_CHASE,
     allowStrictResidualCompletionWithoutFairValue: env.ALLOW_STRICT_RESIDUAL_COMPLETION_WITHOUT_FAIR_VALUE,
+    allowResidualCompletionWithoutFairValue: env.ALLOW_RESIDUAL_COMPLETION_WITHOUT_FAIR_VALUE,
+    residualCompletionCostBasisCap: env.RESIDUAL_COMPLETION_COST_BASIS_CAP,
+    residualCompletionImprovementThreshold: env.RESIDUAL_COMPLETION_IMPROVEMENT_THRESHOLD,
     strictResidualCompletionCap: env.STRICT_RESIDUAL_COMPLETION_CAP,
     softResidualCompletionCap: env.SOFT_RESIDUAL_COMPLETION_CAP,
     forbidUnderdogBuyIfFairBelowPrice: env.FORBID_UNDERDOG_BUY_IF_FAIR_BELOW_PRICE,
@@ -749,8 +819,8 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
       1.01,
     ),
     marketBasketBorderlineAvgCap: Math.max(config.marketBasketBorderlineAvgCap, 1.02),
-    marketBasketMergeTargetMultiplier: Math.max(config.marketBasketMergeTargetMultiplier, 8),
-    marketBasketMergeTargetMaxShares: Math.max(config.marketBasketMergeTargetMaxShares, 320),
+    marketBasketMergeTargetMultiplier: Math.max(config.marketBasketMergeTargetMultiplier, 2.5),
+    marketBasketMergeTargetMaxShares: Math.max(config.marketBasketMergeTargetMaxShares, 900),
     maxMarketExposureShares: Math.max(config.maxMarketExposureShares, 500),
     maxMarketSharesPerSide: Math.max(config.maxMarketSharesPerSide, 500),
     maxOneSidedExposureShares: Math.max(config.maxOneSidedExposureShares, 150),

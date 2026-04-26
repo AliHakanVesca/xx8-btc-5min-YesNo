@@ -335,15 +335,37 @@ export function marketBasketContinuationProjection(args: {
   const currentEffectivePair = matchedEffectivePairCost(args.state, args.config.cryptoTakerFeeRate);
   const residualQty = Math.abs(args.state.upShares - args.state.downShares);
   const currentDebtUSDC = Math.max(0, currentEffectivePair - 1) * currentMatchedQty;
-  const campaignActive =
+  const campaignBaseLot = args.config.liveSmallLotLadder[0] ?? args.config.defaultLot;
+  const campaignFlowCount = estimateCampaignFlowCount(args.state);
+  const campaignFlowTarget = Math.max(1, args.config.xuanBasketCampaignMinFlows);
+  const campaignMergeTargetQty = Math.max(
+    args.config.marketBasketMinMergeShares,
+    Math.min(
+      args.config.marketBasketMergeTargetMaxShares,
+      campaignBaseLot * Math.max(1, args.config.marketBasketMergeTargetMultiplier),
+    ),
+  );
+  const hasCampaignBuy = hasXuanCampaignBuy(args.state);
+  const debtPositiveCampaignActive =
     args.config.xuanBasketCampaignEnabled &&
     currentMatchedQty >= args.config.xuanBasketCampaignMinMatchedShares - 1e-9 &&
     currentDebtUSDC > args.config.marketBasketMinDebtUsdc + 1e-9 &&
     currentEffectivePair > args.config.marketBasketGoodAvgCap + 1e-9 &&
     (
       residualQty <= Math.max(args.config.postMergeFlatDustShares, 1e-6) + 1e-9 ||
-      hasXuanCampaignBuy(args.state)
+      hasCampaignBuy
     );
+  const postProfitCampaignActive =
+    args.config.xuanBasketCampaignEnabled &&
+    args.config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
+    hasCampaignBuy &&
+    currentMatchedQty >= args.config.xuanBasketCampaignMinMatchedShares - 1e-9 &&
+    residualQty <= Math.max(args.config.postMergeFlatDustShares, 1e-6) + 1e-9 &&
+    currentEffectivePair <= args.config.marketBasketMergeEffectivePairCap + 1e-9 &&
+    currentMatchedQty < campaignMergeTargetQty - 1e-9 &&
+    campaignFlowCount < campaignFlowTarget &&
+    args.secsToClose > args.config.finalWindowCompletionOnlySec;
+  const campaignActive = debtPositiveCampaignActive || postProfitCampaignActive;
   if (
     currentMatchedQty < args.config.marketBasketContinuationMinMatchedShares - 1e-9 &&
     !campaignActive
@@ -359,10 +381,7 @@ export function marketBasketContinuationProjection(args: {
   const deltaBasketDebtUSDC = currentDebtUSDC - projectedDebtUSDC;
   const edgePerPair = 1 - args.costWithFees;
   const addedDebtUSDC = Math.max(0, args.costWithFees - 1) * args.candidateSize;
-  const campaignBaseLot = args.config.liveSmallLotLadder[0] ?? args.config.defaultLot;
   const averageImprovingUsage = estimateAverageImprovingContinuationUsage(args.config, args.state);
-  const campaignFlowCount = estimateCampaignFlowCount(args.state);
-  const campaignFlowTarget = Math.max(1, args.config.xuanBasketCampaignMinFlows);
   const avgImprovingBudgetRemainingUSDC = Math.max(
     0,
     Math.min(

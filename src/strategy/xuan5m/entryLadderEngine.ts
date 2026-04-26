@@ -145,6 +145,7 @@ export interface BalancedPairCandidateTrace {
   cycleSkippedReason?: string | undefined;
   xuanBorderlinePhase?: XuanBorderlineEntryPhase | undefined;
   fairValueFallbackReason?: string | undefined;
+  postProfitLowSideSetup?: boolean | undefined;
   stagedEntry?: boolean | undefined;
   plannedOppositeSide?: OutcomeSide | undefined;
   plannedOppositeQty?: number | undefined;
@@ -206,6 +207,7 @@ export interface SingleLegSeedCandidateTrace {
   cycleSkippedReason?: string | undefined;
   xuanBorderlinePhase?: XuanBorderlineEntryPhase | undefined;
   fairValueFallbackReason?: string | undefined;
+  postProfitLowSideSetup?: boolean | undefined;
   stagedEntry?: boolean | undefined;
   plannedOppositeSide?: OutcomeSide | undefined;
   plannedOppositeQty?: number | undefined;
@@ -284,6 +286,7 @@ export interface EntryDecisionTrace {
   flowShapingClipBudgetRemaining?: number;
   campaignFlowCount?: number;
   campaignFlowTarget?: number;
+  stagedDebtReducingFlow?: boolean;
   initialBasketRecoveryPlan?: "none" | "weak" | "medium" | "strong";
   initialBasketRecoveryScore?: number;
   initialBasketEffectivePair?: number;
@@ -357,6 +360,7 @@ export interface EntryDecisionTrace {
     | "recent_completion"
     | "temporal_priority"
     | "covered_seed_priority"
+    | "staged_debt_reducing_flow"
     | undefined;
   semanticRoleTarget?: "neutral" | "mid_pair" | "high_low_setup" | "raw_side_preserve" | undefined;
   completionRoleReleaseOrderBias?: "neutral" | "role_order" | undefined;
@@ -895,6 +899,36 @@ interface MarketBasketStateTrace {
   campaignMode?: "BASKET_CAMPAIGN_ACTIVE";
 }
 
+function estimateTraceCampaignFlowCount(state: XuanMarketState): number {
+  const buys = state.fillHistory
+    .filter((fill) => fill.side === "BUY")
+    .sort((left, right) => left.timestamp - right.timestamp);
+  let flowCount = 0;
+  let lastTimestamp: number | undefined;
+
+  for (const fill of buys) {
+    if (lastTimestamp === undefined || fill.timestamp - lastTimestamp > 4) {
+      flowCount += 1;
+    }
+    lastTimestamp = fill.timestamp;
+  }
+
+  return flowCount;
+}
+
+function publicFootprintBasketMergeTargetQty(config: XuanStrategyConfig): number {
+  const baseLot = config.liveSmallLotLadder[0] ?? config.defaultLot;
+  return normalizeTraceNumber(
+    Math.max(
+      config.marketBasketMinMergeShares,
+      Math.min(
+        config.marketBasketMergeTargetMaxShares,
+        baseLot * Math.max(1, config.marketBasketMergeTargetMultiplier),
+      ),
+    ),
+  );
+}
+
 function effectiveInventoryCost(state: XuanMarketState, side: OutcomeSide, feeRate: number): number {
   const lots = side === "UP" ? state.upLots : state.downLots;
   if (lots.length === 0) {
@@ -936,7 +970,10 @@ function marketBasketStateTrace(config: XuanStrategyConfig, state: XuanMarketSta
         fill.executionMode === "HIGH_LOW_COMPLETION_CHASE"
       ),
   );
-  const campaignActive =
+  const campaignFlowCount = estimateTraceCampaignFlowCount(state);
+  const campaignFlowTarget = Math.max(1, config.xuanBasketCampaignMinFlows);
+  const campaignMergeTargetQty = publicFootprintBasketMergeTargetQty(config);
+  const debtPositiveCampaignActive =
     config.xuanBasketCampaignEnabled &&
     config.marketBasketContinuationEnabled &&
     mergeableQty >= config.xuanBasketCampaignMinMatchedShares - 1e-9 &&
@@ -946,6 +983,17 @@ function marketBasketStateTrace(config: XuanStrategyConfig, state: XuanMarketSta
       residualQty <= Math.max(config.postMergeFlatDustShares, 1e-6) + 1e-9 ||
       campaignSeedActive
     );
+  const postProfitCampaignActive =
+    config.xuanBasketCampaignEnabled &&
+    config.marketBasketContinuationEnabled &&
+    config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
+    campaignSeedActive &&
+    mergeableQty >= config.xuanBasketCampaignMinMatchedShares - 1e-9 &&
+    residualQty <= Math.max(config.postMergeFlatDustShares, 1e-6) + 1e-9 &&
+    basketEffectiveAvg <= config.marketBasketMergeEffectivePairCap + 1e-9 &&
+    mergeableQty < campaignMergeTargetQty - 1e-9 &&
+    campaignFlowCount < campaignFlowTarget;
+  const campaignActive = debtPositiveCampaignActive || postProfitCampaignActive;
   return {
     totalUp: normalizeTraceNumber(state.upShares),
     totalDown: normalizeTraceNumber(state.downShares),
@@ -2131,6 +2179,52 @@ export function evaluateEntryBuys(
         bestCandidate: inspected.bestCandidate,
         flowPressureState,
       });
+    const stagedDebtReducingFlow =
+      inspected.bestCandidate !== undefined
+        ? buildStagedDebtReducingFlowSeed({
+            config,
+            state,
+            ctx,
+            basketState: currentBasketState,
+            candidate: inspected.bestCandidate,
+          })
+        : undefined;
+
+    const stagedDebtReducingCandidate = inspected.bestCandidate;
+    if (stagedDebtReducingFlow && stagedDebtReducingCandidate) {
+      return {
+        decisions: [stagedDebtReducingFlow.decision],
+        trace: {
+          ...trace,
+          mode: "temporal_pair_cycle",
+          selectedMode: stagedDebtReducingFlow.decision.mode,
+          rawPair: stagedDebtReducingCandidate.rawPairCost,
+          effectivePair: stagedDebtReducingCandidate.pairCost,
+          feeUSDC: stagedDebtReducingCandidate.feeUSDC,
+          expectedNetIfMerged: stagedDebtReducingCandidate.expectedNetIfMerged,
+          ...basketTraceFromCandidate(stagedDebtReducingCandidate),
+          stagedEntry: true,
+          stagedDebtReducingFlow: true,
+          plannedOppositeSide: stagedDebtReducingFlow.plannedOppositeSide,
+          plannedOppositeQty: stagedDebtReducingFlow.plannedOppositeQty,
+          cycleQualityLabel: stagedDebtReducingCandidate.cycleQualityLabel,
+          cycleOpenedReason: "temporal_single_leg_seed",
+          stateAfter: projectedStateAfterCycleBuys(
+            state,
+            stagedDebtReducingFlow.decision.side === "UP" ? stagedDebtReducingFlow.decision.size : 0,
+            stagedDebtReducingFlow.decision.side === "DOWN" ? stagedDebtReducingFlow.decision.size : 0,
+            stagedDebtReducingFlow.decision.side === "UP" ? stagedDebtReducingFlow.decision.expectedAveragePrice : 0,
+            stagedDebtReducingFlow.decision.side === "DOWN" ? stagedDebtReducingFlow.decision.expectedAveragePrice : 0,
+          ),
+          candidates: inspected.traces,
+          childOrderIntendedSide: stagedDebtReducingFlow.decision.side,
+          childOrderSelectedSide: stagedDebtReducingFlow.decision.side,
+          childOrderReason: "staged_debt_reducing_flow",
+          semanticRoleTarget: "high_low_setup",
+          skipReason: "staged_debt_reducing_flow",
+        },
+      };
+    }
 
     if (inspected.bestCandidate && !preferTemporalCloneCycle) {
       return {
@@ -5379,6 +5473,50 @@ function shouldBlockPublicFootprintMicroCoveredSeedFallback(args: {
   return args.candidateSize + 1e-6 < minCampaignClipQty;
 }
 
+function shouldAllowPostProfitLowSideCampaignSeed(args: {
+  config: XuanStrategyConfig;
+  state: XuanMarketState;
+  basketState: MarketBasketStateTrace;
+  side: OutcomeSide;
+  seedPrice: number;
+  oppositePrice: number;
+  rawPairCost: number;
+  referencePairCost: number;
+  pairExecutableSize: number;
+  oldGap: number;
+}): boolean {
+  if (
+    args.config.botMode !== "XUAN" ||
+    args.config.xuanCloneMode !== "PUBLIC_FOOTPRINT" ||
+    !args.config.xuanBasketCampaignEnabled ||
+    !args.config.marketBasketContinuationEnabled ||
+    args.basketState.basketDebtUSDC > args.config.marketBasketMinDebtUsdc + 1e-9 ||
+    args.basketState.basketEffectiveAvg > args.config.marketBasketMergeEffectivePairCap + 1e-9 ||
+    args.basketState.mergeableQty <= 1e-6 ||
+    args.basketState.mergeableQty >= publicFootprintBasketMergeTargetQty(args.config) - 1e-9 ||
+    args.basketState.residualQty > Math.max(args.config.postMergeFlatDustShares, 1e-6) + 1e-9 ||
+    args.oldGap > Math.max(args.config.postMergeFlatDustShares, 1e-6) + 1e-9 ||
+    args.pairExecutableSize <= 0 ||
+    !Number.isFinite(args.rawPairCost) ||
+    !Number.isFinite(args.referencePairCost)
+  ) {
+    return false;
+  }
+
+  const lowSide = args.seedPrice <= args.oppositePrice;
+  const spread = Math.abs(args.seedPrice - args.oppositePrice);
+  if (!lowSide || args.seedPrice > args.config.lowSideMaxForHighCompletion + 1e-9) {
+    return false;
+  }
+  if (spread + 1e-9 < args.config.highLowContinuationMinSpread) {
+    return false;
+  }
+  if (args.rawPairCost > args.config.xuanBorderlineRawPairCap + 1e-9) {
+    return false;
+  }
+  return args.referencePairCost <= args.config.xuanBasketCampaignFlowShapingEffectiveCap + 1e-9;
+}
+
 function evaluateSingleLegSeed(
   config: XuanStrategyConfig,
   state: XuanMarketState,
@@ -5583,6 +5721,29 @@ function evaluateSingleLegSeed(
       referencePriorActive,
       freshCycleCandidateContext,
     );
+    const postProfitLowSideSetup = shouldAllowPostProfitLowSideCampaignSeed({
+      config,
+      state,
+      basketState,
+      side,
+      seedPrice: seedQuote.averagePrice,
+      oppositePrice: oppositeQuote.averagePrice,
+      rawPairCost,
+      referencePairCost,
+      pairExecutableSize,
+      oldGap,
+    });
+    if (
+      postProfitLowSideSetup &&
+      (
+        skipReason === undefined ||
+        skipReason === "fresh_cycle_borderline_pair" ||
+        skipReason === "early_mid_pair_repeat_fee_guard" ||
+        skipReason === "borderline_same_pattern_repeat"
+      )
+    ) {
+      skipReason = undefined;
+    }
     const borderlineCoveredSeedAllowed =
       cycleTrace.cycleQualityLabel === "BORDERLINE_PAIR" &&
       skipReason === undefined &&
@@ -5627,6 +5788,7 @@ function evaluateSingleLegSeed(
       continuationDutyActive &&
       continuationProjection !== undefined &&
       !continuationProjection.allowed &&
+      !postProfitLowSideSetup &&
       (skipReason === undefined ||
         skipReason === "fresh_cycle_borderline_pair" ||
         skipReason === "fresh_cycle_bad_pair")
@@ -5640,9 +5802,14 @@ function evaluateSingleLegSeed(
       config.borderlinePairStagedEntryEnabled &&
       requiresSamePairgroupOppositeOrder &&
       !canUseInventoryCover;
+    const useStagedPostProfitLowSideEntry =
+      postProfitLowSideSetup &&
+      requiresSamePairgroupOppositeOrder &&
+      !canUseInventoryCover;
 
     if (
       skipReason === undefined &&
+      !postProfitLowSideSetup &&
       shouldBlockLowSideUnpairedBasketDebtSeed({
         config,
         state,
@@ -5681,6 +5848,8 @@ function evaluateSingleLegSeed(
       borderlinePolicy,
     })
       ? "missing_fair_value_allowed_by_pair_reference_cap"
+      : postProfitLowSideSetup && baseFairValueDecision.reason === "fair_value_missing"
+        ? "post_profit_low_side_setup"
       : undefined;
     if (
       skipReason === undefined &&
@@ -5749,7 +5918,15 @@ function evaluateSingleLegSeed(
         : {}),
       ...(borderlinePolicy ? { xuanBorderlinePhase: borderlinePolicy.phase } : {}),
       ...(fairValueFallbackReason ? { fairValueFallbackReason } : {}),
+      ...(postProfitLowSideSetup ? { postProfitLowSideSetup: true } : {}),
       ...(useStagedBorderlineEntry
+        ? {
+            stagedEntry: true,
+            plannedOppositeSide: oppositeSide,
+            plannedOppositeQty: pairExecutableSize,
+          }
+        : {}),
+      ...(useStagedPostProfitLowSideEntry
         ? {
             stagedEntry: true,
             plannedOppositeSide: oppositeSide,
@@ -5819,7 +5996,7 @@ function evaluateSingleLegSeed(
           negativeEdgeUsdc,
           seedQuote.averagePrice + oppositeQuote.averagePrice,
         );
-      decisions = useStagedBorderlineEntry
+      decisions = useStagedBorderlineEntry || useStagedPostProfitLowSideEntry
         ? [seedDecision]
         : [seedDecision, coveredDecision];
     }
@@ -5992,6 +6169,71 @@ function buildBalancedPairEntryBuys(
       candidate.rawPairCost,
     ),
   );
+}
+
+function buildStagedDebtReducingFlowSeed(args: {
+  config: XuanStrategyConfig;
+  state: XuanMarketState;
+  ctx: EntryLadderContext;
+  basketState: MarketBasketStateTrace;
+  candidate: BalancedPairCandidate;
+}): { decision: EntryBuyDecision; plannedOppositeSide: OutcomeSide; plannedOppositeQty: number } | undefined {
+  if (
+    args.config.botMode !== "XUAN" ||
+    args.config.xuanCloneMode !== "PUBLIC_FOOTPRINT" ||
+    !args.config.xuanBasketCampaignEnabled ||
+    !args.config.marketBasketContinuationEnabled ||
+    args.ctx.secsToClose <= args.config.finalWindowCompletionOnlySec ||
+    !(args.basketState.balancedButDebted || args.basketState.campaignActive) ||
+    Math.abs(args.state.upShares - args.state.downShares) > Math.max(args.config.postMergeFlatDustShares, 1e-6)
+  ) {
+    return undefined;
+  }
+  if (
+    !args.candidate.marketBasketContinuation ||
+    args.candidate.continuationClass !== "DEBT_REDUCING" ||
+    args.candidate.campaignClipType !== "STRONG_HIGH_LOW_CONTINUATION" ||
+    args.candidate.pairCost >= args.config.highLowDebtReducingEffectiveCap - 1e-9
+  ) {
+    return undefined;
+  }
+  const flowCount = args.candidate.campaignFlowCount ?? 0;
+  const flowTarget = args.candidate.campaignFlowTarget ?? args.config.xuanBasketCampaignMinFlows;
+  if (flowCount >= flowTarget) {
+    return undefined;
+  }
+  const upPrice = args.candidate.upExecution.averagePrice;
+  const downPrice = args.candidate.downExecution.averagePrice;
+  const spread = Math.abs(upPrice - downPrice);
+  const lowSide: OutcomeSide = upPrice <= downPrice ? "UP" : "DOWN";
+  const highSide: OutcomeSide = lowSide === "UP" ? "DOWN" : "UP";
+  const lowExecution = lowSide === "UP" ? args.candidate.upExecution : args.candidate.downExecution;
+  const lowPrice = lowSide === "UP" ? upPrice : downPrice;
+  if (
+    spread + 1e-9 < args.config.highLowContinuationMinSpread ||
+    lowPrice > args.config.lowSideMaxForHighCompletion + 0.06 + 1e-9
+  ) {
+    return undefined;
+  }
+  const baseLot = args.config.liveSmallLotLadder[0] ?? args.config.defaultLot;
+  if (args.candidate.requestedSize < baseLot * args.config.xuanBasketCampaignAvgImprovementQtyMultiplier - 1e-9) {
+    return undefined;
+  }
+  return {
+    decision: buildEntryBuy(
+      args.state,
+      lowSide,
+      lowExecution,
+      "temporal_single_leg_seed",
+      "TEMPORAL_SINGLE_LEG_SEED",
+      args.config.cryptoTakerFeeRate,
+      args.candidate.pairCost,
+      args.candidate.negativeEdgeUsdc,
+      args.candidate.rawPairCost,
+    ),
+    plannedOppositeSide: highSide,
+    plannedOppositeQty: args.candidate.requestedSize,
+  };
 }
 
 function preferredBalancedPairFirstSide(

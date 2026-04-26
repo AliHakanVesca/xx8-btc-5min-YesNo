@@ -429,7 +429,10 @@ export function evaluateDelayedMergeGate(
 
   const strongEarlyBasketMerge =
     basketEffectivePair !== undefined &&
-    metrics.pendingMatchedQty >= config.marketBasketMinMergeShares - 1e-9 &&
+    metrics.pendingMatchedQty >=
+      (config.xuanCloneMode === "PUBLIC_FOOTPRINT"
+        ? basketMergeTargetShares
+        : config.marketBasketMinMergeShares) - 1e-9 &&
     basketEffectivePair <= config.marketBasketStrongAvgCap + 1e-9;
   if (
     !exactMergePriorActive &&

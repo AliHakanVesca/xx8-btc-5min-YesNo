@@ -134,6 +134,48 @@ describe("merge coordinator", () => {
     expect(gate.pendingMatchedQty).toBe(80);
   });
 
+  it("holds a public-footprint strong basket below the xuan-sized merge target", () => {
+    const config = buildConfig({
+      BOT_MODE: "XUAN",
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      MARKET_BASKET_MIN_MERGE_SHARES: "40",
+      MARKET_BASKET_MERGE_EFFECTIVE_PAIR_CAP: "1",
+    });
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      price: 0.39,
+      size: 80,
+      timestamp: market.startTs + 10,
+      makerTaker: "taker",
+    });
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.5,
+      size: 80,
+      timestamp: market.startTs + 11,
+      makerTaker: "taker",
+    });
+    let tracker = createMergeBatchTracker();
+    tracker = syncMergeBatchTracker(tracker, 80, market.startTs + 11);
+
+    const gate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 46,
+      secsFromOpen: 46,
+      secsToClose: 254,
+      usdcBalance: 100,
+      tracker,
+    });
+
+    expect(gate.allow).toBe(false);
+    expect(gate.forced).toBe(false);
+    expect(gate.reason).toBe("public_footprint_hold");
+    expect(gate.pendingMatchedQty).toBe(80);
+  });
+
   it("holds public-footprint age merges until the market basket reaches the xuan target", () => {
     const config = buildConfig({
       BOT_MODE: "XUAN",

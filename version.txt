@@ -1,6 +1,16 @@
 
 ##############################################
 
+Version : V.0.0.34
+Date    : 26.04.2026
+Author  : Ali Hakan Çakır
+Changes : - Forced-age merge gate public-footprint basket target altinda bekletildi.
+          - Profitable public-footprint basket icin forced-age hold testi eklendi.
+
+##############################################
+
+##############################################
+
 Version : V.0.0.33
 Date    : 26.04.2026
 Author  : Ali Hakan Çakır

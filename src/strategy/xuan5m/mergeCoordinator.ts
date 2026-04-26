@@ -397,6 +397,11 @@ export function evaluateDelayedMergeGate(
     basketEffectivePair !== undefined &&
     basketEffectivePair > config.marketBasketMergeEffectivePairCap + 1e-9 &&
     args.secsToClose > config.finalWindowCompletionOnlySec;
+  const forcedAgePublicFootprintBasketHold =
+    publicFootprintHoldWithoutPrior &&
+    basketEffectivePair !== undefined &&
+    metrics.pendingMatchedQty < basketMergeTargetShares - 1e-9 &&
+    args.secsToClose > config.finalWindowCompletionOnlySec;
 
   if (
     metrics.oldestMatchedAgeSec !== undefined &&
@@ -407,6 +412,14 @@ export function evaluateDelayedMergeGate(
         allow: false,
         forced: false,
         reason: "basket_debt_hold",
+        ...metrics,
+      };
+    }
+    if (forcedAgePublicFootprintBasketHold) {
+      return {
+        allow: false,
+        forced: false,
+        reason: "public_footprint_hold",
         ...metrics,
       };
     }

@@ -31,6 +31,7 @@ import {
 import { pairCostWithBothTaker } from "./sumAvgEngine.js";
 import type { StrategyExecutionMode } from "./executionModes.js";
 import type { FairValueSnapshot } from "./fairValueEngine.js";
+import type { OutcomeSide } from "../../infra/clob/types.js";
 
 export interface BotDecision {
   phase: ReturnType<typeof getStrategyPhase>;
@@ -59,6 +60,8 @@ export interface BotDecisionTrace {
   flowRotationRetryAttempted: boolean;
   flowRotationRetrySelected: boolean;
   sameWindowCompletionAndOverlap: boolean;
+  sameSideOverlapPrunedForCompletion?: boolean | undefined;
+  sameSideOverlapRecoveryPairCost?: number | undefined;
   entry: EntryDecisionTrace;
 }
 
@@ -303,13 +306,22 @@ export class Xuan5mBot {
       risk.tradable &&
       config.residualJanitorEnabled &&
       entryEvaluation.trace.skipReason === "micro_residual_janitor_pair";
-    const entryBuys =
+    const rawEntryBuys =
       risk.allowNewEntries || janitorEntryAllowed
         ? entryEvaluation.decisions
         : [];
+    const sameSideOverlapArbitration = arbitrateSameSideCompletionOverlap(
+      config,
+      state,
+      books,
+      rawEntryBuys,
+      inventoryAdjustmentProbe,
+    );
+    const entryBuys = sameSideOverlapArbitration.entryBuys;
     const sameWindowCompletionAndOverlap =
       risk.allowNewEntries &&
-      shouldAllowSameWindowCompletionAndOverlap(config, state, entryEvaluation, entryBuys, inventoryAdjustmentProbe);
+      (sameSideOverlapArbitration.forceCompletion ||
+        shouldAllowSameWindowCompletionAndOverlap(config, state, entryEvaluation, entryBuys, inventoryAdjustmentProbe));
     const inventoryAdjustment =
       !risk.allowNewEntries || sameWindowCompletionAndOverlap
         ? inventoryAdjustmentProbe
@@ -339,13 +351,26 @@ export class Xuan5mBot {
         flowRotationRetryAttempted: shouldAttemptFlowRotationRetry,
         flowRotationRetrySelected,
         sameWindowCompletionAndOverlap,
+        ...(sameSideOverlapArbitration.prunedForCompletion
+          ? {
+              sameSideOverlapPrunedForCompletion: true,
+              ...(sameSideOverlapArbitration.recoveryPairCost !== undefined
+                ? { sameSideOverlapRecoveryPairCost: sameSideOverlapArbitration.recoveryPairCost }
+                : {}),
+            }
+          : {}),
         selectedMode:
           entryBuys[0]?.mode ??
           inventoryAdjustment?.completion?.mode ??
           inventoryAdjustment?.unwind?.mode ??
           entryEvaluation.trace.selectedMode,
         entry: risk.allowNewEntries
-          ? entryEvaluation.trace
+          ? sameSideOverlapArbitration.prunedForCompletion
+            ? {
+                ...entryEvaluation.trace,
+                skipReason: "same_side_overlap_pruned_for_completion",
+              }
+            : entryEvaluation.trace
           : {
               ...entryEvaluation.trace,
               gatedByRisk: true,
@@ -354,6 +379,105 @@ export class Xuan5mBot {
       },
     };
   }
+}
+
+interface SameSideOverlapArbitrationResult {
+  entryBuys: EntryBuyDecision[];
+  forceCompletion: boolean;
+  prunedForCompletion: boolean;
+  recoveryPairCost?: number | undefined;
+}
+
+function arbitrateSameSideCompletionOverlap(
+  config: XuanStrategyConfig,
+  state: XuanMarketState,
+  books: OrderBookState,
+  entryBuys: EntryBuyDecision[],
+  inventoryAdjustment: InventoryAdjustmentDecision | undefined,
+): SameSideOverlapArbitrationResult {
+  if (config.botMode !== "XUAN" || config.xuanCloneMode !== "PUBLIC_FOOTPRINT" || !inventoryAdjustment?.completion) {
+    return { entryBuys, forceCompletion: false, prunedForCompletion: false };
+  }
+
+  const completion = inventoryAdjustment.completion;
+  const sameSideTemporalBuys = entryBuys.filter(
+    (entryBuy) =>
+      entryBuy.reason === "temporal_single_leg_seed" &&
+      entryBuy.side === completion.sideToBuy,
+  );
+  if (sameSideTemporalBuys.length === 0) {
+    return { entryBuys, forceCompletion: false, prunedForCompletion: false };
+  }
+
+  const sideShares = completion.sideToBuy === "UP" ? state.upShares : state.downShares;
+  const oppositeSide: OutcomeSide = completion.sideToBuy === "UP" ? "DOWN" : "UP";
+  const oppositeShares = oppositeSide === "UP" ? state.upShares : state.downShares;
+  if (oppositeShares <= sideShares + config.maxCompletionOvershootShares + 1e-6) {
+    return { entryBuys, forceCompletion: false, prunedForCompletion: false };
+  }
+
+  const sameSideQty = sameSideTemporalBuys.reduce((sum, entryBuy) => sum + entryBuy.size, 0);
+  const projectedSameSideShares = sideShares + completion.missingShares + sameSideQty;
+  const newSameSideResidualQty = Math.max(0, projectedSameSideShares - oppositeShares);
+  const largeResidualThreshold = Math.max(
+    config.completionMinQty,
+    config.controlledOverlapSeedMaxQty * 0.5,
+    (config.liveSmallLotLadder[0] ?? config.defaultLot) * 0.35,
+  );
+  if (newSameSideResidualQty < largeResidualThreshold - 1e-6) {
+    return { entryBuys, forceCompletion: false, prunedForCompletion: false };
+  }
+
+  const recoveryPairCost = sameSideOverlapRecoveryPairCost({
+    config,
+    books,
+    sameSide: completion.sideToBuy,
+    oppositeSide,
+    sameSideBuys: sameSideTemporalBuys,
+    residualQty: newSameSideResidualQty,
+  });
+  const recoverablePairCap = Math.min(
+    config.highLowAvgImprovingMaxEffectivePair,
+    config.xuanBasketCampaignFlowShapingEffectiveCap,
+  );
+  if (recoveryPairCost !== undefined && recoveryPairCost <= recoverablePairCap + 1e-9) {
+    return { entryBuys, forceCompletion: false, prunedForCompletion: false, recoveryPairCost };
+  }
+
+  const prunedEntryBuys = entryBuys.filter((entryBuy) => !sameSideTemporalBuys.includes(entryBuy));
+  return {
+    entryBuys: prunedEntryBuys,
+    forceCompletion: true,
+    prunedForCompletion: true,
+    recoveryPairCost,
+  };
+}
+
+function sameSideOverlapRecoveryPairCost(args: {
+  config: XuanStrategyConfig;
+  books: OrderBookState;
+  sameSide: OutcomeSide;
+  oppositeSide: OutcomeSide;
+  sameSideBuys: EntryBuyDecision[];
+  residualQty: number;
+}): number | undefined {
+  const quoteQty = Math.min(
+    args.residualQty,
+    args.sameSideBuys.reduce((sum, entryBuy) => sum + entryBuy.size, 0),
+  );
+  if (quoteQty <= 1e-6) {
+    return undefined;
+  }
+  const oppositeQuote = args.books.quoteForSize(args.oppositeSide, "ask", quoteQty);
+  if (!oppositeQuote.fullyFilled) {
+    return undefined;
+  }
+  const sameSideAveragePrice =
+    args.sameSideBuys.reduce((sum, entryBuy) => sum + entryBuy.expectedAveragePrice * entryBuy.size, 0) /
+    Math.max(1e-6, args.sameSideBuys.reduce((sum, entryBuy) => sum + entryBuy.size, 0));
+  const upPrice = args.sameSide === "UP" ? sameSideAveragePrice : oppositeQuote.averagePrice;
+  const downPrice = args.sameSide === "DOWN" ? sameSideAveragePrice : oppositeQuote.averagePrice;
+  return Number(pairCostWithBothTaker(upPrice, downPrice, args.config.cryptoTakerFeeRate).toFixed(6));
 }
 
 function shouldAllowSameWindowCompletionAndOverlap(

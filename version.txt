@@ -1,6 +1,16 @@
 
 ##############################################
 
+Version : V.0.0.33
+Date    : 26.04.2026
+Author  : Ali Hakan Çakır
+Changes : - Same-side overlap arbitration completion lehine budama akisi eklendi.
+          - Temporal orphan completion ve micro covered-seed fallback testleri genisletildi.
+
+##############################################
+
+##############################################
+
 Version : V.0.0.32
 Date    : 26.04.2026
 Author  : Ali Hakan Çakır

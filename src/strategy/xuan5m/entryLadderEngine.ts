@@ -275,6 +275,8 @@ export interface EntryDecisionTrace {
   fairValueEVBefore?: number;
   fairValueEVAfter?: number;
   addedDebtUSDC?: number;
+  xuanTemporalCompletionMinAgeSec?: number;
+  xuanTemporalCompletionEarlyMaxEffectivePair?: number;
   continuationClass?: MarketBasketContinuationClass;
   avgImprovingBudgetRemainingUSDC?: number;
   avgImprovingClipBudgetRemaining?: number;
@@ -2312,6 +2314,8 @@ export function evaluateEntryBuys(
       marketBasketContinuationCycleSkippedReason ??
       seedEvaluation.trace.find((seedTrace) => seedTrace.cycleSkippedReason === "low_side_unpaired_basket_debt")
         ?.cycleSkippedReason ??
+      seedEvaluation.trace.find((seedTrace) => seedTrace.cycleSkippedReason === "xuan_micro_covered_seed_fallback")
+        ?.cycleSkippedReason ??
       temporalSeedEvaluation.trace.find((seedTrace) => seedTrace.cycleSkippedReason)?.cycleSkippedReason ??
       seedEvaluation.trace.find((seedTrace) => seedTrace.cycleSkippedReason)?.cycleSkippedReason ??
       inspected.traces.find((candidateTrace) => candidateTrace.cycleSkippedReason)?.cycleSkippedReason;
@@ -2827,6 +2831,42 @@ export function evaluateEntryBuys(
       newGap,
     });
     const campaignPhaseCapOverride = campaignResidualFallback.allowed;
+    const earlyTemporalLaggingRebalanceWait =
+      config.botMode === "XUAN" &&
+      config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
+      !exactCompletionQtyPrior &&
+      partialAgeSec < config.xuanTemporalCompletionMinAgeSec &&
+      ctx.secsToClose > config.finalWindowCompletionOnlySec &&
+      repairCost > config.xuanTemporalCompletionEarlyMaxEffectivePair + 1e-9;
+    if (earlyTemporalLaggingRebalanceWait) {
+      lastBlockedRepairEvaluation = {
+        decisions: [],
+        trace: {
+          ...trace,
+          repairSizingMode,
+          repairCandidateCount: repairCandidateSizes.length,
+          repairFilledSize: executableSize,
+          repairFinalQty: executableSize,
+          repairCost,
+          repairAllowed: allowance.allowed,
+          repairCapMode: allowance.capMode,
+          repairOldGap: oldGap,
+          repairNewGap: newGap,
+          repairWouldIncreaseImbalance: wouldIncreaseImbalance,
+          repairOppositeAveragePrice: oppositeAveragePrice,
+          repairHighLowMismatch: allowance.highLowMismatch ?? false,
+          completionReleaseRole: blockedCompletionReleaseRole,
+          completionHoldSec: normalizeTraceNumber(config.xuanTemporalCompletionMinAgeSec - partialAgeSec),
+          xuanTemporalCompletionMinAgeSec: config.xuanTemporalCompletionMinAgeSec,
+          xuanTemporalCompletionEarlyMaxEffectivePair: config.xuanTemporalCompletionEarlyMaxEffectivePair,
+          currentBasketEffectiveAvg: normalizeTraceNumber(currentMatchedEffectivePair),
+          continuationRejectedReason: "temporal_lagging_rebalance_wait",
+          overlapRepairOutcome: "wait",
+          skipReason: "temporal_lagging_rebalance_wait",
+        },
+      };
+      continue;
+    }
     const campaignResidualCostBasisBlocked =
       unbalancedCampaignResidual &&
       oldGap >= Math.max(config.controlledOverlapMinResidualShares, config.microRepairMaxQty) - 1e-9 &&
@@ -5307,6 +5347,38 @@ function shouldAllowCoveredSeedMissingFairValue(args: {
   return args.rawPairCost <= rawCap + 1e-9 && args.referencePairCost <= effectiveCap + 1e-9;
 }
 
+function shouldBlockPublicFootprintMicroCoveredSeedFallback(args: {
+  config: XuanStrategyConfig;
+  state: XuanMarketState;
+  basketState: MarketBasketStateTrace;
+  candidateSize: number;
+}): boolean {
+  if (
+    args.config.botMode !== "XUAN" ||
+    args.config.xuanCloneMode !== "PUBLIC_FOOTPRINT" ||
+    !args.config.xuanBasketCampaignEnabled ||
+    !args.config.marketBasketBootstrapEnabled
+  ) {
+    return false;
+  }
+  if (args.state.fillHistory.some((fill) => fill.side === "BUY")) {
+    return false;
+  }
+  if (
+    args.basketState.mergeableQty > 1e-6 ||
+    args.basketState.residualQty > Math.max(args.config.postMergeFlatDustShares, 1e-6)
+  ) {
+    return false;
+  }
+
+  const baseLot = args.config.liveSmallLotLadder[0] ?? args.config.defaultLot;
+  const minCampaignClipQty = Math.max(
+    args.config.microRepairMaxQty + args.state.market.minOrderSize,
+    baseLot * Math.max(args.config.campaignMinClipPct, args.config.campaignLaunchXuanProbePct * 0.5),
+  );
+  return args.candidateSize + 1e-6 < minCampaignClipQty;
+}
+
 function evaluateSingleLegSeed(
   config: XuanStrategyConfig,
   state: XuanMarketState,
@@ -5610,6 +5682,18 @@ function evaluateSingleLegSeed(
     })
       ? "missing_fair_value_allowed_by_pair_reference_cap"
       : undefined;
+    if (
+      skipReason === undefined &&
+      fairValueFallbackReason &&
+      shouldBlockPublicFootprintMicroCoveredSeedFallback({
+        config,
+        state,
+        basketState,
+        candidateSize: pairExecutableSize > 0 ? pairExecutableSize : candidateSize,
+      })
+    ) {
+      skipReason = "xuan_micro_covered_seed_fallback";
+    }
     const fairValueDecision = fairValueFallbackReason
       ? { allowed: true }
       : baseFairValueDecision;
@@ -5678,6 +5762,7 @@ function evaluateSingleLegSeed(
       skipReason === "opening_weak_pair_no_followup_plan" ||
       skipReason === "early_mid_pair_repeat_fee_guard" ||
       skipReason === "low_side_unpaired_basket_debt" ||
+      skipReason === "xuan_micro_covered_seed_fallback" ||
       skipReason === "avg_improving_pair_too_expensive" ||
       skipReason === "avg_improving_spread_too_small" ||
       skipReason === "avg_improving_clip_budget_exhausted" ||

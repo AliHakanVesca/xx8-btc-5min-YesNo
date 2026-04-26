@@ -400,20 +400,31 @@ function chooseCompletion(
       oldGap,
       newGap: projectedGap,
     });
+    const temporalOrphanFallback = temporalSingleLegOrphanCompletionFallback({
+      config,
+      state,
+      leadingSide,
+      partialAgeSec,
+      secsToClose: ctx.secsToClose,
+      repairCost: costWithFees,
+      executableSize: candidateSize,
+      oldGap,
+      newGap: projectedGap,
+      negativeEdgeUsdc: allowance.negativeEdgeUsdc,
+    });
     const earlyTemporalCompletionWait =
       config.botMode === "XUAN" &&
       config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
       !exactCompletionQtyPrior &&
-      !allowance.highLowMismatch &&
       partialAgeSec < config.xuanTemporalCompletionMinAgeSec &&
       ctx.secsToClose > config.finalWindowCompletionOnlySec &&
       costWithFees > config.xuanTemporalCompletionEarlyMaxEffectivePair + 1e-9 &&
       !marketBasketProjection?.phaseMaxOverrideAllowed &&
-      !campaignResidualFallback.allowed;
+      !temporalOrphanFallback.allowed;
     if (earlyTemporalCompletionWait) {
       continue;
     }
-    const campaignPhaseCapOverride = campaignResidualFallback.allowed;
+    const campaignPhaseCapOverride = campaignResidualFallback.allowed || temporalOrphanFallback.allowed;
     if (
       costWithFees > phase.cap &&
       !highLowPhaseCapOverride &&
@@ -429,7 +440,7 @@ function chooseCompletion(
       costWithFees <= config.temporalRepairUltraFastMissingFairValueCap &&
       allowance.allowed;
     const fairValueRequired =
-      ultraFastCloneFairValueFallback || campaignResidualFallback.allowed
+      ultraFastCloneFairValueFallback || campaignResidualFallback.allowed || temporalOrphanFallback.allowed
         ? false
         : allowance.highLowMismatch && allowance.allowed && !allowance.requiresFairValue
           ? false
@@ -437,7 +448,7 @@ function chooseCompletion(
               config.allowStrictResidualCompletionWithoutFairValue &&
               costWithFees <= config.strictResidualCompletionCap
             ) || Boolean(allowance.requiresFairValue);
-    const fairValueDecision = ultraFastCloneFairValueFallback || campaignResidualFallback.allowed
+    const fairValueDecision = ultraFastCloneFairValueFallback || campaignResidualFallback.allowed || temporalOrphanFallback.allowed
       ? { allowed: true as const }
       : fairValueGate({
           config,
@@ -499,20 +510,24 @@ function chooseCompletion(
       oppositeAveragePrice: existingAverage,
       missingSidePrice: execution.averagePrice,
       exactPriorActive: Boolean(exactCompletionQtyPrior),
-      exceptionalMode: Boolean(allowance.highLowMismatch) || cheapLateCompletionChase || campaignResidualFallback.allowed,
+      exceptionalMode:
+        Boolean(allowance.highLowMismatch) ||
+        cheapLateCompletionChase ||
+        campaignResidualFallback.allowed ||
+        temporalOrphanFallback.allowed,
       recentSeedFlowCount,
       activeIndependentFlowCount,
       ...(ctx.completionPatienceMultiplier !== undefined
         ? { completionPatienceMultiplier: ctx.completionPatienceMultiplier }
         : {}),
     });
-    if (!allowance.allowed) {
+    if (!allowance.allowed && !temporalOrphanFallback.allowed) {
       continue;
     }
-    if (highSideQualitySkipReason) {
+    if (highSideQualitySkipReason && !temporalOrphanFallback.allowed) {
       continue;
     }
-    if (qualitySkipReason) {
+    if (qualitySkipReason && !temporalOrphanFallback.allowed) {
       continue;
     }
     if (
@@ -523,7 +538,11 @@ function chooseCompletion(
         residualAfter: projectedGap,
         secsToClose: ctx.secsToClose,
         exactPriorActive: Boolean(exactCompletionQtyPrior),
-        exceptionalMode: Boolean(allowance.highLowMismatch) || cheapLateCompletionChase || campaignResidualFallback.allowed,
+        exceptionalMode:
+          Boolean(allowance.highLowMismatch) ||
+          cheapLateCompletionChase ||
+          campaignResidualFallback.allowed ||
+          temporalOrphanFallback.allowed,
         recentSeedFlowCount,
         activeIndependentFlowCount,
         flowPressureState,
@@ -534,6 +553,7 @@ function chooseCompletion(
     if (
       !fairValueDecision.allowed &&
       !campaignResidualFallback.allowed &&
+      !temporalOrphanFallback.allowed &&
       (phase.requiresFairValue || phase.mode === "POST_MERGE_RESIDUAL_COMPLETION")
     ) {
       continue;
@@ -541,11 +561,12 @@ function chooseCompletion(
     if (
       !fairValueDecision.allowed &&
       !campaignResidualFallback.allowed &&
+      !temporalOrphanFallback.allowed &&
       phase.mode !== "POST_MERGE_RESIDUAL_COMPLETION"
     ) {
       continue;
     }
-    if (completionDelayProfile.shouldDelay && !campaignResidualFallback.allowed) {
+    if (completionDelayProfile.shouldDelay && !campaignResidualFallback.allowed && !temporalOrphanFallback.allowed) {
       continue;
     }
 
@@ -605,7 +626,7 @@ function chooseCompletion(
       residualAfter: normalizeSize(Math.max(0, missingShares - candidateSize)),
       mode: selectedMode,
       costWithFees,
-      capMode: allowance.capMode,
+      capMode: temporalOrphanFallback.allowed && !allowance.allowed ? "soft" : allowance.capMode,
       negativeEdgeUsdc: allowance.negativeEdgeUsdc,
       oldGap,
       newGap: projectedGap,
@@ -652,6 +673,15 @@ function chooseCompletion(
             residualCompletionFairValueFallback: true,
             ...(campaignResidualFallback.reason
               ? { residualCompletionFallbackReason: campaignResidualFallback.reason }
+              : {}),
+          }
+        : {}),
+      ...(temporalOrphanFallback.allowed
+        ? {
+            campaignMode: "RESIDUAL_COMPLETION_ACTIVE",
+            residualCompletionFairValueFallback: true,
+            ...(temporalOrphanFallback.reason
+              ? { residualCompletionFallbackReason: temporalOrphanFallback.reason }
               : {}),
           }
         : {}),
@@ -1034,6 +1064,93 @@ function residualCompletionFairValueFallback(args: {
     return { allowed: true, reason: "residual_average_improvement" };
   }
   return { allowed: false };
+}
+
+function temporalSingleLegOrphanCompletionFallback(args: {
+  config: XuanStrategyConfig;
+  state: XuanMarketState;
+  leadingSide: OutcomeSide;
+  partialAgeSec: number;
+  secsToClose: number;
+  repairCost: number;
+  executableSize: number;
+  oldGap: number;
+  newGap: number;
+  negativeEdgeUsdc: number;
+}): { allowed: boolean; reason?: string | undefined } {
+  if (
+    args.config.botMode !== "XUAN" ||
+    args.config.xuanCloneMode !== "PUBLIC_FOOTPRINT" ||
+    !args.config.allowResidualCompletion ||
+    args.executableSize <= 0 ||
+    args.executableSize > args.oldGap + 1e-9 ||
+    args.newGap >= args.oldGap - 1e-9 ||
+    args.secsToClose <= args.config.finalWindowNoChaseSec
+  ) {
+    return { allowed: false };
+  }
+
+  const hasTemporalOrphan = (args.leadingSide === "UP" ? args.state.upLots : args.state.downLots).some(
+    (lot) => lot.executionMode === "TEMPORAL_SINGLE_LEG_SEED",
+  );
+  if (!hasTemporalOrphan) {
+    return { allowed: false };
+  }
+
+  const matchedQty = mergeableShares(args.state);
+  if (matchedQty > Math.max(args.config.postMergeFlatDustShares, 1e-6) + 1e-9) {
+    return { allowed: false };
+  }
+
+  const minReleaseAgeSec = Math.max(
+    args.config.xuanTemporalCompletionMinAgeSec,
+    Math.min(args.config.completionUrgencyPatientSec, args.config.completionTargetMaxDelaySec),
+  );
+  if (args.partialAgeSec < minReleaseAgeSec) {
+    return { allowed: false };
+  }
+
+  const maxEffectiveCost =
+    args.partialAgeSec >= args.config.completionUrgencyForceSec
+      ? Math.min(args.config.temporalRepairEmergencyCap, args.config.xuanBehaviorCap)
+      : args.partialAgeSec >= args.config.completionTargetMaxDelaySec
+        ? Math.min(args.config.temporalRepairPatientCap, args.config.xuanBehaviorCap)
+        : Math.min(args.config.temporalRepairSoftCap, args.config.xuanBehaviorCap);
+  if (args.repairCost > maxEffectiveCost + 1e-9) {
+    return { allowed: false };
+  }
+
+  const maxAddedDebt =
+    args.partialAgeSec >= args.config.completionTargetMaxDelaySec
+      ? args.config.terminalCarryMaxAddedDebtUsdc
+      : Math.min(args.config.terminalCarryMaxAddedDebtUsdc, args.config.maxAvgImprovingAddedDebtUsdc);
+  if (args.negativeEdgeUsdc > maxAddedDebt + 1e-9) {
+    return { allowed: false };
+  }
+
+  const maxQty =
+    args.partialAgeSec >= args.config.completionTargetMaxDelaySec
+      ? Math.min(args.oldGap, args.config.xuanBasketCampaignCompletionClipMaxQty)
+      : Math.min(
+          args.oldGap,
+          Math.max(
+            args.config.campaignCompletionMinPct * (args.config.liveSmallLotLadder[0] ?? args.config.defaultLot),
+            args.config.microRepairMaxQty,
+          ),
+        );
+  if (args.executableSize > maxQty + 1e-9) {
+    return { allowed: false };
+  }
+
+  return {
+    allowed: true,
+    reason:
+      args.repairCost <= 1
+        ? "temporal_orphan_debt_reducing"
+        : args.partialAgeSec >= args.config.completionTargetMaxDelaySec
+          ? "temporal_orphan_terminal_carry"
+          : "temporal_orphan_controlled_negative",
+  };
 }
 
 function resolveGuidedMinCompletionSize(args: {

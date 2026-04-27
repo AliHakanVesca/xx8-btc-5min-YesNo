@@ -1,12 +1,14 @@
-import type {
-  CanonicalPhase,
-  CanonicalReferenceBundle,
-  CanonicalSequenceEvent,
-  CanonicalReferenceExtract,
-  NormalizedClipTier,
-  QtyBucket,
-  ResidualBucket,
-  TimingBucket,
+import {
+  computeCanonicalBehaviorMetrics,
+  type CanonicalBehaviorMetrics,
+  type CanonicalPhase,
+  type CanonicalReferenceBundle,
+  type CanonicalSequenceEvent,
+  type CanonicalReferenceExtract,
+  type NormalizedClipTier,
+  type QtyBucket,
+  type ResidualBucket,
+  type TimingBucket,
 } from "./xuanCanonicalReference.js";
 import type { OutcomeSide } from "../infra/clob/types.js";
 
@@ -49,6 +51,12 @@ export interface ComparatorBreakdown {
   cycleCompletionLatencyScore: number;
   openingEntryTimingScore: number;
   childOrderMicroTimingScore: number;
+  sameSecondDualBuyRateScore: number;
+  oppositeLegGapScore: number;
+  buyRowsPerMarketScore: number;
+  medianTradeSizeScore: number;
+  mergeAfterMatchedDelayScore: number;
+  stagedOppositeReleaseScore: number;
 }
 
 export interface SideSequenceMismatchDetail {
@@ -160,6 +168,26 @@ export interface CanonicalComparisonResult {
     cycleCompletionLatencyMaxAbsDeltaSec: number;
     exactLifecycleParityRequired: boolean;
     exactLifecycleParityBroken: boolean;
+    referenceSameSecondDualBuyRate: number;
+    candidateSameSecondDualBuyRate: number;
+    sameSecondDualBuyRateSimilarity: number;
+    referenceSameSecondDualBuyCount: number;
+    candidateSameSecondDualBuyCount: number;
+    referenceOppositeLegGapMedianSec: number;
+    candidateOppositeLegGapMedianSec: number;
+    oppositeLegGapSimilarity: number;
+    referenceBuyRowsPerMarket: number;
+    candidateBuyRowsPerMarket: number;
+    buyRowsPerMarketSimilarity: number;
+    referenceMedianTradeSize: number;
+    candidateMedianTradeSize: number;
+    medianTradeSizeSimilarity: number;
+    referenceMergeAfterMatchedDelaySec: number;
+    candidateMergeAfterMatchedDelaySec: number;
+    mergeAfterMatchedDelaySimilarity: number;
+    referenceStagedOppositeReleaseRate: number;
+    candidateStagedOppositeReleaseRate: number;
+    stagedOppositeReleaseSimilarity: number;
   };
 }
 
@@ -205,6 +233,21 @@ export interface ComparisonFlowSummary {
   cycleCompletionLatencyScore: number;
   openingEntryTimingScore: number;
   childOrderMicroTimingScore: number;
+  referenceSameSecondDualBuyRate: number;
+  candidateSameSecondDualBuyRate: number;
+  sameSecondDualBuyRateSimilarity: number;
+  referenceOppositeLegGapMedianSec: number;
+  candidateOppositeLegGapMedianSec: number;
+  oppositeLegGapSimilarity: number;
+  referenceBuyRowsPerMarket: number;
+  candidateBuyRowsPerMarket: number;
+  buyRowsPerMarketSimilarity: number;
+  referenceMedianTradeSize: number;
+  candidateMedianTradeSize: number;
+  medianTradeSizeSimilarity: number;
+  referenceStagedOppositeReleaseRate: number;
+  candidateStagedOppositeReleaseRate: number;
+  stagedOppositeReleaseSimilarity: number;
 }
 
 export interface ComparisonFlowStatus {
@@ -247,6 +290,21 @@ export interface FlowCalibrationSummary {
   averageCycleCompletionLatencyDeltaP75Sec: number;
   averageCycleCompletionLatencyMaxAbsDeltaSec: number;
   completionLatencyDirection: "candidate_early" | "candidate_late" | "aligned";
+  averageSameSecondDualBuyRateSimilarity: number;
+  averageReferenceSameSecondDualBuyRate: number;
+  averageCandidateSameSecondDualBuyRate: number;
+  averageOppositeLegGapSimilarity: number;
+  averageReferenceOppositeLegGapMedianSec: number;
+  averageCandidateOppositeLegGapMedianSec: number;
+  averageBuyRowsPerMarketSimilarity: number;
+  averageReferenceBuyRowsPerMarket: number;
+  averageCandidateBuyRowsPerMarket: number;
+  averageMedianTradeSizeSimilarity: number;
+  averageReferenceMedianTradeSize: number;
+  averageCandidateMedianTradeSize: number;
+  averageStagedOppositeReleaseSimilarity: number;
+  averageReferenceStagedOppositeReleaseRate: number;
+  averageCandidateStagedOppositeReleaseRate: number;
   status: ComparatorVerdict;
   recommendedFocus: string[];
 }
@@ -892,6 +950,113 @@ function numericDeltaScore(reference: number, candidate: number, exactWeight = 1
   return 0;
 }
 
+function canonicalBehaviorMetrics(extract: CanonicalReferenceExtract): CanonicalBehaviorMetrics {
+  const computed = computeCanonicalBehaviorMetrics(extract.orderedClipSequence);
+  return {
+    sameSecondDualBuyCount: extract.sameSecondDualBuyCount ?? computed.sameSecondDualBuyCount,
+    sameSecondDualBuyRate: extract.sameSecondDualBuyRate ?? computed.sameSecondDualBuyRate,
+    oppositeLegGapMedian: extract.oppositeLegGapMedian ?? computed.oppositeLegGapMedian,
+    buyRowsPerMarket: extract.buyRowsPerMarket ?? computed.buyRowsPerMarket,
+    medianTradeSize: extract.medianTradeSize ?? computed.medianTradeSize,
+    mergeAfterMatchedDelay: extract.mergeAfterMatchedDelay ?? computed.mergeAfterMatchedDelay,
+    stagedOppositeReleaseRate: extract.stagedOppositeReleaseRate ?? computed.stagedOppositeReleaseRate,
+  };
+}
+
+function excessRateSimilarity(reference: number, candidate: number, tolerance = 0.03, fullPenaltyAfter = 0.25): number {
+  if (candidate <= reference + tolerance) return 1;
+  return Math.max(0, 1 - (candidate - reference - tolerance) / fullPenaltyAfter);
+}
+
+function lowerBoundSimilarity(reference: number, candidate: number, freeRatio = 0.75, fullPenaltyRatio = 0.2): number {
+  if (reference <= 0) return candidate <= 0 ? 1 : 0;
+  if (candidate >= reference * freeRatio) return 1;
+  const floor = reference * fullPenaltyRatio;
+  if (candidate <= floor) return 0;
+  return Math.max(0, (candidate - floor) / Math.max(reference * (freeRatio - fullPenaltyRatio), 1e-9));
+}
+
+function upperBoundSimilarity(reference: number, candidate: number, freeRatio = 1.25, fullPenaltyRatio = 2.75): number {
+  if (reference <= 0) return candidate <= 0 ? 1 : 0;
+  if (candidate <= reference * freeRatio) return 1;
+  const ceiling = reference * fullPenaltyRatio;
+  if (candidate >= ceiling) return 0;
+  return Math.max(0, 1 - (candidate - reference * freeRatio) / Math.max(reference * (fullPenaltyRatio - freeRatio), 1e-9));
+}
+
+function behaviorTimingReasons(args: {
+  referenceSameSecondDualBuyRate: number;
+  candidateSameSecondDualBuyRate: number;
+  sameSecondDualBuyRateSimilarity: number;
+  referenceOppositeLegGapMedianSec: number;
+  candidateOppositeLegGapMedianSec: number;
+  oppositeLegGapSimilarity: number;
+  referenceBuyRowsPerMarket: number;
+  candidateBuyRowsPerMarket: number;
+  buyRowsPerMarketSimilarity: number;
+  referenceMedianTradeSize: number;
+  candidateMedianTradeSize: number;
+  medianTradeSizeSimilarity: number;
+  referenceStagedOppositeReleaseRate: number;
+  candidateStagedOppositeReleaseRate: number;
+  stagedOppositeReleaseSimilarity: number;
+}): { failReasons: string[]; warnReasons: string[] } {
+  const failReasons: string[] = [];
+  const warnReasons: string[] = [];
+  if (
+    args.candidateSameSecondDualBuyRate > args.referenceSameSecondDualBuyRate + 0.15 &&
+    args.sameSecondDualBuyRateSimilarity < 0.55
+  ) {
+    failReasons.push("same_second_dual_buy_rate_high");
+  } else if (
+    args.candidateSameSecondDualBuyRate > args.referenceSameSecondDualBuyRate + 0.08 &&
+    args.sameSecondDualBuyRateSimilarity < 0.8
+  ) {
+    warnReasons.push("same_second_dual_buy_rate_warn");
+  }
+  if (
+    args.referenceOppositeLegGapMedianSec >= 5 &&
+    args.candidateOppositeLegGapMedianSec < args.referenceOppositeLegGapMedianSec * 0.35 &&
+    args.oppositeLegGapSimilarity < 0.45
+  ) {
+    failReasons.push("opposite_leg_gap_too_short");
+  } else if (
+    args.referenceOppositeLegGapMedianSec >= 5 &&
+    args.candidateOppositeLegGapMedianSec < args.referenceOppositeLegGapMedianSec * 0.65 &&
+    args.oppositeLegGapSimilarity < 0.75
+  ) {
+    warnReasons.push("opposite_leg_gap_short_warn");
+  }
+  if (
+    args.referenceBuyRowsPerMarket > 0 &&
+    args.candidateBuyRowsPerMarket > args.referenceBuyRowsPerMarket * 2.5 &&
+    args.buyRowsPerMarketSimilarity < 0.35
+  ) {
+    failReasons.push("buy_density_too_high");
+  } else if (
+    args.referenceBuyRowsPerMarket > 0 &&
+    args.candidateBuyRowsPerMarket > args.referenceBuyRowsPerMarket * 1.8 &&
+    args.buyRowsPerMarketSimilarity < 0.65
+  ) {
+    warnReasons.push("buy_density_warn");
+  }
+  if (
+    args.referenceMedianTradeSize > 0 &&
+    args.candidateMedianTradeSize < args.referenceMedianTradeSize * 0.5 &&
+    args.medianTradeSizeSimilarity < 0.6
+  ) {
+    warnReasons.push("median_trade_size_too_small");
+  }
+  if (
+    args.referenceStagedOppositeReleaseRate >= 0.5 &&
+    args.candidateStagedOppositeReleaseRate < args.referenceStagedOppositeReleaseRate * 0.5 &&
+    args.stagedOppositeReleaseSimilarity < 0.6
+  ) {
+    warnReasons.push("staged_opposite_release_low");
+  }
+  return { failReasons, warnReasons };
+}
+
 export function buildComparisonFlowSummary(comparison: CanonicalComparisonResult): ComparisonFlowSummary {
   return {
     flowLineageSimilarity: comparison.details.flowLineageSimilarity,
@@ -935,6 +1100,21 @@ export function buildComparisonFlowSummary(comparison: CanonicalComparisonResult
     cycleCompletionLatencyScore: comparison.breakdown.cycleCompletionLatencyScore,
     openingEntryTimingScore: comparison.breakdown.openingEntryTimingScore,
     childOrderMicroTimingScore: comparison.breakdown.childOrderMicroTimingScore,
+    referenceSameSecondDualBuyRate: comparison.details.referenceSameSecondDualBuyRate,
+    candidateSameSecondDualBuyRate: comparison.details.candidateSameSecondDualBuyRate,
+    sameSecondDualBuyRateSimilarity: comparison.details.sameSecondDualBuyRateSimilarity,
+    referenceOppositeLegGapMedianSec: comparison.details.referenceOppositeLegGapMedianSec,
+    candidateOppositeLegGapMedianSec: comparison.details.candidateOppositeLegGapMedianSec,
+    oppositeLegGapSimilarity: comparison.details.oppositeLegGapSimilarity,
+    referenceBuyRowsPerMarket: comparison.details.referenceBuyRowsPerMarket,
+    candidateBuyRowsPerMarket: comparison.details.candidateBuyRowsPerMarket,
+    buyRowsPerMarketSimilarity: comparison.details.buyRowsPerMarketSimilarity,
+    referenceMedianTradeSize: comparison.details.referenceMedianTradeSize,
+    candidateMedianTradeSize: comparison.details.candidateMedianTradeSize,
+    medianTradeSizeSimilarity: comparison.details.medianTradeSizeSimilarity,
+    referenceStagedOppositeReleaseRate: comparison.details.referenceStagedOppositeReleaseRate,
+    candidateStagedOppositeReleaseRate: comparison.details.candidateStagedOppositeReleaseRate,
+    stagedOppositeReleaseSimilarity: comparison.details.stagedOppositeReleaseSimilarity,
   };
 }
 
@@ -986,6 +1166,25 @@ export function classifyComparisonFlowSummary(summary: ComparisonFlowSummary): C
   } else if ((summary.completionReleaseRoleSimilarity ?? 1) < 0.7) {
     warnReasons.push("completion_release_role_similarity_warn");
   }
+  const behaviorReasons = behaviorTimingReasons({
+    referenceSameSecondDualBuyRate: summary.referenceSameSecondDualBuyRate ?? 0,
+    candidateSameSecondDualBuyRate: summary.candidateSameSecondDualBuyRate ?? 0,
+    sameSecondDualBuyRateSimilarity: summary.sameSecondDualBuyRateSimilarity ?? 1,
+    referenceOppositeLegGapMedianSec: summary.referenceOppositeLegGapMedianSec ?? 0,
+    candidateOppositeLegGapMedianSec: summary.candidateOppositeLegGapMedianSec ?? 0,
+    oppositeLegGapSimilarity: summary.oppositeLegGapSimilarity ?? 1,
+    referenceBuyRowsPerMarket: summary.referenceBuyRowsPerMarket ?? 0,
+    candidateBuyRowsPerMarket: summary.candidateBuyRowsPerMarket ?? 0,
+    buyRowsPerMarketSimilarity: summary.buyRowsPerMarketSimilarity ?? 1,
+    referenceMedianTradeSize: summary.referenceMedianTradeSize ?? 0,
+    candidateMedianTradeSize: summary.candidateMedianTradeSize ?? 0,
+    medianTradeSizeSimilarity: summary.medianTradeSizeSimilarity ?? 1,
+    referenceStagedOppositeReleaseRate: summary.referenceStagedOppositeReleaseRate ?? 0,
+    candidateStagedOppositeReleaseRate: summary.candidateStagedOppositeReleaseRate ?? 0,
+    stagedOppositeReleaseSimilarity: summary.stagedOppositeReleaseSimilarity ?? 1,
+  });
+  failReasons.push(...behaviorReasons.failReasons);
+  warnReasons.push(...behaviorReasons.warnReasons);
 
   if (failReasons.length > 0) {
     return { status: "FAIL", reasons: failReasons };
@@ -1067,6 +1266,21 @@ export function buildFlowCalibrationSummary(summaries: ComparisonFlowSummary[]):
     childOrderMicroTimingScore: average(
       (summary) => summary.childOrderMicroTimingScore ?? summary.childOrderMicroTimingSimilarity ?? 1,
     ),
+    referenceSameSecondDualBuyRate: average((summary) => summary.referenceSameSecondDualBuyRate ?? 0),
+    candidateSameSecondDualBuyRate: average((summary) => summary.candidateSameSecondDualBuyRate ?? 0),
+    sameSecondDualBuyRateSimilarity: average((summary) => summary.sameSecondDualBuyRateSimilarity ?? 1),
+    referenceOppositeLegGapMedianSec: average((summary) => summary.referenceOppositeLegGapMedianSec ?? 0),
+    candidateOppositeLegGapMedianSec: average((summary) => summary.candidateOppositeLegGapMedianSec ?? 0),
+    oppositeLegGapSimilarity: average((summary) => summary.oppositeLegGapSimilarity ?? 1),
+    referenceBuyRowsPerMarket: average((summary) => summary.referenceBuyRowsPerMarket ?? 0),
+    candidateBuyRowsPerMarket: average((summary) => summary.candidateBuyRowsPerMarket ?? 0),
+    buyRowsPerMarketSimilarity: average((summary) => summary.buyRowsPerMarketSimilarity ?? 1),
+    referenceMedianTradeSize: average((summary) => summary.referenceMedianTradeSize ?? 0),
+    candidateMedianTradeSize: average((summary) => summary.candidateMedianTradeSize ?? 0),
+    medianTradeSizeSimilarity: average((summary) => summary.medianTradeSizeSimilarity ?? 1),
+    referenceStagedOppositeReleaseRate: average((summary) => summary.referenceStagedOppositeReleaseRate ?? 0),
+    candidateStagedOppositeReleaseRate: average((summary) => summary.candidateStagedOppositeReleaseRate ?? 0),
+    stagedOppositeReleaseSimilarity: average((summary) => summary.stagedOppositeReleaseSimilarity ?? 1),
   };
   const status = classifyComparisonFlowSummary(aggregate);
   const completionLatencyDirection =
@@ -1104,6 +1318,11 @@ export function buildFlowCalibrationSummary(summaries: ComparisonFlowSummary[]):
     if (reason.includes("side_sequence")) return "improve_seed_side_rhythm";
     if (reason.includes("semantic_role_sequence")) return "align_high_low_role_sequence";
     if (reason.includes("completion_release_role")) return "align_completion_release_role_sequence";
+    if (reason.includes("same_second_dual_buy")) return "stage_first_leg_before_opposite_release";
+    if (reason.includes("opposite_leg_gap")) return "increase_planned_opposite_patience";
+    if (reason.includes("buy_density")) return "reduce_micro_pair_sweep_density";
+    if (reason.includes("median_trade_size")) return "use_xuan_sized_lot_ladder";
+    if (reason.includes("staged_opposite_release")) return "raise_staged_opposite_release_rate";
     return "inspect_flow_similarity";
   });
   const sideSequenceMismatchOffsetDeltaSec = averageMismatchOffsetDeltaSec();
@@ -1203,6 +1422,21 @@ export function buildFlowCalibrationSummary(summaries: ComparisonFlowSummary[]):
     averageCycleCompletionLatencyDeltaP75Sec: aggregate.cycleCompletionLatencyDeltaP75Sec,
     averageCycleCompletionLatencyMaxAbsDeltaSec: aggregate.cycleCompletionLatencyMaxAbsDeltaSec,
     completionLatencyDirection,
+    averageSameSecondDualBuyRateSimilarity: aggregate.sameSecondDualBuyRateSimilarity,
+    averageReferenceSameSecondDualBuyRate: aggregate.referenceSameSecondDualBuyRate,
+    averageCandidateSameSecondDualBuyRate: aggregate.candidateSameSecondDualBuyRate,
+    averageOppositeLegGapSimilarity: aggregate.oppositeLegGapSimilarity,
+    averageReferenceOppositeLegGapMedianSec: aggregate.referenceOppositeLegGapMedianSec,
+    averageCandidateOppositeLegGapMedianSec: aggregate.candidateOppositeLegGapMedianSec,
+    averageBuyRowsPerMarketSimilarity: aggregate.buyRowsPerMarketSimilarity,
+    averageReferenceBuyRowsPerMarket: aggregate.referenceBuyRowsPerMarket,
+    averageCandidateBuyRowsPerMarket: aggregate.candidateBuyRowsPerMarket,
+    averageMedianTradeSizeSimilarity: aggregate.medianTradeSizeSimilarity,
+    averageReferenceMedianTradeSize: aggregate.referenceMedianTradeSize,
+    averageCandidateMedianTradeSize: aggregate.candidateMedianTradeSize,
+    averageStagedOppositeReleaseSimilarity: aggregate.stagedOppositeReleaseSimilarity,
+    averageReferenceStagedOppositeReleaseRate: aggregate.referenceStagedOppositeReleaseRate,
+    averageCandidateStagedOppositeReleaseRate: aggregate.candidateStagedOppositeReleaseRate,
     status: sampleCount === 0 ? "WARN" : status.status,
     recommendedFocus: [...new Set(sampleCount === 0 ? ["collect_replay_flow_samples"] : recommendedFocus)],
   };
@@ -1282,6 +1516,49 @@ export function compareCanonicalReference(
     referenceFirstEntryOffsetSec,
     candidateFirstEntryOffsetSec,
   );
+  const referenceBehavior = canonicalBehaviorMetrics(reference);
+  const candidateBehavior = canonicalBehaviorMetrics(candidate);
+  const sameSecondDualBuyRateSimilarity = excessRateSimilarity(
+    referenceBehavior.sameSecondDualBuyRate,
+    candidateBehavior.sameSecondDualBuyRate,
+  );
+  const oppositeLegGapSimilarity = lowerBoundSimilarity(
+    referenceBehavior.oppositeLegGapMedian,
+    candidateBehavior.oppositeLegGapMedian,
+  );
+  const buyRowsPerMarketSimilarity = upperBoundSimilarity(
+    referenceBehavior.buyRowsPerMarket,
+    candidateBehavior.buyRowsPerMarket,
+  );
+  const medianTradeSizeSimilarity = boundedRatioSimilarity(
+    referenceBehavior.medianTradeSize,
+    candidateBehavior.medianTradeSize,
+  );
+  const mergeAfterMatchedDelaySimilarity = boundedRatioSimilarity(
+    referenceBehavior.mergeAfterMatchedDelay,
+    candidateBehavior.mergeAfterMatchedDelay,
+  );
+  const stagedOppositeReleaseSimilarity =
+    candidateBehavior.stagedOppositeReleaseRate >= referenceBehavior.stagedOppositeReleaseRate
+      ? 1
+      : lowerBoundSimilarity(referenceBehavior.stagedOppositeReleaseRate, candidateBehavior.stagedOppositeReleaseRate);
+  const behaviorReasons = behaviorTimingReasons({
+    referenceSameSecondDualBuyRate: referenceBehavior.sameSecondDualBuyRate,
+    candidateSameSecondDualBuyRate: candidateBehavior.sameSecondDualBuyRate,
+    sameSecondDualBuyRateSimilarity,
+    referenceOppositeLegGapMedianSec: referenceBehavior.oppositeLegGapMedian,
+    candidateOppositeLegGapMedianSec: candidateBehavior.oppositeLegGapMedian,
+    oppositeLegGapSimilarity,
+    referenceBuyRowsPerMarket: referenceBehavior.buyRowsPerMarket,
+    candidateBuyRowsPerMarket: candidateBehavior.buyRowsPerMarket,
+    buyRowsPerMarketSimilarity,
+    referenceMedianTradeSize: referenceBehavior.medianTradeSize,
+    candidateMedianTradeSize: candidateBehavior.medianTradeSize,
+    medianTradeSizeSimilarity,
+    referenceStagedOppositeReleaseRate: referenceBehavior.stagedOppositeReleaseRate,
+    candidateStagedOppositeReleaseRate: candidateBehavior.stagedOppositeReleaseRate,
+    stagedOppositeReleaseSimilarity,
+  });
 
   const correctnessScore =
     cycleCountScore * 15 +
@@ -1309,14 +1586,21 @@ export function compareCanonicalReference(
     cycleCompletionLatencySimilarity * 1 +
     childOrderMicroTiming.similarity * 0.6;
 
-  const score = Math.round((correctnessScore + familyScore) * 100) / 100;
+  const behaviorPenalty =
+    (1 - sameSecondDualBuyRateSimilarity) * 4 +
+    (1 - oppositeLegGapSimilarity) * 4 +
+    (1 - buyRowsPerMarketSimilarity) * 2 +
+    (1 - medianTradeSizeSimilarity) * 1.5 +
+    (1 - stagedOppositeReleaseSimilarity) * 1.5 +
+    (1 - mergeAfterMatchedDelaySimilarity) * 0.5;
+  const score = Math.max(0, Math.round((correctnessScore + familyScore - behaviorPenalty) * 100) / 100);
 
   let verdict: ComparatorVerdict;
-  if (hardFailTotal > 0 || exactLifecycleParityBroken) {
+  if (hardFailTotal > 0 || exactLifecycleParityBroken || behaviorReasons.failReasons.length > 0) {
     verdict = "FAIL";
-  } else if (score >= 80) {
+  } else if (score >= 80 && behaviorReasons.warnReasons.length === 0) {
     verdict = "PASS";
-  } else if (score >= 65) {
+  } else if (score >= 65 || behaviorReasons.warnReasons.length > 0) {
     verdict = "WARN";
   } else {
     verdict = "FAIL";
@@ -1353,6 +1637,12 @@ export function compareCanonicalReference(
       cycleCompletionLatencyScore: cycleCompletionLatencySimilarity,
       openingEntryTimingScore: openingEntryTimingSimilarity,
       childOrderMicroTimingScore: childOrderMicroTiming.similarity,
+      sameSecondDualBuyRateScore: sameSecondDualBuyRateSimilarity,
+      oppositeLegGapScore: oppositeLegGapSimilarity,
+      buyRowsPerMarketScore: buyRowsPerMarketSimilarity,
+      medianTradeSizeScore: medianTradeSizeSimilarity,
+      mergeAfterMatchedDelayScore: mergeAfterMatchedDelaySimilarity,
+      stagedOppositeReleaseScore: stagedOppositeReleaseSimilarity,
     },
     details: {
       referenceSlug: reference.slug,
@@ -1409,6 +1699,26 @@ export function compareCanonicalReference(
       cycleCompletionLatencyMaxAbsDeltaSec: Number(cycleCompletionLatencyMaxAbsDeltaSec.toFixed(6)),
       exactLifecycleParityRequired,
       exactLifecycleParityBroken,
+      referenceSameSecondDualBuyRate: referenceBehavior.sameSecondDualBuyRate,
+      candidateSameSecondDualBuyRate: candidateBehavior.sameSecondDualBuyRate,
+      sameSecondDualBuyRateSimilarity,
+      referenceSameSecondDualBuyCount: referenceBehavior.sameSecondDualBuyCount,
+      candidateSameSecondDualBuyCount: candidateBehavior.sameSecondDualBuyCount,
+      referenceOppositeLegGapMedianSec: referenceBehavior.oppositeLegGapMedian,
+      candidateOppositeLegGapMedianSec: candidateBehavior.oppositeLegGapMedian,
+      oppositeLegGapSimilarity,
+      referenceBuyRowsPerMarket: referenceBehavior.buyRowsPerMarket,
+      candidateBuyRowsPerMarket: candidateBehavior.buyRowsPerMarket,
+      buyRowsPerMarketSimilarity,
+      referenceMedianTradeSize: referenceBehavior.medianTradeSize,
+      candidateMedianTradeSize: candidateBehavior.medianTradeSize,
+      medianTradeSizeSimilarity,
+      referenceMergeAfterMatchedDelaySec: referenceBehavior.mergeAfterMatchedDelay,
+      candidateMergeAfterMatchedDelaySec: candidateBehavior.mergeAfterMatchedDelay,
+      mergeAfterMatchedDelaySimilarity,
+      referenceStagedOppositeReleaseRate: referenceBehavior.stagedOppositeReleaseRate,
+      candidateStagedOppositeReleaseRate: candidateBehavior.stagedOppositeReleaseRate,
+      stagedOppositeReleaseSimilarity,
     },
   };
 }

@@ -409,6 +409,73 @@ describe("xuan replay comparator", () => {
     expect(calibration.recommendedFocus.length).toBeGreaterThan(0);
   });
 
+  it("fails same-tick dual buys even when the side order still matches", () => {
+    const reference = buildReference({
+      orderedClipSequence: [
+        buildEvent({
+          sequenceIndex: 0,
+          clipIndex: 1,
+          cycleId: 1,
+          phase: "ENTRY",
+          tOffsetSec: 4,
+          tOffsetMs: 4000,
+          outcome: "DOWN",
+          qty: 125,
+          qtyBucket: "31_plus",
+          baseLot: 125,
+        }),
+        buildEvent({
+          sequenceIndex: 1,
+          clipIndex: 2,
+          cycleId: 1,
+          phase: "COMPLETION",
+          tOffsetSec: 30,
+          tOffsetMs: 30000,
+          outcome: "UP",
+          qty: 124,
+          qtyBucket: "31_plus",
+          baseLot: 125,
+        }),
+      ],
+      buySequence: ["DOWN", "UP"],
+      completionCount: 1,
+      sameSecondDualBuyRate: 0,
+      sameSecondDualBuyCount: 0,
+      oppositeLegGapMedian: 26,
+      buyRowsPerMarket: 2,
+      medianTradeSize: 124.5,
+      stagedOppositeReleaseRate: 1,
+    });
+    const sameTickCandidate = buildReference({
+      ...reference,
+      slug: "same-tick-candidate",
+      orderedClipSequence: reference.orderedClipSequence.map((event, index) =>
+        event.kind !== "BUY"
+          ? event
+          : {
+              ...event,
+              tOffsetSec: 4,
+              tOffsetMs: 4000,
+              sequenceIndex: index,
+            },
+      ),
+      sameSecondDualBuyRate: 1,
+      sameSecondDualBuyCount: 1,
+      oppositeLegGapMedian: 0,
+      stagedOppositeReleaseRate: 0,
+    });
+
+    const comparison = compareCanonicalReference(reference, sameTickCandidate);
+    const status = classifyComparisonFlowSummary(buildComparisonFlowSummary(comparison));
+
+    expect(comparison.details.sideSequenceSimilarity).toBe(1);
+    expect(comparison.details.sameSecondDualBuyRateSimilarity).toBeLessThan(0.55);
+    expect(comparison.details.oppositeLegGapSimilarity).toBeLessThan(0.45);
+    expect(comparison.verdict).toBe("FAIL");
+    expect(status.reasons).toContain("same_second_dual_buy_rate_high");
+    expect(status.reasons).toContain("opposite_leg_gap_too_short");
+  });
+
   it("penalizes side-first sequence mismatches against the bundled public-sequence fixture", () => {
     const reference = publicSequenceFixture.references[0] as CanonicalReferenceExtract;
     const candidate: CanonicalReferenceExtract = {

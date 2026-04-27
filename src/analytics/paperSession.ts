@@ -31,6 +31,7 @@ import type { EntryBuyDecision, EntryDecisionTrace } from "../strategy/xuan5m/en
 import type { CompletionReleaseRole } from "../strategy/xuan5m/modePolicy.js";
 import type { StrategyExecutionMode } from "../strategy/xuan5m/executionModes.js";
 import { buildFootprintSummary, type FootprintSummary } from "./footprintMetrics.js";
+import type { CanonicalReferenceExtract, CanonicalSequenceEvent } from "./xuanCanonicalReference.js";
 
 export const paperSessionVariants = ["xuan-flow", "blocked-completion"] as const;
 export type PaperSessionVariant = (typeof paperSessionVariants)[number];
@@ -40,6 +41,8 @@ export function isPaperSessionVariant(value: string): value is PaperSessionVaria
 }
 
 export interface PaperSessionOptions {
+  marketStartTs?: number | undefined;
+  referenceFlow?: CanonicalReferenceExtract | undefined;
   completionPatienceMultiplier?: number | undefined;
   openingSeedOffsetShiftSec?: number | undefined;
   overlapSeedOffsetShiftSec?: number | undefined;
@@ -412,6 +415,83 @@ const sessionVariants: Record<PaperSessionVariant, PaperSessionStepSpec[]> = {
   ],
 };
 
+function clampPaperBookPrice(value: number | null | undefined, fallback: number): number {
+  const raw = Number.isFinite(value) ? Number(value) : fallback;
+  return Number(Math.min(0.99, Math.max(0.01, raw)).toFixed(4));
+}
+
+function referenceBookFromBuyEvent(event: CanonicalSequenceEvent): ReplayBooks {
+  const sideAsk = clampPaperBookPrice(event.price, 0.5);
+  const oppositeAsk = clampPaperBookPrice(1.01 - sideAsk, 0.5);
+  const upAsk = event.outcome === "UP" ? sideAsk : oppositeAsk;
+  const downAsk = event.outcome === "DOWN" ? sideAsk : oppositeAsk;
+  return {
+    upBid: clampPaperBookPrice(upAsk - 0.01, 0.49),
+    upAsk,
+    downBid: clampPaperBookPrice(downAsk - 0.01, 0.49),
+    downAsk,
+  };
+}
+
+function buildReferenceFlowReplaySteps(reference: CanonicalReferenceExtract): PaperSessionStepSpec[] {
+  const steps: PaperSessionStepSpec[] = [];
+  const lifecycleOffsets = new Set<string>();
+
+  for (const event of reference.orderedClipSequence) {
+    if (event.kind === "BUY" && event.outcome) {
+      const isCompletion = event.phase === "COMPLETION" || event.phase === "HIGH_LOW_COMPLETION";
+      steps.push({
+        name: `reference-${event.sequenceIndex}-${String(event.phase).toLowerCase()}-${event.outcome.toLowerCase()}`,
+        note: `Reference ${event.phase} ${event.outcome} clip from ${reference.slug}.`,
+        offsetSec: event.tOffsetSec,
+        books: referenceBookFromBuyEvent(event),
+        entryFillPolicy: isCompletion ? "none" : event.outcome === "UP" ? "up-only" : "down-only",
+        completionFill: isCompletion ? true : false,
+        mergePolicy: "skip",
+      });
+      continue;
+    }
+
+    if (event.kind === "MERGE") {
+      const key = `MERGE:${event.tOffsetSec}`;
+      if (lifecycleOffsets.has(key)) {
+        continue;
+      }
+      lifecycleOffsets.add(key);
+      steps.push({
+        name: `reference-merge-${event.tOffsetSec}`,
+        note: `Reference merge cohort from ${reference.slug}.`,
+        offsetSec: event.tOffsetSec,
+        books: { upBid: 0.66, upAsk: 0.67, downBid: 0.66, downAsk: 0.67 },
+        entryFillPolicy: "none",
+        completionFill: false,
+        mergePolicy: "force",
+      });
+      continue;
+    }
+
+    if (event.kind === "REDEEM") {
+      const key = `REDEEM:${event.tOffsetSec}`;
+      if (lifecycleOffsets.has(key)) {
+        continue;
+      }
+      lifecycleOffsets.add(key);
+      steps.push({
+        name: `reference-redeem-${event.tOffsetSec}`,
+        note: `Reference residual redeem from ${reference.slug}.`,
+        offsetSec: event.tOffsetSec,
+        books: { upBid: 0.49, upAsk: 0.5, downBid: 0.49, downAsk: 0.5 },
+        entryFillPolicy: "none",
+        completionFill: false,
+        mergePolicy: "skip",
+        redeemPolicy: "residual",
+      });
+    }
+  }
+
+  return steps.sort((left, right) => left.offsetSec - right.offsetSec);
+}
+
 function buildSyntheticBook(assetId: string, market: string, bid: number, ask: number): OrderBook {
   return {
     market,
@@ -442,6 +522,20 @@ function shouldFillEntry(
   entryTrace?: EntryDecisionTrace | undefined,
 ): boolean {
   const policy = step.entryFillPolicy ?? "all";
+  const completionLikeEntry =
+    step.completionFill === true &&
+    entryBuy.reason === "lagging_rebalance" &&
+    (
+      entryBuy.mode === "HIGH_LOW_COMPLETION_CHASE" ||
+      entryBuy.mode === "CHEAP_LATE_COMPLETION_CHASE" ||
+      entryBuy.mode === "PARTIAL_FAST_COMPLETION" ||
+      entryBuy.mode === "PARTIAL_SOFT_COMPLETION" ||
+      entryBuy.mode === "PARTIAL_EMERGENCY_COMPLETION" ||
+      entryBuy.mode === "POST_MERGE_RESIDUAL_COMPLETION"
+    );
+  if (completionLikeEntry) {
+    return true;
+  }
   if (entryBuys.length <= 1) {
     return policy !== "none";
   }
@@ -764,18 +858,22 @@ export function runPaperSession(
   const config = buildStrategyConfig(env);
   const bot = new Xuan5mBot();
   const clock = new SystemClock();
-  const startTs = Math.floor(clock.now() / 300) * 300;
+  const startTs = Number.isFinite(options.marketStartTs)
+    ? Math.floor(Number(options.marketStartTs))
+    : Math.floor(clock.now() / 300) * 300;
   const market = buildOfflineMarket(startTs);
   let state = createMarketState(market);
   let effectiveCostState: EffectiveCostState = { up: 0, down: 0 };
   const steps: PaperSessionStepResult[] = [];
-  const replaySteps = applyCompletionTimingCalibration(
-    applyOverlapSeedTimingCalibration(
-      applyOpeningSeedTimingCalibration(sessionVariants[variant], options),
-      options,
-    ),
-    options,
-  );
+  const replaySteps = options.referenceFlow
+    ? buildReferenceFlowReplaySteps(options.referenceFlow)
+    : applyCompletionTimingCalibration(
+        applyOverlapSeedTimingCalibration(
+          applyOpeningSeedTimingCalibration(sessionVariants[variant], options),
+          options,
+        ),
+        options,
+      );
   let mergeBatchTracker = createMergeBatchTracker();
   let nonFinalForcedMergeCohorts = 0;
 

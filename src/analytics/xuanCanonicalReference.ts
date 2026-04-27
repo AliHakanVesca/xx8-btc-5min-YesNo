@@ -63,6 +63,13 @@ export interface CanonicalReferenceExtract {
   normalizedClipTierCounts: Record<NormalizedClipTier, number>;
   buySequence: OutcomeSide[];
   alternatingTransitionCount: number;
+  sameSecondDualBuyCount?: number | undefined;
+  sameSecondDualBuyRate?: number | undefined;
+  oppositeLegGapMedian?: number | undefined;
+  buyRowsPerMarket?: number | undefined;
+  medianTradeSize?: number | undefined;
+  mergeAfterMatchedDelay?: number | undefined;
+  stagedOppositeReleaseRate?: number | undefined;
   authority: {
     tradeTape: TradeAuthority;
     lifecycle: LifecycleAuthority;
@@ -253,6 +260,62 @@ function median(values: number[]): number | undefined {
   const mid = Math.floor(sorted.length / 2);
   if (sorted.length % 2 === 1) return sorted[mid];
   return (sorted[mid - 1]! + sorted[mid]!) / 2;
+}
+
+export interface CanonicalBehaviorMetrics {
+  sameSecondDualBuyCount: number;
+  sameSecondDualBuyRate: number;
+  oppositeLegGapMedian: number;
+  buyRowsPerMarket: number;
+  medianTradeSize: number;
+  mergeAfterMatchedDelay: number;
+  stagedOppositeReleaseRate: number;
+}
+
+export function computeCanonicalBehaviorMetrics(
+  orderedClipSequence: CanonicalSequenceEvent[],
+  mergeAfterMatchedDelays: number[] = [],
+): CanonicalBehaviorMetrics {
+  const buys = orderedClipSequence.filter(
+    (event): event is CanonicalSequenceEvent & { outcome: OutcomeSide } =>
+      event.kind === "BUY" && event.outcome !== null,
+  );
+  const buysBySecond = new Map<number, Set<OutcomeSide>>();
+  for (const event of buys) {
+    const sides = buysBySecond.get(event.tOffsetSec) ?? new Set<OutcomeSide>();
+    sides.add(event.outcome);
+    buysBySecond.set(event.tOffsetSec, sides);
+  }
+  const sameSecondDualBuyCount = [...buysBySecond.values()].filter((sides) => sides.size > 1).length;
+  const oppositeLegGaps = buys
+    .slice(1)
+    .map((event, index) => {
+      const previous = buys[index]!;
+      return previous.outcome !== event.outcome ? Math.max(0, event.tOffsetSec - previous.tOffsetSec) : undefined;
+    })
+    .filter((gap): gap is number => gap !== undefined);
+  const openedCycles = new Map<number, number>();
+  const stagedReleaseCycles = new Set<number>();
+  for (const event of buys) {
+    if ((event.phase === "ENTRY" || event.phase === "OVERLAP") && !openedCycles.has(event.cycleId)) {
+      openedCycles.set(event.cycleId, event.tOffsetSec);
+    }
+    if (event.phase === "COMPLETION" || event.phase === "HIGH_LOW_COMPLETION") {
+      const openedAt = openedCycles.get(event.cycleId);
+      if (openedAt !== undefined && event.tOffsetSec > openedAt) {
+        stagedReleaseCycles.add(event.cycleId);
+      }
+    }
+  }
+  return {
+    sameSecondDualBuyCount,
+    sameSecondDualBuyRate: buysBySecond.size > 0 ? normalize(sameSecondDualBuyCount / buysBySecond.size) : 0,
+    oppositeLegGapMedian: normalize(median(oppositeLegGaps) ?? 0),
+    buyRowsPerMarket: buys.length,
+    medianTradeSize: normalize(median(buys.map((event) => event.qty)) ?? 0),
+    mergeAfterMatchedDelay: normalize(median(mergeAfterMatchedDelays) ?? 0),
+    stagedOppositeReleaseRate: openedCycles.size > 0 ? normalize(stagedReleaseCycles.size / openedCycles.size) : 0,
+  };
 }
 
 function dominantResidualSideFromCycles(cycles: InferredCycle[]): OutcomeSide | "FLAT" {
@@ -621,6 +684,7 @@ function buildCanonicalFromInputs(args: BuildCanonicalArgs): CanonicalReferenceE
     return acc + (buySequence[index - 1] !== side ? 1 : 0);
   }, 0);
   const finalResidualSide = dominantResidualSideFromCycles(activeCycles);
+  const behaviorMetrics = computeCanonicalBehaviorMetrics(orderedClipSequence, mergeLatencies);
   return {
     slug: args.slug,
     startTs,
@@ -640,6 +704,13 @@ function buildCanonicalFromInputs(args: BuildCanonicalArgs): CanonicalReferenceE
     normalizedClipTierCounts,
     buySequence,
     alternatingTransitionCount,
+    sameSecondDualBuyCount: behaviorMetrics.sameSecondDualBuyCount,
+    sameSecondDualBuyRate: behaviorMetrics.sameSecondDualBuyRate,
+    oppositeLegGapMedian: behaviorMetrics.oppositeLegGapMedian,
+    buyRowsPerMarket: behaviorMetrics.buyRowsPerMarket,
+    medianTradeSize: behaviorMetrics.medianTradeSize,
+    mergeAfterMatchedDelay: behaviorMetrics.mergeAfterMatchedDelay,
+    stagedOppositeReleaseRate: behaviorMetrics.stagedOppositeReleaseRate,
     authority: {
       tradeTape: args.tradeAuthority,
       lifecycle: args.lifecycleAuthority,
@@ -802,6 +873,7 @@ export function buildCanonicalReferenceFromPaperSession(report: PaperSessionRepo
         price: fill.price,
         qty: fill.size,
         timestamp: step.timestamp,
+        internalLabel: fill.executionMode ?? fill.kind,
       });
     }
     if (step.execution.mergeShares > 0) {

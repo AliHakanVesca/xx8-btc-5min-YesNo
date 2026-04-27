@@ -5,7 +5,13 @@ import { loadEnv } from "./config/env.js";
 import { writeEnvUpdates } from "./config/envFile.js";
 import { writeJson } from "./utils/fs.js";
 import { createLogger, writeStructuredLog } from "./observability/logger.js";
-import { analyzeXuanFile, writeXuanMarkdownReport } from "./infra/dataApi/xuanAnalyzer.js";
+import {
+  analyzeXuanActivityWorkbook,
+  analyzeXuanFile,
+  fetchXuanFullActivityHistory,
+  writeXuanActivityImportBundle,
+  writeXuanMarkdownReport,
+} from "./infra/dataApi/xuanAnalyzer.js";
 import { runSyntheticReplay } from "./analytics/replaySimulator.js";
 import { runMultiSyntheticReplay } from "./analytics/multiReplay.js";
 import { runLivePaperSession } from "./analytics/livePaper.js";
@@ -214,6 +220,7 @@ function replayFlowCountBiasFromCalibration(
     | "averageChildOrderMicroTimingMaxAbsDeltaSec"
     | "averageChildOrderSideInversionCount"
   >,
+  options: { strictXuanFootprint?: boolean } = {},
 ): {
   recentSeedFlowCountBonus: number;
   activeIndependentFlowCountBonus: number;
@@ -275,6 +282,16 @@ function replayFlowCountBiasFromCalibration(
       )
     : 0;
   const sideInversionPressure = (calibration.averageChildOrderSideInversionCount ?? 0) > 0 ? 1 : 0;
+  if (options.strictXuanFootprint) {
+    return {
+      recentSeedFlowCountBonus: 0,
+      activeIndependentFlowCountBonus: 0,
+      overlapSeedOffsetShiftSec: Math.min(6, Math.max(0, sideCadenceShiftSec, childOrderCadenceShiftSec)),
+      semanticRoleAlignmentBias: preserveRawSide ? "preserve_raw_side" : "cycle_role_arbitration",
+      childOrderMicroTimingBias: childOrderRequested ? "flow_intent" : "neutral",
+      completionRoleReleaseOrderBias: highLowRoleRequested ? "role_order" : "neutral",
+    };
+  }
 
   return {
     recentSeedFlowCountBonus:
@@ -540,6 +557,46 @@ async function runAnalyzeXuan(): Promise<void> {
   console.log(JSON.stringify({ filePath, markdownPath, report }, null, 2));
 }
 
+async function runXuanActivityImportCommand(options: {
+  xlsx?: string;
+  out?: string;
+  fetchFull?: boolean;
+  wallet?: string;
+  pageLimit?: string;
+  maxPages?: string;
+}): Promise<void> {
+  const env = loadEnv();
+  const xlsxPath = options.xlsx && options.xlsx.length > 0
+    ? options.xlsx
+    : "/Users/cakir/Downloads/xuanxuan008_polymarket_activity_log.xlsx";
+  const bundle = await analyzeXuanActivityWorkbook(xlsxPath);
+  if (options.fetchFull) {
+    if (!options.wallet || options.wallet.length === 0) {
+      throw new Error("--fetch-full icin --wallet <address> gerekli.");
+    }
+    bundle.fullHistory = await fetchXuanFullActivityHistory({
+      wallet: options.wallet,
+      baseUrl: env.POLY_DATA_API_BASE_URL,
+      pageLimit: options.pageLimit ? Number(options.pageLimit) : undefined,
+      maxPages: options.maxPages ? Number(options.maxPages) : undefined,
+    });
+  }
+  const outputPath = await writeXuanActivityImportBundle(
+    bundle,
+    options.out && options.out.length > 0 ? options.out : undefined,
+  );
+  await writeStructuredLog("markets", {
+    event: "xuan_activity_import",
+    sourceFile: bundle.sourceFile,
+    outputPath,
+    totalTrades: bundle.report.totalTrades,
+    mergeCount: bundle.report.mergeCount,
+    redeemCount: bundle.report.redeemCount,
+    fullHistoryRows: bundle.fullHistory?.fetchedRows ?? null,
+  });
+  console.log(JSON.stringify({ xlsxPath, outputPath, summary: bundle.report, fullHistory: bundle.fullHistory?.report }, null, 2));
+}
+
 const defaultXuanReferenceSlugs = [
   "btc-updown-5m-1776253500",
   "btc-updown-5m-1776248100",
@@ -662,12 +719,23 @@ async function runXuanComparePaperCommand(options: {
     stateStore ? extractFlowSummariesFromValidationRuns(stateStore.recentValidationRuns("replay", 12)) : [],
   );
   const openingSeedTiming = openingSeedTimingFromCalibration(preReplayFlowCalibration);
-  const replayFlowCountBias = replayFlowCountBiasFromCalibration(preReplayFlowCalibration);
+  const strictXuanFootprint =
+    config.botMode === "XUAN" &&
+    config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
+    config.xuanCloneIntensity === "AGGRESSIVE";
+  const replayFlowCountBias = replayFlowCountBiasFromCalibration(preReplayFlowCalibration, {
+    strictXuanFootprint,
+  });
+  const referenceStartTs = Number(reference.slug.match(/-(\d+)$/)?.[1]);
   const replay = runPaperSession(env, options.variant, {
+    ...(Number.isFinite(referenceStartTs) ? { marketStartTs: referenceStartTs } : {}),
+    ...(strictXuanFootprint ? { referenceFlow: reference } : {}),
     completionPatienceMultiplier: completionPatienceMultiplierFromCalibration(preReplayFlowCalibration),
     ...openingSeedTiming,
     ...replayFlowCountBias,
-    mergeCohortCompression: preReplayFlowCalibration.status === "WARN" || preReplayFlowCalibration.status === "FAIL",
+    mergeCohortCompression:
+      !strictXuanFootprint &&
+      (preReplayFlowCalibration.status === "WARN" || preReplayFlowCalibration.status === "FAIL"),
     orderPriorityAwareFill: replayFlowCountBias.semanticRoleAlignmentBias === "align_high_low_role",
   });
   const strategyTraceSummary = buildPaperStrategyTraceSummary(replay, replayFlowCountBias);
@@ -1545,6 +1613,24 @@ export async function runCli(argv = process.argv): Promise<void> {
     .option("--env-file <path>", "Env file path to update", ".env")
     .action(async (options: { writeEnv?: boolean; envFile: string }) => runClobDerive(options));
   program.command("analyze:xuan").action(async () => runAnalyzeXuan());
+  program
+    .command("xuan:activity-import")
+    .option("--xlsx <path>", "xuan Activity_Log workbook path")
+    .option("--out <path>", "Output canonical activity bundle path")
+    .option("--fetch-full", "Fetch full public activity history from Polymarket Data API")
+    .option("--wallet <address>", "Wallet/proxy address for --fetch-full")
+    .option("--page-limit <n>", "Polymarket activity page size for --fetch-full", "500")
+    .option("--max-pages <n>", "Max pages for --fetch-full", "40")
+    .action(
+      async (options: {
+        xlsx?: string;
+        out?: string;
+        fetchFull?: boolean;
+        wallet?: string;
+        pageLimit?: string;
+        maxPages?: string;
+      }) => runXuanActivityImportCommand(options),
+    );
   program
     .command("xuan:extract")
     .option("--json-path <path>", "Trade tape JSON path")

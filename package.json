@@ -21,6 +21,7 @@
     "inventory:manage": "tsx src/cli.ts inventory:manage",
     "clob:derive": "tsx src/cli.ts clob:derive",
     "analyze:xuan": "tsx src/cli.ts analyze:xuan",
+    "xuan:activity-import": "tsx src/cli.ts xuan:activity-import",
     "xuan:extract": "tsx src/cli.ts xuan:extract",
     "xuan:compare-paper": "tsx src/cli.ts xuan:compare-paper",
     "xuan:extract-runtime": "tsx src/cli.ts xuan:extract-runtime",
@@ -49,6 +50,7 @@
     "pino": "10.3.1",
     "viem": "2.46.3",
     "ws": "8.20.0",
+    "xlsx": "^0.18.5",
     "zod": "4.3.6"
   },
   "devDependencies": {

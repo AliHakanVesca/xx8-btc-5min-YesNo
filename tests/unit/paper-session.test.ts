@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { parseEnv } from "../../src/config/env.js";
 import { runPaperSession } from "../../src/analytics/paperSession.js";
 import { buildCanonicalReferenceFromPaperSession } from "../../src/analytics/xuanCanonicalReference.js";
+import { exact1776253500Reference } from "../../src/analytics/xuanExactReference.js";
 
 describe("paper session replay", () => {
   const env = parseEnv({
@@ -147,6 +148,27 @@ describe("paper session replay", () => {
     expect(canonical.mergeCount).toBe(2);
     expect(new Set(mergeOffsets)).toEqual(new Set([86, 280]));
     expect(canonical.finalResidualBucket).toBe("flat");
+  });
+
+  it("replays the strict xuan reference side and role sequence in aggressive clone mode", () => {
+    const aggressiveEnv = parseEnv({
+      DRY_RUN: "true",
+      POLY_STACK_MODE: "current-prod-v1",
+      BOT_MODE: "XUAN",
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+    });
+    const report = runPaperSession(aggressiveEnv, "xuan-flow", {
+      marketStartTs: exact1776253500Reference.startTs,
+      referenceFlow: exact1776253500Reference,
+    });
+    const canonical = buildCanonicalReferenceFromPaperSession(report);
+    const referenceBuys = exact1776253500Reference.orderedClipSequence.filter((event) => event.kind === "BUY");
+    const candidateBuys = canonical.orderedClipSequence.filter((event) => event.kind === "BUY");
+
+    expect(candidateBuys.map((event) => event.outcome)).toEqual(referenceBuys.map((event) => event.outcome));
+    expect(candidateBuys.map((event) => event.phase)).toEqual(referenceBuys.map((event) => event.phase));
+    expect(candidateBuys.map((event) => event.tOffsetSec)).toEqual(referenceBuys.map((event) => event.tOffsetSec));
   });
 
   it("runs the blocked-completion session and finishes with residual inventory", () => {

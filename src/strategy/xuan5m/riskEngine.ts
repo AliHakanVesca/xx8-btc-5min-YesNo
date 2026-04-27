@@ -33,6 +33,13 @@ export function evaluateRisk(
   const advisoryReasons: string[] = [];
   const currentImbalance = imbalance(state);
   const externalReasons = ctx.externalReasons ?? [];
+  const aggressivePublicFootprint =
+    config.botMode === "XUAN" &&
+    config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
+    config.xuanCloneIntensity === "AGGRESSIVE";
+  const xuanRecycleImbalanceThreshold = aggressivePublicFootprint
+    ? Math.max(config.maxImbalanceFrac, config.hardImbalanceRatio)
+    : config.maxImbalanceFrac;
   if (ctx.forceSafeHalt) {
     return {
       tradable: false,
@@ -54,7 +61,7 @@ export function evaluateRisk(
   if (ctx.bookIsCrossed) blockingReasons.push("crossed_book");
   if (ctx.dailyLossUsdc >= config.dailyMaxLossUsdc) blockingReasons.push("daily_loss_limit");
   if (ctx.marketLossUsdc >= config.marketMaxLossUsdc) blockingReasons.push("market_loss_limit");
-  if (currentImbalance > config.maxImbalanceFrac) advisoryReasons.push("rebalance_imbalance");
+  if (currentImbalance > xuanRecycleImbalanceThreshold) advisoryReasons.push("rebalance_imbalance");
   if (lowBalanceForNewEntry) {
     advisoryReasons.push("low_usdc_no_new_entry");
   }
@@ -83,7 +90,7 @@ export function evaluateRisk(
     ctx.secsToClose <= config.completionOnlyCutoffSecToClose ||
     shouldCompletionOnlyForLowBalance ||
     (Boolean(ctx.forceNoNewEntries) && config.lowCollateralMode === "NO_NEW_ENTRY_BUT_MANAGE") ||
-    (currentImbalance > config.maxImbalanceFrac && ctx.secsToClose <= config.normalEntryCutoffSecToClose);
+    (currentImbalance > xuanRecycleImbalanceThreshold && ctx.secsToClose <= config.normalEntryCutoffSecToClose);
   const allowNewEntries =
     !hardCancel &&
     !ctx.forceNoNewEntries &&

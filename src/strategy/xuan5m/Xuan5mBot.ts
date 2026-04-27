@@ -205,6 +205,22 @@ export class Xuan5mBot {
       hasPartialResidual &&
       activeIndependentFlowCount < config.maxOpenGroupsPerMarket &&
       (config.allowOverlapInLast30S || secsToClose > config.finalWindowCompletionOnlySec);
+    const strictXuanPartialCompletionOnly =
+      config.botMode === "XUAN" &&
+      config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
+      config.xuanCloneIntensity !== "AGGRESSIVE" &&
+      config.blockNewPairWhilePartialOpen &&
+      !config.allowControlledOverlap &&
+      hasPartialResidual &&
+      risk.allowNewEntries;
+    const effectiveRisk = strictXuanPartialCompletionOnly
+      ? {
+          ...risk,
+          allowNewEntries: false,
+          completionOnly: true,
+          reasons: [...risk.reasons, "xuan_strict_partial_completion_first"],
+        }
+      : risk;
 
     const lot = chooseLot(config, {
       marketSlug: state.market.slug,
@@ -277,7 +293,7 @@ export class Xuan5mBot {
     const protectedResidualContext =
       (baseEntryContext.protectedResidualShares ?? 0) + 1e-9 >= controlledOverlapResidualThreshold;
     const shouldAttemptFlowRotationRetry =
-      risk.allowNewEntries &&
+      effectiveRisk.allowNewEntries &&
       shouldRetrySameWindowFlowRotation(config, initialEntryEvaluation, inventoryAdjustmentProbe, {
         hasProtectedResidualContext: protectedResidualContext,
       });
@@ -307,7 +323,7 @@ export class Xuan5mBot {
       config.residualJanitorEnabled &&
       entryEvaluation.trace.skipReason === "micro_residual_janitor_pair";
     const rawEntryBuys =
-      risk.allowNewEntries || janitorEntryAllowed
+      effectiveRisk.allowNewEntries || janitorEntryAllowed
         ? entryEvaluation.decisions
         : [];
     const sameSideOverlapArbitration = arbitrateSameSideCompletionOverlap(
@@ -319,18 +335,18 @@ export class Xuan5mBot {
     );
     const entryBuys = sameSideOverlapArbitration.entryBuys;
     const sameWindowCompletionAndOverlap =
-      risk.allowNewEntries &&
+      effectiveRisk.allowNewEntries &&
       (sameSideOverlapArbitration.forceCompletion ||
         shouldAllowSameWindowCompletionAndOverlap(config, state, entryEvaluation, entryBuys, inventoryAdjustmentProbe));
     const inventoryAdjustment =
-      !risk.allowNewEntries || sameWindowCompletionAndOverlap
+      !effectiveRisk.allowNewEntries || sameWindowCompletionAndOverlap
         ? inventoryAdjustmentProbe
         : undefined;
     const mergePlan = planMerge(config, projectMergeState(state, entryBuys, inventoryAdjustment?.completion));
 
     return {
       phase,
-      risk,
+      risk: effectiveRisk,
       entryBuys,
       completion: inventoryAdjustment?.completion,
       unwind: inventoryAdjustment?.unwind,
@@ -364,7 +380,7 @@ export class Xuan5mBot {
           inventoryAdjustment?.completion?.mode ??
           inventoryAdjustment?.unwind?.mode ??
           entryEvaluation.trace.selectedMode,
-        entry: risk.allowNewEntries
+        entry: effectiveRisk.allowNewEntries
           ? sameSideOverlapArbitration.prunedForCompletion
             ? {
                 ...entryEvaluation.trace,
@@ -406,6 +422,13 @@ function arbitrateSameSideCompletionOverlap(
       entryBuy.side === completion.sideToBuy,
   );
   if (sameSideTemporalBuys.length === 0) {
+    return { entryBuys, forceCompletion: false, prunedForCompletion: false };
+  }
+  if (
+    config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
+    config.xuanCloneIntensity === "AGGRESSIVE" &&
+    completion.missingShares <= state.market.minOrderSize + config.maxCompletionOvershootShares + 1e-6
+  ) {
     return { entryBuys, forceCompletion: false, prunedForCompletion: false };
   }
 

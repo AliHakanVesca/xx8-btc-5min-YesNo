@@ -5097,6 +5097,85 @@ describe("xuan mode and pair order groups", () => {
     expect(evaluation.trace.effectivePair).toBeCloseTo(1.04582, 6);
   });
 
+  it("uses a full xuan-sized probe under aggressive public-footprint intensity", () => {
+    const market = buildOfflineMarket(1713696000);
+    const state = createMarketState(market);
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.53, size: 240 }], [{ price: 0.54, size: 240 }]),
+      buildBook(
+        market.tokens.DOWN.tokenId,
+        market.conditionId,
+        [{ price: 0.46, size: 240 }],
+        [{ price: 0.47, size: 240 }],
+      ),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 5,
+        secsToClose: 295,
+        lot: 95,
+        fairValueSnapshot: {
+          status: "valid",
+          estimatedThreshold: false,
+          fairUp: 0.54,
+          fairDown: 0.47,
+        },
+      },
+    );
+
+    expect(evaluation.decisions).toHaveLength(1);
+    expect(evaluation.decisions[0]).toMatchObject({
+      side: "DOWN",
+      size: 95,
+      mode: "PAIRGROUP_COVERED_SEED",
+    });
+    expect(evaluation.trace.stagedEntry).toBe(true);
+    expect(evaluation.trace.plannedOppositeSide).toBe("UP");
+    expect(evaluation.trace.plannedOppositeQty).toBeCloseTo(95, 6);
+    expect(evaluation.trace.plannedOppositeMinWaitSec).toBeGreaterThanOrEqual(8);
+    expect(evaluation.trace.campaignLaunchMode).toBe("XUAN_PROBE_LAUNCH");
+    expect(evaluation.trace.initialBasketQtyCap).toBeCloseTo(95, 6);
+    expect(evaluation.trace.executedProbeQty).toBeCloseTo(95, 6);
+  });
+
+  it("removes partial-open overlap locks in aggressive public-footprint intensity", () => {
+    const config = buildRuntimeConfig({
+      BOT_MODE: "XUAN",
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+      BLOCK_NEW_PAIR_WHILE_PARTIAL_OPEN: "true",
+      ALLOW_CONTROLLED_OVERLAP: "false",
+      PARTIAL_OPEN_ACTION: "COMPLETION_ONLY",
+      MAX_OPEN_GROUPS_PER_MARKET: "2",
+      MAX_OPEN_PARTIAL_GROUPS_PER_MARKET: "1",
+      ALLOW_OVERLAP_ONLY_AFTER_PARTIAL_CLASSIFIED: "true",
+      ALLOW_OVERLAP_ONLY_WHEN_COMPLETION_ENGINE_ACTIVE: "true",
+      REQUIRE_MATCHED_INVENTORY_BEFORE_SECOND_GROUP: "true",
+    });
+
+    expect(config.blockNewPairWhilePartialOpen).toBe(false);
+    expect(config.allowControlledOverlap).toBe(true);
+    expect(config.partialOpenAction).toBe("ALLOW_OVERLAP");
+    expect(config.maxMarketExposureShares).toBeGreaterThanOrEqual(2400);
+    expect(config.maxMarketSharesPerSide).toBeGreaterThanOrEqual(2400);
+    expect(config.maxOneSidedExposureShares).toBeGreaterThanOrEqual(720);
+    expect(config.maxCyclesPerMarket).toBeGreaterThanOrEqual(45);
+    expect(config.maxBuysPerSide).toBeGreaterThanOrEqual(45);
+    expect(config.maxOpenGroupsPerMarket).toBeGreaterThanOrEqual(10);
+    expect(config.maxOpenPartialGroups).toBeGreaterThanOrEqual(4);
+    expect(config.allowOverlapOnlyAfterPartialClassified).toBe(false);
+    expect(config.allowOverlapOnlyWhenCompletionEngineActive).toBe(false);
+    expect(config.requireMatchedInventoryBeforeSecondGroup).toBe(false);
+  });
+
   it("turns a debt-positive probe into an average-improving basket campaign", () => {
     const market = buildOfflineMarket(1713696000);
     let state = createMarketState(market);
@@ -6736,5 +6815,275 @@ describe("xuan mode and pair order groups", () => {
     );
 
     expect(evaluation.trace.skipReason).not.toBe("late_small_residual_hold");
+  });
+
+  it("strict aggressive clone bypasses bad-cycle lock inside a xuan family seed slot", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    for (const offset of [0, 2]) {
+      state = applyFill(state, {
+        outcome: "UP",
+        side: "BUY",
+        price: 0.6,
+        size: 10,
+        timestamp: market.startTs + offset,
+        makerTaker: "taker",
+        executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+      });
+      state = applyFill(state, {
+        outcome: "DOWN",
+        side: "BUY",
+        price: 0.45,
+        size: 10,
+        timestamp: market.startTs + offset + 1,
+        makerTaker: "taker",
+        executionMode: "PARTIAL_FAST_COMPLETION",
+      });
+    }
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.47, size: 200 }], [{ price: 0.485, size: 200 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.47, size: 200 }], [{ price: 0.485, size: 200 }]),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+        MAX_NEW_CYCLES_PER_30S: "99",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 10,
+        secsToClose: 240,
+        lot: 80,
+        fairValueSnapshot: {
+          status: "valid",
+          estimatedThreshold: false,
+          fairUp: 0.5,
+          fairDown: 0.5,
+        },
+      },
+    );
+
+    expect(evaluation.trace.skipReason).not.toBe("bad_cycle_completion_only");
+  });
+
+  it("strict aggressive clone releases family-prior residual completion before cost-basis cap stalls it", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      size: 91.25,
+      price: 0.48,
+      timestamp: market.startTs,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.72, size: 200 }], [{ price: 0.74, size: 200 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.47, size: 200 }], [{ price: 0.49, size: 200 }]),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 6,
+        secsToClose: 294,
+        lot: 90,
+        allowControlledOverlap: true,
+        protectedResidualShares: 91.25,
+        protectedResidualSide: "DOWN",
+      },
+    );
+
+    expect(evaluation.decisions).toHaveLength(1);
+    expect(evaluation.decisions[0]?.side).toBe("UP");
+    expect(evaluation.trace.skipReason).not.toBe("residual_completion_cost_basis_cap");
+  });
+
+  it("strict aggressive clone reopens a post-merge dust market with a small paired continuation", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 33.25,
+      price: 0.51,
+      timestamp: market.startTs,
+      makerTaker: "taker",
+      executionMode: "XUAN_HARD_PAIR_SWEEP",
+    });
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      size: 33.25,
+      price: 0.49,
+      timestamp: market.startTs + 1,
+      makerTaker: "taker",
+      executionMode: "XUAN_HARD_PAIR_SWEEP",
+    });
+    state = applyMerge(state, {
+      amount: 33.24,
+      timestamp: market.startTs + 160,
+      simulated: true,
+    });
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.54, size: 200 }], [{ price: 0.56, size: 200 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.45, size: 200 }], [{ price: 0.47, size: 200 }]),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+        MARKET_BASKET_BOOTSTRAP_ENABLED: "false",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 218,
+        secsToClose: 82,
+        lot: 90,
+      },
+    );
+
+    expect(evaluation.decisions.length).toBeGreaterThan(0);
+    expect(evaluation.decisions).toHaveLength(1);
+    expect(evaluation.decisions[0]).toMatchObject({ side: "DOWN", mode: "PAIRGROUP_COVERED_SEED" });
+    expect(evaluation.trace.stagedEntry).toBe(true);
+    expect(evaluation.trace.plannedOppositeSide).toBe("UP");
+    expect(evaluation.trace.skipReason).not.toBe("pair_cap+single_leg_seed");
+  });
+
+  it("strict aggressive clone ignores pair daily budget for small post-merge paired continuation", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 30,
+      price: 0.51,
+      timestamp: market.startTs,
+      makerTaker: "taker",
+      executionMode: "XUAN_HARD_PAIR_SWEEP",
+    });
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      size: 30,
+      price: 0.49,
+      timestamp: market.startTs + 1,
+      makerTaker: "taker",
+      executionMode: "XUAN_HARD_PAIR_SWEEP",
+    });
+    state = applyMerge(state, {
+      amount: 29.99,
+      timestamp: market.startTs + 160,
+      simulated: true,
+    });
+    state.negativePairEdgeConsumedUsdc = 999;
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.54, size: 200 }], [{ price: 0.56, size: 200 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.45, size: 200 }], [{ price: 0.47, size: 200 }]),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+        MARKET_BASKET_BOOTSTRAP_ENABLED: "false",
+        MAX_NEGATIVE_DAILY_BUDGET_USDC: "1",
+        MAX_NEGATIVE_PAIR_EDGE_PER_MARKET_USDC: "1",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 218,
+        secsToClose: 82,
+        lot: 90,
+        dailyNegativeEdgeSpentUsdc: 999,
+      },
+    );
+
+    expect(evaluation.decisions).toHaveLength(1);
+    expect(evaluation.decisions[0]).toMatchObject({ side: "DOWN", mode: "PAIRGROUP_COVERED_SEED" });
+    expect(evaluation.trace.stagedEntry).toBe(true);
+    expect(evaluation.trace.plannedOppositeSide).toBe("UP");
+    expect(evaluation.trace.skipReason).not.toBe("pair_daily_budget+single_leg_seed");
+  });
+
+  it("strict aggressive clone releases campaign residual completion instead of repair_qty_cap", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 1064.29154,
+      price: 0.52,
+      timestamp: market.startTs + 8,
+      makerTaker: "taker",
+      executionMode: "XUAN_HARD_PAIR_SWEEP",
+    });
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      size: 1064.29154,
+      price: 0.49,
+      timestamp: market.startTs + 9,
+      makerTaker: "taker",
+      executionMode: "XUAN_HARD_PAIR_SWEEP",
+    });
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 85.76828,
+      price: 0.73,
+      timestamp: market.startTs + 107,
+      makerTaker: "taker",
+      executionMode: "PARTIAL_SOFT_COMPLETION",
+    });
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.72, size: 200 }], [{ price: 0.74, size: 200 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.37, size: 200 }], [{ price: 0.38, size: 200 }]),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 108,
+        secsToClose: 192,
+        lot: 90,
+        allowControlledOverlap: true,
+        protectedResidualShares: 85.76828,
+        protectedResidualSide: "DOWN",
+      },
+    );
+
+    expect(evaluation.decisions.length).toBeGreaterThan(0);
+    expect(evaluation.decisions[0]?.side).toBe("DOWN");
+    expect(evaluation.trace.skipReason).not.toBe("repair_qty_cap");
+    expect(evaluation.trace.aggressiveResidualDutyReleaseActive).toBe(true);
   });
 });

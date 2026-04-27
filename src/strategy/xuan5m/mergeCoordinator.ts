@@ -148,6 +148,7 @@ export function evaluateDelayedMergeGate(
   config: Pick<
     XuanStrategyConfig,
     | "xuanCloneMode"
+    | "xuanCloneIntensity"
     | "botMode"
     | "mergeMode"
     | "mergeBatchMode"
@@ -166,6 +167,8 @@ export function evaluateDelayedMergeGate(
     | "hardImbalanceMergeOverlapGraceSec"
     | "hardImbalanceMergeMaxDeferrableShares"
     | "controlledOverlapSeedMaxQty"
+    | "completionMinQty"
+    | "maxOneSidedExposureShares"
     | "defaultLot"
     | "liveSmallLotLadder"
     | "minUsdcBalanceForNewEntry"
@@ -197,8 +200,11 @@ export function evaluateDelayedMergeGate(
       ? resolveBundledMergeClusterPrior(state.market.slug, args.secsFromOpen)
       : undefined;
   const exactMergePriorActive = timingPrior?.scope === "exact" || mergeClusterPrior?.scope === "exact";
+  const aggressivePublicFootprint =
+    config.xuanCloneMode === "PUBLIC_FOOTPRINT" && config.xuanCloneIntensity === "AGGRESSIVE";
   const publicFootprintHoldWithoutPrior =
     config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
+    !aggressivePublicFootprint &&
     !exactMergePriorActive;
   const exactTimingPrior = timingPrior?.scope === "exact" ? timingPrior : undefined;
   const mergeShieldSecFromOpen = exactTimingPrior
@@ -285,10 +291,13 @@ export function evaluateDelayedMergeGate(
     args.nowTs,
     Math.max(config.marketBasketMinMergeShares * 0.01, 1e-6),
   );
+  const materialPlannedOppositeThreshold = aggressivePublicFootprint
+    ? Math.max(state.market.minOrderSize, config.marketBasketMinMergeShares * 0.5)
+    : Math.max(state.market.minOrderSize, config.marketBasketMinMergeShares * 0.1);
   const plannedOppositeHoldActive =
-    publicFootprintHoldWithoutPrior &&
+    config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
     plannedOpposite !== undefined &&
-    plannedOpposite.plannedOppositeMissingQty >= Math.max(state.market.minOrderSize, config.marketBasketMinMergeShares * 0.1) - 1e-9 &&
+    plannedOpposite.plannedOppositeMissingQty >= materialPlannedOppositeThreshold - 1e-9 &&
     args.secsToClose > config.finalWindowCompletionOnlySec;
 
   if (plannedOppositeHoldActive) {
@@ -298,6 +307,61 @@ export function evaluateDelayedMergeGate(
       reason: "planned_opposite_hold",
       mergeVsCarryDecision: "CARRY_TO_SETTLEMENT",
       mergeVsCarryReason: "merge_held_for_planned_opposite_completion",
+      ...metrics,
+    };
+  }
+
+  const secsFromOpen = args.secsFromOpen ?? Number.POSITIVE_INFINITY;
+  const familyFirstMergeWindowActive =
+    aggressivePublicFootprint &&
+    !exactMergePriorActive &&
+    secsFromOpen >= 160 &&
+    secsFromOpen <= 210 &&
+    metrics.completedCycles >= Math.max(1, Math.min(effectiveMinCompletedCyclesBeforeFirstMerge, 2)) &&
+    metrics.pendingMatchedQty >= config.marketBasketMinMergeShares - 1e-9;
+  if (familyFirstMergeWindowActive) {
+    return {
+      allow: true,
+      forced: false,
+      reason: "age_target",
+      ...(basketEffectivePair !== undefined ? { basketEffectivePair: normalize(basketEffectivePair) } : {}),
+      ...metrics,
+    };
+  }
+
+  const familyFinalMergeWindowActive =
+    aggressivePublicFootprint &&
+    !exactMergePriorActive &&
+    secsFromOpen >= 276 &&
+    secsFromOpen <= 282 &&
+    metrics.pendingMatchedQty >= state.market.minOrderSize - 1e-9;
+  if (familyFinalMergeWindowActive) {
+    return {
+      allow: true,
+      forced: true,
+      reason: "final_window",
+      ...(basketEffectivePair !== undefined ? { basketEffectivePair: normalize(basketEffectivePair) } : {}),
+      ...metrics,
+    };
+  }
+
+  const aggressivePostMergeCycleReleaseActive =
+    aggressivePublicFootprint &&
+    !exactMergePriorActive &&
+    state.mergeHistory.length > 0 &&
+    secsFromOpen >= 160 &&
+    secsFromOpen < 276 &&
+    args.secsToClose > config.finalWindowCompletionOnlySec &&
+    metrics.oldestMatchedAgeSec !== undefined &&
+    metrics.oldestMatchedAgeSec >= Math.max(2, config.xuanRhythmMaxWaitSec) &&
+    metrics.pendingMatchedQty >= state.market.minOrderSize - 1e-9 &&
+    Math.abs(state.upShares - state.downShares) <= Math.max(state.market.minOrderSize, config.completionMinQty) + 1e-9;
+  if (aggressivePostMergeCycleReleaseActive) {
+    return {
+      allow: true,
+      forced: false,
+      reason: "cycle_target",
+      ...(basketEffectivePair !== undefined ? { basketEffectivePair: normalize(basketEffectivePair) } : {}),
       ...metrics,
     };
   }
@@ -340,6 +404,37 @@ export function evaluateDelayedMergeGate(
         allow: false,
         forced: false,
         reason: "public_footprint_hold",
+        ...metrics,
+      };
+    }
+    const aggressiveFamilyHardImbalanceHold =
+      aggressivePublicFootprint &&
+      !exactMergePriorActive &&
+      secsFromOpen < 160 &&
+      args.secsToClose > config.finalWindowCompletionOnlySec &&
+      hardImbalanceShareGap <= config.maxOneSidedExposureShares + 1e-9 &&
+      metrics.pendingMatchedQty >= state.market.minOrderSize - 1e-9;
+    if (aggressiveFamilyHardImbalanceHold) {
+      return {
+        allow: false,
+        forced: false,
+        reason: "not_ready",
+        ...(basketEffectivePair !== undefined ? { basketEffectivePair: normalize(basketEffectivePair) } : {}),
+        ...metrics,
+      };
+    }
+    const aggressiveHardImbalanceCompletionDutyHold =
+      aggressivePublicFootprint &&
+      !exactMergePriorActive &&
+      args.secsToClose > config.finalWindowCompletionOnlySec &&
+      secsFromOpen < 276 &&
+      hardImbalanceShareGap > Math.max(state.market.minOrderSize, config.completionMinQty) + 1e-9;
+    if (aggressiveHardImbalanceCompletionDutyHold) {
+      return {
+        allow: false,
+        forced: false,
+        reason: "hard_imbalance_deferred",
+        ...(basketEffectivePair !== undefined ? { basketEffectivePair: normalize(basketEffectivePair) } : {}),
         ...metrics,
       };
     }
@@ -398,6 +493,22 @@ export function evaluateDelayedMergeGate(
       allow: false,
       forced: false,
       reason: "cluster_window",
+      ...metrics,
+    };
+  }
+
+  const aggressiveFamilyPreFirstMergeHold =
+    aggressivePublicFootprint &&
+    !exactMergePriorActive &&
+    secsFromOpen < 160 &&
+    args.secsToClose > config.finalWindowCompletionOnlySec &&
+    metrics.pendingMatchedQty >= state.market.minOrderSize - 1e-9;
+  if (aggressiveFamilyPreFirstMergeHold) {
+    return {
+      allow: false,
+      forced: false,
+      reason: "not_ready",
+      ...(basketEffectivePair !== undefined ? { basketEffectivePair: normalize(basketEffectivePair) } : {}),
       ...metrics,
     };
   }

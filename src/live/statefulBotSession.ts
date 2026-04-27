@@ -4428,7 +4428,9 @@ export async function runStatefulBotSession(
           const groupedEntries = applyPairOrderType(decision.entryBuys, group);
           const missingSide: OutcomeSide = state.upShares > state.downShares ? "DOWN" : "UP";
           const sequentialPairExecutionActive =
-            controlledOverlapActive || group.selectedMode === "PAIRGROUP_COVERED_SEED";
+            controlledOverlapActive ||
+            group.selectedMode === "PAIRGROUP_COVERED_SEED" ||
+            (config.botMode === "XUAN" && config.xuanCloneMode === "PUBLIC_FOOTPRINT");
           const orderedEntries = orderPairEntriesForPublicFootprint({
             config,
             state,
@@ -4699,7 +4701,7 @@ export async function runStatefulBotSession(
             throw new Error("Expected a single entry buy decision.");
           }
           const temporalSeedGroup =
-            entryBuy.mode === "TEMPORAL_SINGLE_LEG_SEED"
+            (entryBuy.mode === "TEMPORAL_SINGLE_LEG_SEED" || entryBuy.mode === "PAIRGROUP_COVERED_SEED")
               ? createPairOrderGroup({
                   conditionId: market.conditionId,
                   marketSlug: market.slug,
@@ -4709,7 +4711,7 @@ export async function runStatefulBotSession(
                   ...(entryBuy.side === "UP" ? { maxUpPrice: entryBuy.order.price } : {}),
                   ...(entryBuy.side === "DOWN" ? { maxDownPrice: entryBuy.order.price } : {}),
                   mode: config.botMode,
-                  selectedMode: "TEMPORAL_SINGLE_LEG_SEED",
+                  selectedMode: entryBuy.mode,
                   createdAt: submittedAtMs,
                   state,
                   rawPair: entryBuy.rawPairCost ?? 0,

@@ -60,6 +60,7 @@ export const envSchema = z.object({
   DRY_RUN: booleanString.default(true),
   BOT_MODE: z.enum(["STRICT", "XUAN"]).default("XUAN"),
   XUAN_CLONE_MODE: z.enum(["OFF", "PUBLIC_FOOTPRINT"]).default("OFF"),
+  XUAN_CLONE_INTENSITY: z.enum(["CONTROLLED", "AGGRESSIVE"]).default("CONTROLLED"),
   STATE_STORE: z.enum(["SQLITE", "JSON"]).default("SQLITE"),
   STATE_DB_PATH: z.string().default("data/xuan_state.sqlite"),
   STARTUP_INVENTORY_POLICY: z.enum(["IGNORE", "ADOPT_AND_RECONCILE"]).default("ADOPT_AND_RECONCILE"),

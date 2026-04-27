@@ -130,6 +130,14 @@ export interface LivePaperSummary {
   xuanPairedContinuationCount?: number;
   xuanIndependentFlowCount?: number;
   xuanCompletionOnlyFillCount?: number;
+  xuanBuyRowsPerMarket?: number;
+  xuanSameSecondDualBuyCount?: number;
+  xuanSameSecondDualBuyRate?: number;
+  xuanOppositeLegGapMedianSec?: number;
+  xuanMedianTradeSize?: number;
+  xuanStagedOppositeSeedCount?: number;
+  xuanStagedOppositeReleaseCount?: number;
+  xuanStagedOppositeReleaseRate?: number;
   xuanDebtReducingContinuationCount?: number;
   xuanDebtHoldMaxSec?: number;
   xuanRhythmWaitSec?: number;
@@ -145,8 +153,14 @@ export interface LivePaperSummary {
   xuanNoTradeReason?: string;
   xuanEarlyNoTradeReason?: string;
   xuanPassBlockers?: string[];
+  xuanEconomicsWarnings?: string[];
   xuanConformanceScore?: number;
   xuanConformanceStatus?: "PASS" | "WARN" | "FAIL";
+  xuanAggressiveClone?: {
+    enabled: boolean;
+    lastFootprintScore?: number;
+    topBlockers: string[];
+  };
 }
 
 export interface LivePaperReport {
@@ -255,6 +269,18 @@ function normalize(value: number, digits = 6): number {
   return Number(value.toFixed(digits));
 }
 
+function medianNumber(values: number[]): number | undefined {
+  const sorted = values.filter((value) => Number.isFinite(value)).sort((left, right) => left - right);
+  if (sorted.length === 0) {
+    return undefined;
+  }
+  const middle = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 1) {
+    return sorted[middle];
+  }
+  return ((sorted[middle - 1] ?? 0) + (sorted[middle] ?? 0)) / 2;
+}
+
 export function scoreXuanConformance(args: {
   rawScore: number;
   fillCount: number;
@@ -270,10 +296,15 @@ export function scoreXuanConformance(args: {
   completionSec?: number | undefined;
   imbalanceShares: number;
   residualShares: number;
-}): { score: number; status: "PASS" | "WARN" | "FAIL"; blockers: string[] } {
+  sameSecondDualBuyRate?: number | undefined;
+  oppositeLegGapMedianSec?: number | undefined;
+  buyRowsPerMarket?: number | undefined;
+}): { score: number; status: "PASS" | "WARN" | "FAIL"; blockers: string[]; economicsWarnings: string[] } {
+  const economicsWarnings = [
+    ...(args.requireProfit === true && (args.mergeRealizedPnl ?? 0) < 0 ? ["negative_merge_pnl"] : []),
+  ];
   const blockers = [
     ...(args.mergedQty > 0 ? [] : ["missing_merge"]),
-    ...(args.requireProfit !== true || (args.mergeRealizedPnl ?? 0) >= 0 ? [] : ["negative_merge_pnl"]),
     ...(args.fillCount >= args.minFillCountForPass ? [] : ["insufficient_fill_count"]),
     ...(args.requirePairedContinuation !== true || (args.pairedContinuationCount ?? 0) > 0
       ? []
@@ -285,12 +316,18 @@ export function scoreXuanConformance(args: {
     ...(args.firstFillSec !== undefined && args.firstFillSec <= 15 ? [] : ["late_or_missing_first_fill"]),
     ...(args.completionSec !== undefined && args.completionSec <= 120 ? [] : ["late_or_missing_completion"]),
     ...(args.imbalanceShares <= 1 && args.residualShares <= 1 ? [] : ["residual_not_flat"]),
+    ...((args.sameSecondDualBuyRate ?? 0) <= 0.12 ? [] : ["same_second_dual_buy_rate_high"]),
+    ...(args.oppositeLegGapMedianSec === undefined || args.oppositeLegGapMedianSec >= 8
+      ? []
+      : ["opposite_leg_gap_too_short"]),
+    ...((args.buyRowsPerMarket ?? 0) <= 35 ? [] : ["buy_density_too_high"]),
   ];
   const score = blockers.length === 0 ? args.rawScore : Math.min(args.rawScore, 74);
   return {
     score,
     status: blockers.length === 0 && score >= 75 ? "PASS" : score >= 45 ? "WARN" : "FAIL",
     blockers,
+    economicsWarnings,
   };
 }
 
@@ -923,6 +960,7 @@ export function summarizeLivePaperSamples(args: {
 
 function enrichSummaryWithExecution(args: {
   summary: LivePaperSummary;
+  config: XuanStrategyConfig;
   state: XuanMarketState;
   marketStartTs: number;
   xuanMinFillCountForPass: number;
@@ -944,6 +982,35 @@ function enrichSummaryWithExecution(args: {
   const finalState = buildStateSnapshot(args.state);
   const buyFills = filledExecutions.filter((execution) => execution.tradeSide === "BUY");
   const completionFills = filledExecutions.filter((execution) => execution.kind === "completion");
+  const buyFillsByTimestamp = new Map<number, Set<OutcomeSide>>();
+  for (const execution of buyFills) {
+    const sides = buyFillsByTimestamp.get(execution.timestamp) ?? new Set<OutcomeSide>();
+    sides.add(execution.outcome);
+    buyFillsByTimestamp.set(execution.timestamp, sides);
+  }
+  const sameSecondDualBuyCount = [...buyFillsByTimestamp.values()].filter(
+    (sides) => sides.has("UP") && sides.has("DOWN"),
+  ).length;
+  const sameSecondDualBuyRate = sameSecondDualBuyCount / Math.max(buyFillsByTimestamp.size, 1);
+  const oppositeLegGaps = [...buyFills]
+    .sort((left, right) => left.timestamp - right.timestamp)
+    .reduce<number[]>((gaps, execution, index, sorted) => {
+      if (index === 0) {
+        return gaps;
+      }
+      const previous = sorted[index - 1]!;
+      if (previous.outcome !== execution.outcome) {
+        gaps.push(Math.max(0, execution.timestamp - previous.timestamp));
+      }
+      return gaps;
+    }, []);
+  const oppositeLegGapMedianSec = medianNumber(oppositeLegGaps);
+  const medianTradeSize = medianNumber(buyFills.map((execution) => execution.filledShares));
+  const stagedOppositeSeedCount = buyFills.filter((execution) => execution.mode === "PAIRGROUP_COVERED_SEED").length;
+  const stagedOppositeReleaseCount = completionFills.filter(
+    (execution) => execution.mode === "HIGH_LOW_COMPLETION_CHASE",
+  ).length;
+  const stagedOppositeReleaseRate = stagedOppositeReleaseCount / Math.max(stagedOppositeSeedCount, 1);
   const pairedContinuationGroups = new Map<number, Set<OutcomeSide>>();
   let debtReducingContinuationCount = 0;
   for (const execution of buyFills) {
@@ -1030,6 +1097,9 @@ function enrichSummaryWithExecution(args: {
     ...(completionTs !== undefined ? { completionSec: completionTs - args.marketStartTs } : {}),
     imbalanceShares,
     residualShares,
+    sameSecondDualBuyRate,
+    ...(oppositeLegGapMedianSec !== undefined ? { oppositeLegGapMedianSec } : {}),
+    buyRowsPerMarket: buyFills.length,
   });
   const xuanNoTradeReason = [...args.noTradeReasons.entries()].sort((left, right) => right[1] - left[1])[0]?.[0];
   const xuanFinalMergeForced = args.merges.some((merge) => merge.status === "merged" && merge.forced);
@@ -1073,6 +1143,14 @@ function enrichSummaryWithExecution(args: {
     xuanPairedContinuationCount: pairedContinuationCount,
     xuanIndependentFlowCount: independentFlowCount,
     xuanCompletionOnlyFillCount: completionOnlyFillCount,
+    xuanBuyRowsPerMarket: buyFills.length,
+    xuanSameSecondDualBuyCount: sameSecondDualBuyCount,
+    xuanSameSecondDualBuyRate: normalize(sameSecondDualBuyRate),
+    ...(oppositeLegGapMedianSec !== undefined ? { xuanOppositeLegGapMedianSec: normalize(oppositeLegGapMedianSec) } : {}),
+    ...(medianTradeSize !== undefined ? { xuanMedianTradeSize: normalize(medianTradeSize) } : {}),
+    xuanStagedOppositeSeedCount: stagedOppositeSeedCount,
+    xuanStagedOppositeReleaseCount: stagedOppositeReleaseCount,
+    xuanStagedOppositeReleaseRate: normalize(stagedOppositeReleaseRate),
     xuanDebtReducingContinuationCount: Math.floor(debtReducingContinuationCount / 2),
     xuanDebtHoldMaxSec: normalize(debtHoldMaxSec),
     ...(args.xuanRhythmWaitSec !== undefined ? { xuanRhythmWaitSec: normalize(args.xuanRhythmWaitSec) } : {}),
@@ -1087,8 +1165,14 @@ function enrichSummaryWithExecution(args: {
     xuanFinalMergeForced,
     ...(xuanNoTradeReason ? { xuanNoTradeReason } : {}),
     xuanPassBlockers: xuanScore.blockers,
+    xuanEconomicsWarnings: xuanScore.economicsWarnings,
     xuanConformanceScore: xuanScore.score,
     xuanConformanceStatus: xuanScore.status,
+    xuanAggressiveClone: {
+      enabled: args.config.xuanCloneMode === "PUBLIC_FOOTPRINT" && args.config.xuanCloneIntensity === "AGGRESSIVE",
+      lastFootprintScore: xuanScore.score,
+      topBlockers: xuanScore.blockers.slice(0, 5),
+    },
   };
 }
 
@@ -1287,6 +1371,7 @@ export async function runLivePaperSession(
       startedAt,
       endedAt,
     }),
+    config,
     state,
     marketStartTs: market.startTs,
     xuanMinFillCountForPass: config.xuanMinFillCountForPass,

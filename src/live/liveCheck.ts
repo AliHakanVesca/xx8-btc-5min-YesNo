@@ -119,6 +119,11 @@ interface LiveCheckReport {
     latestReplayTimestamp?: number;
     runtimeChildOrderDispatch: RuntimeChildOrderDispatchReadiness;
   };
+  xuanAggressiveClone: {
+    enabled: boolean;
+    lastFootprintScore?: number;
+    topBlockers: string[];
+  };
   recommendedEnv: Record<string, string>;
 }
 
@@ -218,6 +223,37 @@ function extractRuntimeChildOrderDispatchReadiness(
     compressedPairSubmitCount: asNumber(summaryCandidate?.compressedPairSubmitCount),
     averageInterChildDelayMs: asNullableNumber(summaryCandidate?.averageInterChildDelayMs),
     maxInterChildDelayMs: asNullableNumber(summaryCandidate?.maxInterChildDelayMs),
+  };
+}
+
+function extractXuanAggressiveCloneReadiness(
+  config: ReturnType<typeof buildStrategyConfig>,
+  payload: Record<string, unknown> | undefined,
+): LiveCheckReport["xuanAggressiveClone"] {
+  const summary = isRecord(payload?.summary) ? payload.summary : undefined;
+  const reportSummary = isRecord(payload?.reportSummary) ? payload.reportSummary : undefined;
+  const flowStatus = isRecord(payload?.flowStatus) ? payload.flowStatus : undefined;
+  const directScore = typeof payload?.score === "number" ? payload.score : undefined;
+  const summaryScore = typeof summary?.xuanConformanceScore === "number" ? summary.xuanConformanceScore : undefined;
+  const reportScore = typeof reportSummary?.score === "number" ? reportSummary.score : undefined;
+  const passBlockers = Array.isArray(summary?.xuanPassBlockers)
+    ? summary.xuanPassBlockers.filter((item): item is string => typeof item === "string")
+    : [];
+  const directFlowReasons = Array.isArray(payload?.flowReasons)
+    ? payload.flowReasons.filter((item): item is string => typeof item === "string")
+    : [];
+  const reportFlowReasons = Array.isArray(reportSummary?.flowReasons)
+    ? reportSummary.flowReasons.filter((item): item is string => typeof item === "string")
+    : [];
+  const statusFlowReasons = Array.isArray(flowStatus?.reasons)
+    ? flowStatus.reasons.filter((item): item is string => typeof item === "string")
+    : [];
+  const lastFootprintScore = directScore ?? summaryScore ?? reportScore;
+
+  return {
+    enabled: config.xuanCloneMode === "PUBLIC_FOOTPRINT" && config.xuanCloneIntensity === "AGGRESSIVE",
+    ...(lastFootprintScore !== undefined ? { lastFootprintScore } : {}),
+    topBlockers: [...passBlockers, ...directFlowReasons, ...reportFlowReasons, ...statusFlowReasons].slice(0, 5),
   };
 }
 
@@ -724,6 +760,10 @@ export async function runLiveCheck(env: AppEnv): Promise<LiveCheckReport> {
     warnings.push(`Inventory snapshot alinamadi: ${error instanceof Error ? error.message : String(error)}`);
   }
 
+  const xuanAggressiveClone = extractXuanAggressiveCloneReadiness(
+    config,
+    isRecord(latestReplayValidation?.payload) ? latestReplayValidation.payload : undefined,
+  );
   const report = {
     summary: {
       readyForLiveSmall: blockers.length === 0,
@@ -781,6 +821,7 @@ export async function runLiveCheck(env: AppEnv): Promise<LiveCheckReport> {
       ...(latestReplayValidation ? { latestReplayTimestamp: latestReplayValidation.timestamp } : {}),
       runtimeChildOrderDispatch: runtimeChildOrderDispatchReadiness,
     },
+    xuanAggressiveClone,
     recommendedEnv: recommendedCanaryEnv(),
   };
   stateStore.close();

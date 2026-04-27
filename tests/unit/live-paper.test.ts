@@ -69,7 +69,7 @@ describe("live paper analytics", () => {
     expect(scored.blockers).toEqual([]);
   });
 
-  it("blocks xuan PASS when merge pnl is negative", () => {
+  it("keeps negative merge pnl as an economics warning, not a behavior blocker", () => {
     const scored = scoreXuanConformance({
       rawScore: 90,
       fillCount: 4,
@@ -86,9 +86,10 @@ describe("live paper analytics", () => {
       residualShares: 0.02,
     });
 
-    expect(scored.score).toBe(74);
-    expect(scored.status).toBe("WARN");
-    expect(scored.blockers).toContain("negative_merge_pnl");
+    expect(scored.score).toBe(90);
+    expect(scored.status).toBe("PASS");
+    expect(scored.blockers).not.toContain("negative_merge_pnl");
+    expect(scored.economicsWarnings).toContain("negative_merge_pnl");
   });
 
   it("does not count split completions as real xuan continuation for PASS", () => {

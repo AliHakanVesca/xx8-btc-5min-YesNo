@@ -216,6 +216,171 @@ describe("merge coordinator", () => {
     expect(gate.pendingMatchedQty).toBe(95);
   });
 
+  it("uses aggressive family timing for first merge without exact prior", () => {
+    const config = buildConfig({
+      BOT_MODE: "XUAN",
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+      MARKET_BASKET_MIN_MERGE_SHARES: "30",
+    });
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      price: 0.44,
+      size: 40,
+      timestamp: market.startTs + 20,
+      makerTaker: "taker",
+    });
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.45,
+      size: 40,
+      timestamp: market.startTs + 21,
+      makerTaker: "taker",
+    });
+    let tracker = createMergeBatchTracker();
+    tracker = syncMergeBatchTracker(tracker, 40, market.startTs + 21);
+
+    const gate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 170,
+      secsFromOpen: 170,
+      secsToClose: 130,
+      usdcBalance: 100,
+      tracker,
+    });
+
+    expect(gate.allow).toBe(true);
+    expect(gate.forced).toBe(false);
+    expect(gate.reason).toBe("age_target");
+  });
+
+  it("holds aggressive family merge before the first xuan timing window", () => {
+    const config = buildConfig({
+      BOT_MODE: "XUAN",
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+      MARKET_BASKET_MIN_MERGE_SHARES: "30",
+    });
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      price: 0.44,
+      size: 40,
+      timestamp: market.startTs + 20,
+      makerTaker: "taker",
+    });
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.45,
+      size: 40,
+      timestamp: market.startTs + 21,
+      makerTaker: "taker",
+    });
+    let tracker = createMergeBatchTracker();
+    tracker = syncMergeBatchTracker(tracker, 40, market.startTs + 21);
+
+    const gate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 46,
+      secsFromOpen: 46,
+      secsToClose: 254,
+      usdcBalance: 100,
+      tracker,
+    });
+
+    expect(gate.allow).toBe(false);
+    expect(gate.forced).toBe(false);
+    expect(gate.reason).toBe("not_ready");
+    expect(gate.pendingMatchedQty).toBe(40);
+  });
+
+  it("holds aggressive hard-imbalance merge before the first xuan timing window", () => {
+    const config = buildConfig({
+      BOT_MODE: "XUAN",
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+      MARKET_BASKET_MIN_MERGE_SHARES: "30",
+    });
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.44,
+      size: 90,
+      timestamp: market.startTs,
+      makerTaker: "taker",
+    });
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      price: 0.58,
+      size: 30,
+      timestamp: market.startTs + 1,
+      makerTaker: "taker",
+    });
+    let tracker = createMergeBatchTracker();
+    tracker = syncMergeBatchTracker(tracker, 30, market.startTs + 1);
+
+    const gate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 1,
+      secsFromOpen: 1,
+      secsToClose: 299,
+      usdcBalance: 100,
+      tracker,
+    });
+
+    expect(gate.allow).toBe(false);
+    expect(gate.forced).toBe(false);
+    expect(gate.reason).toBe("not_ready");
+    expect(gate.pendingMatchedQty).toBe(30);
+  });
+
+  it("forces aggressive family merge in the final xuan window without exact prior", () => {
+    const config = buildConfig({
+      BOT_MODE: "XUAN",
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+    });
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      price: 0.5,
+      size: 10,
+      timestamp: market.startTs + 180,
+      makerTaker: "taker",
+    });
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.48,
+      size: 10,
+      timestamp: market.startTs + 181,
+      makerTaker: "taker",
+    });
+    let tracker = createMergeBatchTracker();
+    tracker = syncMergeBatchTracker(tracker, 10, market.startTs + 181);
+
+    const gate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 278,
+      secsFromOpen: 278,
+      secsToClose: 22,
+      usdcBalance: 100,
+      tracker,
+    });
+
+    expect(gate.allow).toBe(true);
+    expect(gate.forced).toBe(true);
+    expect(gate.reason).toBe("final_window");
+  });
+
   it("releases a public-footprint basket once the xuan-sized merge target is reached", () => {
     const config = buildConfig({
       BOT_MODE: "XUAN",
@@ -399,6 +564,33 @@ describe("merge coordinator", () => {
     expect(deferredGate.reason).toBe("hard_imbalance_deferred");
     expect(releasedGate.allow).toBe(true);
     expect(releasedGate.reason).toBe("hard_imbalance");
+  });
+
+  it("keeps aggressive public-footprint hard imbalance open for completion before final window", () => {
+    const config = buildConfig({
+      BOT_MODE: "XUAN",
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+      FORCE_MERGE_ON_HARD_IMBALANCE: "true",
+    });
+    const market = buildOfflineMarket(1713696000);
+    const state = createMarketState(market);
+    state.upShares = 7.5;
+    state.downShares = 91.25;
+    let tracker = createMergeBatchTracker();
+    tracker = syncMergeBatchTracker(tracker, 7.5, market.startTs + 60);
+
+    const gate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 160,
+      secsFromOpen: 160,
+      secsToClose: 140,
+      usdcBalance: 100,
+      tracker,
+    });
+
+    expect(gate.allow).toBe(false);
+    expect(gate.forced).toBe(false);
+    expect(gate.reason).toBe("hard_imbalance_deferred");
   });
 
   it("defers hard-imbalance flush caused by a small overlap seed", () => {

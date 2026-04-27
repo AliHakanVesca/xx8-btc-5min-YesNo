@@ -1133,6 +1133,25 @@ export function pairSweepAllowance(args: {
   const projectedDailyBudget = (args.dailyNegativeEdgeSpentUsdc ?? 0) + negativeEdgeUsdc;
   const bootstrapAllowed = marketBasketBootstrapAllowed(args);
   const basketContinuation = marketBasketContinuationProjection(args);
+  const aggressivePublicFootprint =
+    args.config.botMode === "XUAN" &&
+    args.config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
+    args.config.xuanCloneIntensity === "AGGRESSIVE";
+  const aggressiveSmallContinuationClip = Math.max(
+    args.config.xuanMicroPairMaxQty,
+    args.config.liveSmallLotLadder[0] ?? args.config.defaultLot,
+    args.state.market.minOrderSize,
+  );
+  const aggressiveSmallContinuationBudgetBypass =
+    aggressivePublicFootprint &&
+    args.secsToClose > args.config.finalWindowNoChaseSec &&
+    args.candidateSize <= aggressiveSmallContinuationClip + 1e-9 &&
+    args.costWithFees <= args.config.xuanBehaviorCap + 1e-9 &&
+    (
+      args.state.mergeHistory.length > 0 ||
+      args.state.fillHistory.some((fill) => fill.side === "BUY") ||
+      imbalanceRatio <= args.config.hardImbalanceRatio
+    );
 
   if (args.secsToClose <= args.config.finalWindowNoChaseSec && !args.config.allowAnyNewBuyInLast10S) {
     return {
@@ -1229,6 +1248,9 @@ export function pairSweepAllowance(args: {
   const withinCycleBudget = negativeEdgeUsdc <= args.config.maxNegativePairEdgePerCycleUsdc;
   const withinMarketBudget = projectedMarketBudget <= args.config.maxNegativePairEdgePerMarketUsdc;
   const withinDailyBudget = projectedDailyBudget <= args.config.maxNegativeDailyBudgetUsdc;
+  const effectiveWithinCycleBudget = withinCycleBudget || aggressiveSmallContinuationBudgetBypass;
+  const effectiveWithinMarketBudget = withinMarketBudget || aggressiveSmallContinuationBudgetBypass;
+  const effectiveWithinDailyBudget = withinDailyBudget || aggressiveSmallContinuationBudgetBypass;
   const flowPressureState =
     args.flowPressureState ??
     deriveFlowPressureBudgetState({
@@ -1248,9 +1270,9 @@ export function pairSweepAllowance(args: {
     args.candidateSize <= args.config.xuanSoftSweepMaxQty &&
     args.secsToClose > args.config.xuanMinTimeLeftForSoftSweep &&
     imbalanceRatio <= args.config.softImbalanceRatio &&
-    withinCycleBudget &&
-    withinMarketBudget &&
-    withinDailyBudget
+    effectiveWithinCycleBudget &&
+    effectiveWithinMarketBudget &&
+    effectiveWithinDailyBudget
   ) {
     return {
       allowed: true,
@@ -1267,9 +1289,9 @@ export function pairSweepAllowance(args: {
     args.candidateSize <= args.config.xuanHardSweepMaxQty &&
     args.secsToClose > args.config.xuanMinTimeLeftForHardSweep &&
     imbalanceRatio <= args.config.hardImbalanceRatio &&
-    withinCycleBudget &&
-    withinMarketBudget &&
-    withinDailyBudget
+    effectiveWithinCycleBudget &&
+    effectiveWithinMarketBudget &&
+    effectiveWithinDailyBudget
   ) {
     return {
       allowed: true,
@@ -1280,7 +1302,7 @@ export function pairSweepAllowance(args: {
     };
   }
 
-  if (bootstrapAllowed && withinCycleBudget && withinMarketBudget && withinDailyBudget) {
+  if (bootstrapAllowed && effectiveWithinCycleBudget && effectiveWithinMarketBudget && effectiveWithinDailyBudget) {
     return {
       allowed: true,
       mode: "XUAN_HARD_PAIR_SWEEP",

@@ -1,6 +1,16 @@
 
 ##############################################
 
+Version : V.0.0.36
+Date    : 27.04.2026
+Author  : Ali Hakan Çakır
+Changes : - Live paper XUAN conformance metrikleri ve skorlamasi eklendi.
+          - Public-footprint runtime risk ve preset varsayilanlari guncellendi.
+
+##############################################
+
+##############################################
+
 Version : V.0.0.35
 Date    : 26.04.2026
 Author  : Ali Hakan Çakır

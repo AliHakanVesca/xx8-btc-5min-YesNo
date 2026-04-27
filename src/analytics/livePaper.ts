@@ -117,6 +117,36 @@ export interface LivePaperSummary {
   finalDownAverage?: number;
   finalFillCount?: number;
   finalMergeCount?: number;
+  xuanFirstFillSec?: number;
+  xuanCompletionSec?: number;
+  xuanLastFillSec?: number;
+  xuanFillCount?: number;
+  xuanImbalanceShares?: number;
+  xuanResidualShares?: number;
+  xuanMergeQty?: number;
+  xuanMergeRealizedPnl?: number;
+  xuanLastMergeRealizedPnl?: number;
+  xuanPairUnderOneFillCount?: number;
+  xuanPairedContinuationCount?: number;
+  xuanIndependentFlowCount?: number;
+  xuanCompletionOnlyFillCount?: number;
+  xuanDebtReducingContinuationCount?: number;
+  xuanDebtHoldMaxSec?: number;
+  xuanRhythmWaitSec?: number;
+  xuanCompletionDelayedCount?: number;
+  xuanEarlyCompletionReason?: string;
+  xuanMergeBlockedReasonTop?: string;
+  xuanMergeReadyButSkippedCount?: number;
+  xuanPairCapBlockedCount?: number;
+  xuanLateFreshSeedCutoffCount?: number;
+  xuanPreopenBlockedCount?: number;
+  xuanRiskGatedBlockedCount?: number;
+  xuanFinalMergeForced?: boolean;
+  xuanNoTradeReason?: string;
+  xuanEarlyNoTradeReason?: string;
+  xuanPassBlockers?: string[];
+  xuanConformanceScore?: number;
+  xuanConformanceStatus?: "PASS" | "WARN" | "FAIL";
 }
 
 export interface LivePaperReport {
@@ -166,6 +196,7 @@ export interface LivePaperBookSnapshot {
 }
 
 export interface LivePaperOrderExecution {
+  timestamp: number;
   kind: "entry" | "completion" | "unwind";
   status: "filled" | "partial" | "rejected";
   outcome: OutcomeSide;
@@ -183,11 +214,14 @@ export interface LivePaperOrderExecution {
   order: MarketOrderArgs;
   consumedLevels: OrderLevel[];
   mode?: StrategyExecutionMode;
+  pairCostWithFees?: number;
+  projectedBasketEffectivePair?: number;
   negativeEdgeUsdc?: number;
   flowLineage?: string;
 }
 
 export interface LivePaperMergeExecution {
+  timestamp: number;
   status: "merged" | "skipped";
   requestedShares: number;
   mergedShares: number;
@@ -219,6 +253,45 @@ function sleep(ms: number): Promise<void> {
 
 function normalize(value: number, digits = 6): number {
   return Number(value.toFixed(digits));
+}
+
+export function scoreXuanConformance(args: {
+  rawScore: number;
+  fillCount: number;
+  minFillCountForPass: number;
+  mergedQty: number;
+  mergeRealizedPnl?: number | undefined;
+  requireProfit?: boolean | undefined;
+  pairedContinuationCount?: number | undefined;
+  independentFlowCount?: number | undefined;
+  requirePairedContinuation?: boolean | undefined;
+  debtHoldMaxSec?: number | undefined;
+  firstFillSec?: number | undefined;
+  completionSec?: number | undefined;
+  imbalanceShares: number;
+  residualShares: number;
+}): { score: number; status: "PASS" | "WARN" | "FAIL"; blockers: string[] } {
+  const blockers = [
+    ...(args.mergedQty > 0 ? [] : ["missing_merge"]),
+    ...(args.requireProfit !== true || (args.mergeRealizedPnl ?? 0) >= 0 ? [] : ["negative_merge_pnl"]),
+    ...(args.fillCount >= args.minFillCountForPass ? [] : ["insufficient_fill_count"]),
+    ...(args.requirePairedContinuation !== true || (args.pairedContinuationCount ?? 0) > 0
+      ? []
+      : ["missing_paired_continuation"]),
+    ...(args.requirePairedContinuation !== true || (args.independentFlowCount ?? 0) > 0
+      ? []
+      : ["insufficient_independent_flow"]),
+    ...((args.debtHoldMaxSec ?? 0) >= 270 ? ["debt_carried_too_long"] : []),
+    ...(args.firstFillSec !== undefined && args.firstFillSec <= 15 ? [] : ["late_or_missing_first_fill"]),
+    ...(args.completionSec !== undefined && args.completionSec <= 120 ? [] : ["late_or_missing_completion"]),
+    ...(args.imbalanceShares <= 1 && args.residualShares <= 1 ? [] : ["residual_not_flat"]),
+  ];
+  const score = blockers.length === 0 ? args.rawScore : Math.min(args.rawScore, 74);
+  return {
+    score,
+    status: blockers.length === 0 && score >= 75 ? "PASS" : score >= 45 ? "WARN" : "FAIL",
+    blockers,
+  };
 }
 
 function normalizeBookTimestampSec(book: OrderBook): number {
@@ -434,6 +507,7 @@ function pricePassesLimit(price: number, tradeSide: TradeSide, limitPrice: numbe
 function simulateOrderExecution(args: {
   config: XuanStrategyConfig;
   books: OrderBookState;
+  nowTs: number;
   kind: LivePaperOrderExecution["kind"];
   outcome: OutcomeSide;
   tradeSide: TradeSide;
@@ -441,6 +515,8 @@ function simulateOrderExecution(args: {
   reason: string;
   order: MarketOrderArgs;
   mode?: StrategyExecutionMode;
+  pairCostWithFees?: number;
+  projectedBasketEffectivePair?: number;
   negativeEdgeUsdc?: number;
   flowLineage?: string;
 }): LivePaperOrderExecution {
@@ -486,6 +562,7 @@ function simulateOrderExecution(args: {
       ? normalize(args.negativeEdgeUsdc * Math.min(1, filledShares / requestedShares))
       : undefined;
   const execution: LivePaperOrderExecution = {
+    timestamp: args.nowTs,
     kind: args.kind,
     status,
     outcome: args.outcome,
@@ -505,6 +582,12 @@ function simulateOrderExecution(args: {
   };
   if (args.mode !== undefined) {
     execution.mode = args.mode;
+  }
+  if (args.pairCostWithFees !== undefined) {
+    execution.pairCostWithFees = normalize(args.pairCostWithFees);
+  }
+  if (args.projectedBasketEffectivePair !== undefined) {
+    execution.projectedBasketEffectivePair = normalize(args.projectedBasketEffectivePair);
   }
   if (scaledNegativeEdge !== undefined) {
     execution.negativeEdgeUsdc = scaledNegativeEdge;
@@ -625,6 +708,7 @@ export function buildLivePaperTick(args: {
     const execution = simulateOrderExecution({
       config: args.config,
       books: executionBooks,
+      nowTs: args.nowTs,
       kind: "entry",
       outcome: entry.side,
       tradeSide: "BUY",
@@ -633,6 +717,10 @@ export function buildLivePaperTick(args: {
       order: entry.order,
       mode: entry.mode,
       flowLineage: `${flowBase}:entry:${entry.reason}:${index}`,
+      ...(entry.pairCostWithFees !== undefined ? { pairCostWithFees: entry.pairCostWithFees } : {}),
+      ...(decision.trace.entry?.marketBasketProjectedEffectivePair !== undefined
+        ? { projectedBasketEffectivePair: decision.trace.entry.marketBasketProjectedEffectivePair }
+        : {}),
       ...(entry.negativeEdgeUsdc !== undefined ? { negativeEdgeUsdc: entry.negativeEdgeUsdc } : {}),
     });
     executions.push(execution);
@@ -644,6 +732,7 @@ export function buildLivePaperTick(args: {
     const execution = simulateOrderExecution({
       config: args.config,
       books: executionBooks,
+      nowTs: args.nowTs,
       kind: "completion",
       outcome: decision.completion.sideToBuy,
       tradeSide: "BUY",
@@ -663,6 +752,7 @@ export function buildLivePaperTick(args: {
     const execution = simulateOrderExecution({
       config: args.config,
       books: executionBooks,
+      nowTs: args.nowTs,
       kind: "unwind",
       outcome: decision.unwind.sideToSell,
       tradeSide: "SELL",
@@ -705,6 +795,7 @@ export function buildLivePaperTick(args: {
     lastMergeAtMs = args.nowTs * 1000;
     const lastMerge = state.mergeHistory.at(-1);
     merge = {
+      timestamp: args.nowTs,
       status: "merged",
       requestedShares: normalize(mergePlan.mergeable),
       mergedShares: normalize(mergeAmount),
@@ -717,6 +808,7 @@ export function buildLivePaperTick(args: {
     mergeTracker = syncMergeBatchTracker(mergeTracker, mergeableShares(state), args.nowTs);
   } else if (mergePlan.shouldMerge || mergeGate.pendingMatchedQty > 0) {
     merge = {
+      timestamp: args.nowTs,
       status: "skipped",
       requestedShares: normalize(mergePlan.mergeable),
       mergedShares: 0,
@@ -832,12 +924,115 @@ export function summarizeLivePaperSamples(args: {
 function enrichSummaryWithExecution(args: {
   summary: LivePaperSummary;
   state: XuanMarketState;
+  marketStartTs: number;
+  xuanMinFillCountForPass: number;
+  xuanTruePassRequiresProfit: boolean;
+  xuanTruePassRequiresPairedContinuation: boolean;
   auditFile: string;
   executions: LivePaperOrderExecution[];
   merges: LivePaperMergeExecution[];
+  pairCapBlockedCount: number;
+  lateFreshSeedCutoffCount: number;
+  preopenBlockedCount: number;
+  riskGatedBlockedCount: number;
+  xuanRhythmWaitSec?: number | undefined;
+  xuanCompletionDelayedCount: number;
+  xuanEarlyCompletionReason?: string | undefined;
+  noTradeReasons: Map<string, number>;
 }): LivePaperSummary {
   const filledExecutions = args.executions.filter((execution) => execution.filledShares > 1e-9);
   const finalState = buildStateSnapshot(args.state);
+  const buyFills = filledExecutions.filter((execution) => execution.tradeSide === "BUY");
+  const completionFills = filledExecutions.filter((execution) => execution.kind === "completion");
+  const pairedContinuationGroups = new Map<number, Set<OutcomeSide>>();
+  let debtReducingContinuationCount = 0;
+  for (const execution of buyFills) {
+    const isPairedContinuation =
+      execution.kind === "entry" &&
+      execution.reason !== "lagging_rebalance" &&
+      (execution.reason === "balanced_pair_reentry" ||
+        execution.mode === "STRICT_PAIR_SWEEP" ||
+        execution.mode === "XUAN_SOFT_PAIR_SWEEP" ||
+        execution.mode === "XUAN_HARD_PAIR_SWEEP" ||
+        execution.projectedBasketEffectivePair !== undefined);
+    if (!isPairedContinuation) {
+      continue;
+    }
+    const sides = pairedContinuationGroups.get(execution.timestamp) ?? new Set<OutcomeSide>();
+    sides.add(execution.outcome);
+    pairedContinuationGroups.set(execution.timestamp, sides);
+    if (
+      execution.projectedBasketEffectivePair !== undefined &&
+      execution.projectedBasketEffectivePair <= 1 + 1e-9
+    ) {
+      debtReducingContinuationCount += 1;
+    }
+  }
+  const pairedContinuationCount = [...pairedContinuationGroups.values()].filter(
+    (sides) => sides.has("UP") && sides.has("DOWN"),
+  ).length;
+  const independentFlowCount = pairedContinuationCount;
+  const completionOnlyFillCount = completionFills.length;
+  const firstFillTs = buyFills.length > 0 ? Math.min(...buyFills.map((execution) => execution.timestamp)) : undefined;
+  const completionTs =
+    completionFills.length > 0 ? Math.min(...completionFills.map((execution) => execution.timestamp)) : undefined;
+  const lastFillTs = buyFills.length > 0 ? Math.max(...buyFills.map((execution) => execution.timestamp)) : undefined;
+  const mergedQty = normalize(args.merges.reduce((acc, merge) => acc + merge.mergedShares, 0));
+  const mergedExecutions = args.merges.filter((merge) => merge.status === "merged");
+  const mergeRealizedPnl = normalize(mergedExecutions.reduce((acc, merge) => acc + merge.realizedPnl, 0));
+  const lastMergeRealizedPnl = normalize(mergedExecutions.at(-1)?.realizedPnl ?? 0);
+  const imbalanceShares = normalize(Math.abs(finalState.upShares - finalState.downShares));
+  const residualShares = normalize(finalState.upShares + finalState.downShares);
+  const pairUnderOneFillCount = buyFills.filter((execution) => execution.averagePrice <= 0.5).length;
+  const mergeReadyButSkippedCount = args.merges.filter(
+    (merge) => merge.status === "skipped" && merge.requestedShares > 0,
+  ).length;
+  const mergeBlockedReasons = new Map<string, number>();
+  for (const merge of args.merges) {
+    if (merge.status !== "skipped" || merge.requestedShares <= 0) {
+      continue;
+    }
+    mergeBlockedReasons.set(merge.reason, (mergeBlockedReasons.get(merge.reason) ?? 0) + 1);
+  }
+  const xuanMergeBlockedReasonTop = [...mergeBlockedReasons.entries()].sort((left, right) => right[1] - left[1])[0]?.[0];
+  const firstDebtHoldTs = args.merges.find(
+    (merge) => merge.status === "skipped" && merge.reason === "basket_debt_hold" && merge.requestedShares > 0,
+  )?.timestamp;
+  const lastDebtHoldTs = [...args.merges]
+    .reverse()
+    .find((merge) => merge.status === "skipped" && merge.reason === "basket_debt_hold" && merge.requestedShares > 0)
+    ?.timestamp;
+  const debtHoldMaxSec =
+    firstDebtHoldTs !== undefined && lastDebtHoldTs !== undefined
+      ? Math.max(0, lastDebtHoldTs - firstDebtHoldTs)
+      : 0;
+  const scoreParts = [
+    firstFillTs !== undefined && firstFillTs - args.marketStartTs <= 15 ? 20 : 0,
+    completionTs !== undefined && completionTs - args.marketStartTs <= 120 ? 20 : 0,
+    buyFills.length >= 6 ? 20 : buyFills.length >= 3 ? 10 : 0,
+    imbalanceShares <= 1 ? 15 : imbalanceShares <= 5 ? 8 : 0,
+    mergedQty > 0 ? 15 : 0,
+    pairUnderOneFillCount >= Math.max(1, Math.floor(buyFills.length / 2)) ? 10 : 0,
+  ];
+  const rawXuanConformanceScore = scoreParts.reduce((acc, value) => acc + value, 0);
+  const xuanScore = scoreXuanConformance({
+    rawScore: rawXuanConformanceScore,
+    fillCount: buyFills.length,
+    minFillCountForPass: args.xuanMinFillCountForPass,
+    mergedQty,
+    mergeRealizedPnl,
+    requireProfit: args.xuanTruePassRequiresProfit,
+    pairedContinuationCount,
+    independentFlowCount,
+    requirePairedContinuation: args.xuanTruePassRequiresPairedContinuation,
+    debtHoldMaxSec,
+    ...(firstFillTs !== undefined ? { firstFillSec: firstFillTs - args.marketStartTs } : {}),
+    ...(completionTs !== undefined ? { completionSec: completionTs - args.marketStartTs } : {}),
+    imbalanceShares,
+    residualShares,
+  });
+  const xuanNoTradeReason = [...args.noTradeReasons.entries()].sort((left, right) => right[1] - left[1])[0]?.[0];
+  const xuanFinalMergeForced = args.merges.some((merge) => merge.status === "merged" && merge.forced);
   return {
     ...args.summary,
     auditFile: args.auditFile,
@@ -865,6 +1060,35 @@ function enrichSummaryWithExecution(args: {
     finalDownAverage: finalState.downAverage,
     finalFillCount: finalState.fillCount,
     finalMergeCount: finalState.mergeCount,
+    ...(firstFillTs !== undefined ? { xuanFirstFillSec: normalize(firstFillTs - args.marketStartTs) } : {}),
+    ...(completionTs !== undefined ? { xuanCompletionSec: normalize(completionTs - args.marketStartTs) } : {}),
+    ...(lastFillTs !== undefined ? { xuanLastFillSec: normalize(lastFillTs - args.marketStartTs) } : {}),
+    xuanFillCount: buyFills.length,
+    xuanImbalanceShares: imbalanceShares,
+    xuanResidualShares: residualShares,
+    xuanMergeQty: mergedQty,
+    xuanMergeRealizedPnl: mergeRealizedPnl,
+    xuanLastMergeRealizedPnl: lastMergeRealizedPnl,
+    xuanPairUnderOneFillCount: pairUnderOneFillCount,
+    xuanPairedContinuationCount: pairedContinuationCount,
+    xuanIndependentFlowCount: independentFlowCount,
+    xuanCompletionOnlyFillCount: completionOnlyFillCount,
+    xuanDebtReducingContinuationCount: Math.floor(debtReducingContinuationCount / 2),
+    xuanDebtHoldMaxSec: normalize(debtHoldMaxSec),
+    ...(args.xuanRhythmWaitSec !== undefined ? { xuanRhythmWaitSec: normalize(args.xuanRhythmWaitSec) } : {}),
+    xuanCompletionDelayedCount: args.xuanCompletionDelayedCount,
+    ...(args.xuanEarlyCompletionReason ? { xuanEarlyCompletionReason: args.xuanEarlyCompletionReason } : {}),
+    ...(xuanMergeBlockedReasonTop ? { xuanMergeBlockedReasonTop } : {}),
+    xuanMergeReadyButSkippedCount: mergeReadyButSkippedCount,
+    xuanPairCapBlockedCount: args.pairCapBlockedCount,
+    xuanLateFreshSeedCutoffCount: args.lateFreshSeedCutoffCount,
+    xuanPreopenBlockedCount: args.preopenBlockedCount,
+    xuanRiskGatedBlockedCount: args.riskGatedBlockedCount,
+    xuanFinalMergeForced,
+    ...(xuanNoTradeReason ? { xuanNoTradeReason } : {}),
+    xuanPassBlockers: xuanScore.blockers,
+    xuanConformanceScore: xuanScore.score,
+    xuanConformanceStatus: xuanScore.status,
   };
 }
 
@@ -915,6 +1139,14 @@ export async function runLivePaperSession(
   const samples: LivePaperSample[] = [];
   const executions: LivePaperOrderExecution[] = [];
   const merges: LivePaperMergeExecution[] = [];
+  let pairCapBlockedCount = 0;
+  let lateFreshSeedCutoffCount = 0;
+  let preopenBlockedCount = 0;
+  let riskGatedBlockedCount = 0;
+  let xuanRhythmWaitSec: number | undefined;
+  let xuanCompletionDelayedCount = 0;
+  let xuanEarlyCompletionReason: string | undefined;
+  const noTradeReasons = new Map<string, number>();
   let state = createMarketState(market);
   let mergeTracker = createMergeBatchTracker();
   let lastMergeAtMs = 0;
@@ -997,6 +1229,34 @@ export async function runLivePaperSession(
       if (tick.merge !== undefined) {
         merges.push(tick.merge);
       }
+      const entrySkipReason =
+        tick.decision.trace.entry?.skipReason ??
+        tick.decision.trace.entry?.cycleSkippedReason ??
+        tick.decision.trace.entry?.plannedOppositeBlockedReason;
+      if (entrySkipReason !== undefined) {
+        if (tick.decision.phase === "PREOPEN") {
+          preopenBlockedCount += 1;
+        } else if (!tick.decision.risk.tradable || !tick.decision.risk.allowNewEntries) {
+          riskGatedBlockedCount += 1;
+        } else {
+          noTradeReasons.set(entrySkipReason, (noTradeReasons.get(entrySkipReason) ?? 0) + 1);
+          if (entrySkipReason === "pair_cap" || entrySkipReason === "pair_cap+single_leg_seed") {
+            pairCapBlockedCount += 1;
+          }
+          if (entrySkipReason === "late_fresh_seed_cutoff") {
+            lateFreshSeedCutoffCount += 1;
+          }
+        }
+      }
+      if (tick.decision.trace.entry?.xuanRhythmWaitSec !== undefined) {
+        xuanRhythmWaitSec = Math.max(xuanRhythmWaitSec ?? 0, tick.decision.trace.entry.xuanRhythmWaitSec);
+      }
+      if (tick.decision.trace.entry?.xuanCompletionDelayedCount !== undefined) {
+        xuanCompletionDelayedCount += tick.decision.trace.entry.xuanCompletionDelayedCount;
+      }
+      if (tick.decision.trace.entry?.xuanEarlyCompletionReason !== undefined) {
+        xuanEarlyCompletionReason = tick.decision.trace.entry.xuanEarlyCompletionReason;
+      }
       await writeAuditEvent(auditFile, {
         event: "paper_live_tick",
         tickIndex: tick.tickIndex,
@@ -1028,9 +1288,21 @@ export async function runLivePaperSession(
       endedAt,
     }),
     state,
+    marketStartTs: market.startTs,
+    xuanMinFillCountForPass: config.xuanMinFillCountForPass,
+    xuanTruePassRequiresProfit: config.xuanTruePassRequiresProfit,
+    xuanTruePassRequiresPairedContinuation: config.xuanTruePassRequiresPairedContinuation,
     auditFile,
     executions,
     merges,
+    pairCapBlockedCount,
+    lateFreshSeedCutoffCount,
+    preopenBlockedCount,
+    riskGatedBlockedCount,
+    xuanRhythmWaitSec,
+    xuanCompletionDelayedCount,
+    xuanEarlyCompletionReason,
+    noTradeReasons,
   });
 
   await writeAuditEvent(auditFile, {

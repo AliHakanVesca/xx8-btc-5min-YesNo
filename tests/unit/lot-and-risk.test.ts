@@ -5,6 +5,7 @@ import { chooseLot } from "../../src/strategy/xuan5m/lotLadder.js";
 import { evaluateRisk } from "../../src/strategy/xuan5m/riskEngine.js";
 import { buildOfflineMarket } from "../../src/infra/gamma/marketDiscovery.js";
 import { createMarketState } from "../../src/strategy/xuan5m/marketState.js";
+import { applyFill } from "../../src/strategy/xuan5m/inventoryState.js";
 
 describe("lot ladder and risk windows", () => {
   const config = buildStrategyConfig(
@@ -80,5 +81,49 @@ describe("lot ladder and risk windows", () => {
     expect(risk.allowNewEntries).toBe(false);
     expect(risk.completionOnly).toBe(true);
     expect(risk.reasons).toContain("low_usdc_no_new_entry");
+  });
+
+  it("keeps new entries open for balanced debt campaign repair after normal entry cutoff", () => {
+    const xuanConfig = buildStrategyConfig(
+      parseEnv({
+        DRY_RUN: "true",
+        POLY_STACK_MODE: "current-prod-v1",
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      }),
+    );
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 40,
+      price: 0.56,
+      timestamp: market.startTs + 1,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      size: 40,
+      price: 0.5,
+      timestamp: market.startTs + 2,
+      makerTaker: "taker",
+      executionMode: "PARTIAL_SOFT_COMPLETION",
+    });
+
+    const risk = evaluateRisk(xuanConfig, state, {
+      secsToClose: 41,
+      staleBookMs: 100,
+      balanceStaleMs: 100,
+      bookIsCrossed: false,
+      dailyLossUsdc: 0,
+      marketLossUsdc: 0,
+      usdcBalance: 100,
+    });
+
+    expect(risk.completionOnly).toBe(false);
+    expect(risk.allowNewEntries).toBe(true);
   });
 });

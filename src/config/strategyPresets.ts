@@ -5,6 +5,16 @@ export interface XuanStrategyConfig {
   stateStorePath: string;
   botMode: "STRICT" | "XUAN";
   xuanCloneMode: "OFF" | "PUBLIC_FOOTPRINT";
+  xuanMinFillCountForPass: number;
+  xuanTruePassRequiresProfit: boolean;
+  xuanTruePassRequiresPairedContinuation: boolean;
+  xuanMicroPairContinuationEnabled: boolean;
+  xuanMicroPairProjectedEffectiveCap: number;
+  xuanMicroPairMaxQty: number;
+  xuanRhythmMinWaitSec: number;
+  xuanRhythmBaseWaitSec: number;
+  xuanRhythmMaxWaitSec: number;
+  xuanCompletionEarlyReleaseMaxEffectivePair: number;
   priceToBeatPolicy: "EXPLICIT_ONLY" | "EXPLICIT_OR_START_CAPTURE";
   priceToBeatStartCaptureWindowMs: number;
   priceToBeatMaxFeedAgeMs: number;
@@ -410,6 +420,16 @@ export function buildStrategyConfig(env: AppEnv): XuanStrategyConfig {
     stateStorePath: resolvedStateStorePath,
     botMode: env.BOT_MODE,
     xuanCloneMode: env.XUAN_CLONE_MODE,
+    xuanMinFillCountForPass: env.XUAN_MIN_FILL_COUNT_FOR_PASS,
+    xuanTruePassRequiresProfit: env.XUAN_TRUE_PASS_REQUIRES_PROFIT,
+    xuanTruePassRequiresPairedContinuation: env.XUAN_TRUE_PASS_REQUIRES_PAIRED_CONTINUATION,
+    xuanMicroPairContinuationEnabled: env.XUAN_MICRO_PAIR_CONTINUATION_ENABLED,
+    xuanMicroPairProjectedEffectiveCap: env.XUAN_MICRO_PAIR_PROJECTED_EFFECTIVE_CAP,
+    xuanMicroPairMaxQty: env.XUAN_MICRO_PAIR_MAX_QTY,
+    xuanRhythmMinWaitSec: env.XUAN_RHYTHM_MIN_WAIT_SEC,
+    xuanRhythmBaseWaitSec: env.XUAN_RHYTHM_BASE_WAIT_SEC,
+    xuanRhythmMaxWaitSec: env.XUAN_RHYTHM_MAX_WAIT_SEC,
+    xuanCompletionEarlyReleaseMaxEffectivePair: env.XUAN_COMPLETION_EARLY_RELEASE_MAX_EFFECTIVE_PAIR,
     priceToBeatPolicy: env.PRICE_TO_BEAT_POLICY,
     priceToBeatStartCaptureWindowMs: env.PRICE_TO_BEAT_START_CAPTURE_WINDOW_MS,
     priceToBeatMaxFeedAgeMs: env.PRICE_TO_BEAT_MAX_FEED_AGE_MS,
@@ -819,9 +839,9 @@ export function buildStrategyConfig(env: AppEnv): XuanStrategyConfig {
 }
 
 function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConfig {
-  const ladder = [80, 90, 100, 125];
+  const ladder = [30, 60, 90, 120, 145];
   const elevatedBehaviorCap = Math.max(config.xuanBehaviorCap, 1.25);
-  const maxLadderLot = Math.max(ladder[ladder.length - 1] ?? 125, 130);
+  const maxLadderLot = Math.max(ladder[ladder.length - 1] ?? 145, 145);
 
   return {
     ...config,
@@ -830,6 +850,16 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     allowNakedSingleLegSeed: false,
     allowXuanCoveredSeed: true,
     allowCheapUnderdogSeed: true,
+    xuanMinFillCountForPass: Math.max(config.xuanMinFillCountForPass, 3),
+    xuanTruePassRequiresProfit: true,
+    xuanTruePassRequiresPairedContinuation: true,
+    xuanMicroPairContinuationEnabled: true,
+    xuanMicroPairProjectedEffectiveCap: Math.max(config.xuanMicroPairProjectedEffectiveCap, 1.01),
+    xuanMicroPairMaxQty: Math.min(Math.max(config.xuanMicroPairMaxQty, 5), ladder[0] ?? 5),
+    xuanRhythmMinWaitSec: Math.max(1, Math.min(config.xuanRhythmMinWaitSec, config.xuanRhythmBaseWaitSec)),
+    xuanRhythmBaseWaitSec: Math.max(config.xuanRhythmBaseWaitSec, config.xuanRhythmMinWaitSec),
+    xuanRhythmMaxWaitSec: Math.max(config.xuanRhythmMaxWaitSec, config.xuanRhythmBaseWaitSec),
+    xuanCompletionEarlyReleaseMaxEffectivePair: Math.max(config.xuanCompletionEarlyReleaseMaxEffectivePair, 1),
     coveredSeedRequiresFairValue: config.coveredSeedRequiresFairValue,
     singleLegFairValueVeto: config.singleLegFairValueVeto,
     xuanBaseLotLadder: ladder,
@@ -852,7 +882,7 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     marketBasketBootstrapMaxQty: Math.max(config.marketBasketBootstrapMaxQty, maxLadderLot),
     marketBasketBootstrapMaxEffectivePair: Math.max(config.marketBasketBootstrapMaxEffectivePair, 1.055),
     marketBasketContinuationMaxQty: Math.max(config.marketBasketContinuationMaxQty, maxLadderLot),
-    marketBasketContinuationMinMatchedShares: Math.min(config.marketBasketContinuationMinMatchedShares, 40),
+    marketBasketContinuationMinMatchedShares: Math.min(config.marketBasketContinuationMinMatchedShares, 30),
     marketBasketContinuationMaxEffectivePair: Math.max(config.marketBasketContinuationMaxEffectivePair, 1.2),
     marketBasketContinuationProjectedEffectivePairCap: Math.max(
       config.marketBasketContinuationProjectedEffectivePairCap,
@@ -863,9 +893,9 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     marketBasketMergeTargetMaxShares: Math.max(config.marketBasketMergeTargetMaxShares, 900),
     maxMarketExposureShares: Math.max(config.maxMarketExposureShares, 500),
     maxMarketSharesPerSide: Math.max(config.maxMarketSharesPerSide, 500),
-    maxOneSidedExposureShares: Math.max(config.maxOneSidedExposureShares, 150),
-    maxCyclesPerMarket: Math.max(config.maxCyclesPerMarket, 8),
-    maxBuysPerSide: Math.max(config.maxBuysPerSide, 10),
+    maxOneSidedExposureShares: Math.max(config.maxOneSidedExposureShares, 180),
+    maxCyclesPerMarket: Math.max(config.maxCyclesPerMarket, 12),
+    maxBuysPerSide: Math.max(config.maxBuysPerSide, 14),
     blockNewPairWhilePartialOpen: config.blockNewPairWhilePartialOpen,
     maxOpenGroupsPerMarket: config.maxOpenGroupsPerMarket,
     maxOpenPartialGroups: config.maxOpenPartialGroups,
@@ -888,15 +918,15 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     highSideEmergencyCap: Math.max(config.highSideEmergencyCap, elevatedBehaviorCap),
     emergencyCompletionMaxQty: Math.max(config.emergencyCompletionMaxQty, maxLadderLot),
     emergencyCompletionHardCap: Math.max(config.emergencyCompletionHardCap, elevatedBehaviorCap),
-    temporalRepairFastCap: Math.max(config.temporalRepairFastCap, 1.035),
-    temporalRepairSoftCap: Math.max(config.temporalRepairSoftCap, 1.075),
-    temporalRepairPatientCap: Math.max(config.temporalRepairPatientCap, 1.13),
+    temporalRepairFastCap: Math.max(config.temporalRepairFastCap, 1.065),
+    temporalRepairSoftCap: Math.max(config.temporalRepairSoftCap, 1.105),
+    temporalRepairPatientCap: Math.max(config.temporalRepairPatientCap, 1.16),
     temporalRepairEmergencyCap: Math.max(config.temporalRepairEmergencyCap, elevatedBehaviorCap),
-    temporalRepairUltraFastWindowSec: Math.max(config.temporalRepairUltraFastWindowSec, 8),
-    temporalRepairUltraFastCap: Math.max(config.temporalRepairUltraFastCap, 1.065),
+    temporalRepairUltraFastWindowSec: Math.max(config.temporalRepairUltraFastWindowSec, 12),
+    temporalRepairUltraFastCap: Math.max(config.temporalRepairUltraFastCap, 1.095),
     temporalRepairUltraFastMissingFairValueCap: Math.max(
       config.temporalRepairUltraFastMissingFairValueCap,
-      1.075,
+      1.11,
     ),
     partialSoftMaxQty: Math.min(Math.max(config.partialSoftMaxQty, maxLadderLot), config.residualStateSoftCompletionMaxQty),
     partialHardMaxQty: Math.min(Math.max(config.partialHardMaxQty, maxLadderLot), config.residualStateSoftCompletionMaxQty),
@@ -913,6 +943,20 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     fairValueFailClosedForSeed: false,
     fairValueFailClosedForNegativePair: config.fairValueFailClosedForNegativePair,
     fairValueFailClosedForHighSideChase: false,
+    allowStrictResidualCompletionWithoutFairValue: true,
+    allowResidualCompletionWithoutFairValue: true,
+    residualCompletionCostBasisCap: Math.max(config.residualCompletionCostBasisCap, 1.095),
+    softResidualCompletionCap: Math.max(config.softResidualCompletionCap, 1.13),
+    completionQualityMaxEffectiveCost: Math.max(config.completionQualityMaxEffectiveCost, 1.13),
+    completionQualityMaxNegativeEdgeUsdc: Math.max(config.completionQualityMaxNegativeEdgeUsdc, 2.25),
+    completionTargetMaxDelaySec: Math.min(config.completionTargetMaxDelaySec, 45),
+    completionUrgencyPatientSec: Math.min(config.completionUrgencyPatientSec, 30),
+    completionUrgencyForceSec: Math.min(config.completionUrgencyForceSec, 90),
+    xuanTemporalCompletionMinAgeSec: Math.max(
+      config.xuanTemporalCompletionMinAgeSec,
+      Math.max(1, Math.min(config.xuanRhythmMinWaitSec, config.xuanRhythmBaseWaitSec)),
+    ),
+    xuanTemporalCompletionEarlyMaxEffectivePair: Math.max(config.xuanTemporalCompletionEarlyMaxEffectivePair, 1.045),
     requireStrictCapForHighLowMismatch: false,
     xuanBehaviorCap: elevatedBehaviorCap,
     cloneChildPreferredShares: Math.min(config.cloneChildPreferredShares, 20),

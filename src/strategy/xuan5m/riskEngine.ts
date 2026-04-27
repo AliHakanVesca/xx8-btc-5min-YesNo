@@ -1,5 +1,5 @@
 import type { XuanStrategyConfig } from "../../config/strategyPresets.js";
-import { imbalance } from "./inventoryState.js";
+import { imbalance, matchedEffectivePairCost, mergeableShares } from "./inventoryState.js";
 import type { XuanMarketState } from "./marketState.js";
 
 export interface RiskContext {
@@ -67,6 +67,15 @@ export function evaluateRisk(
   advisoryReasons.push(...externalReasons);
 
   const hardCancel = ctx.secsToClose <= config.hardCancelSecToClose || blockingReasons.includes("book_stale");
+  const campaignRepairWindowOpen =
+    config.botMode === "XUAN" &&
+    config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
+    config.xuanBasketCampaignEnabled &&
+    config.marketBasketContinuationEnabled &&
+    ctx.secsToClose > config.finalWindowCompletionOnlySec &&
+    mergeableShares(state) >= config.marketBasketContinuationMinMatchedShares - 1e-9 &&
+    Math.abs(state.upShares - state.downShares) <= Math.max(config.postMergeFlatDustShares, 1e-6) + 1e-9 &&
+    matchedEffectivePairCost(state, config.cryptoTakerFeeRate) > 1 + 1e-9;
   const shouldCompletionOnlyForLowBalance = lowBalanceForNewEntry && completionAllowedUnderLowBalance;
   const completionOnly =
     hardCancel ||
@@ -79,7 +88,7 @@ export function evaluateRisk(
     !hardCancel &&
     !ctx.forceNoNewEntries &&
     !ctx.forceCompletionOnly &&
-    ctx.secsToClose > config.normalEntryCutoffSecToClose &&
+    (ctx.secsToClose > config.normalEntryCutoffSecToClose || campaignRepairWindowOpen) &&
     blockingReasons.length === 0 &&
     (!lowBalanceForNewEntry || config.allowNewEntryUnderMinBalance);
   const tradable =

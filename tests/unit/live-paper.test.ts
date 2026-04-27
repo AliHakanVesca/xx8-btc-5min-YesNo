@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { buildLivePaperSample, buildLivePaperTick, summarizeLivePaperSamples } from "../../src/analytics/livePaper.js";
+import {
+  buildLivePaperSample,
+  buildLivePaperTick,
+  scoreXuanConformance,
+  summarizeLivePaperSamples,
+} from "../../src/analytics/livePaper.js";
 import { buildOfflineMarket } from "../../src/infra/gamma/marketDiscovery.js";
 import { parseEnv } from "../../src/config/env.js";
 import { buildStrategyConfig } from "../../src/config/strategyPresets.js";
@@ -20,6 +25,96 @@ function buildBook(assetId: string, market: string, bid: number, ask: number, ti
 }
 
 describe("live paper analytics", () => {
+  it("caps xuan conformance below PASS when fill count is below the xuan minimum", () => {
+    const scored = scoreXuanConformance({
+      rawScore: 80,
+      fillCount: 2,
+      minFillCountForPass: 3,
+      mergedQty: 31.9,
+      mergeRealizedPnl: 0.2,
+      requireProfit: true,
+      pairedContinuationCount: 1,
+      independentFlowCount: 1,
+      requirePairedContinuation: true,
+      firstFillSec: 0,
+      completionSec: 1,
+      imbalanceShares: 0,
+      residualShares: 0.02,
+    });
+
+    expect(scored.score).toBe(74);
+    expect(scored.status).toBe("WARN");
+    expect(scored.blockers).toContain("insufficient_fill_count");
+  });
+
+  it("allows xuan PASS only when merge, fill count, continuation, profit, timing, and residual blockers are clear", () => {
+    const scored = scoreXuanConformance({
+      rawScore: 80,
+      fillCount: 3,
+      minFillCountForPass: 3,
+      mergedQty: 31.9,
+      mergeRealizedPnl: 0.01,
+      requireProfit: true,
+      pairedContinuationCount: 1,
+      independentFlowCount: 1,
+      requirePairedContinuation: true,
+      firstFillSec: 0,
+      completionSec: 1,
+      imbalanceShares: 0,
+      residualShares: 0.02,
+    });
+
+    expect(scored.score).toBe(80);
+    expect(scored.status).toBe("PASS");
+    expect(scored.blockers).toEqual([]);
+  });
+
+  it("blocks xuan PASS when merge pnl is negative", () => {
+    const scored = scoreXuanConformance({
+      rawScore: 90,
+      fillCount: 4,
+      minFillCountForPass: 3,
+      mergedQty: 31.9,
+      mergeRealizedPnl: -0.01,
+      requireProfit: true,
+      pairedContinuationCount: 1,
+      independentFlowCount: 1,
+      requirePairedContinuation: true,
+      firstFillSec: 0,
+      completionSec: 20,
+      imbalanceShares: 0,
+      residualShares: 0.02,
+    });
+
+    expect(scored.score).toBe(74);
+    expect(scored.status).toBe("WARN");
+    expect(scored.blockers).toContain("negative_merge_pnl");
+  });
+
+  it("does not count split completions as real xuan continuation for PASS", () => {
+    const scored = scoreXuanConformance({
+      rawScore: 90,
+      fillCount: 3,
+      minFillCountForPass: 3,
+      mergedQty: 31.9,
+      mergeRealizedPnl: 0.02,
+      requireProfit: true,
+      pairedContinuationCount: 0,
+      independentFlowCount: 0,
+      requirePairedContinuation: true,
+      firstFillSec: 0,
+      completionSec: 20,
+      imbalanceShares: 0,
+      residualShares: 0.02,
+    });
+
+    expect(scored.score).toBe(74);
+    expect(scored.status).toBe("WARN");
+    expect(scored.blockers).toEqual(
+      expect.arrayContaining(["missing_paired_continuation", "insufficient_independent_flow"]),
+    );
+  });
+
   it("builds a live paper sample with entry-buy-first decision when books are fresh", () => {
     const env = parseEnv({
       DRY_RUN: "true",

@@ -11,7 +11,7 @@ import {
   oldestResidualLotTimestamp,
   projectedShareGapAfterBuy,
 } from "./inventoryState.js";
-import type { FillRecord, XuanMarketState } from "./marketState.js";
+import { plannedOppositeCompletionState, type FillRecord, type XuanMarketState } from "./marketState.js";
 import {
   classifyResidualSeverity,
   completionAllowance,
@@ -105,6 +105,7 @@ export interface BalancedPairCandidateTrace {
   marketBasketDebtDeltaUSDC?: number | undefined;
   marketBasketBootstrap?: boolean | undefined;
   marketBasketContinuation?: boolean | undefined;
+  xuanMicroPairContinuation?: boolean | undefined;
   balancedButDebted?: boolean | undefined;
   campaignMode?:
     | "PROBE_OPENED"
@@ -142,13 +143,28 @@ export interface BalancedPairCandidateTrace {
   flowShapingClipBudgetRemaining?: number | undefined;
   campaignFlowCount?: number | undefined;
   campaignFlowTarget?: number | undefined;
+  postCompletionDebtRepairActive?: boolean | undefined;
+  postCompletionRepairAttemptCount?: number | undefined;
+  postCompletionRepairOpenedCount?: number | undefined;
+  pairCapBlockedRepairCount?: number | undefined;
+  avgImprovingActionCount?: number | undefined;
+  debtReducingActionCount?: number | undefined;
+  mergeQtyOverBaseLot?: number | undefined;
+  xuanFlowCount?: number | undefined;
   cycleSkippedReason?: string | undefined;
+  xuanSeedRhythmWaitSec?: number | undefined;
+  xuanSeedDelayedCount?: number | undefined;
   xuanBorderlinePhase?: XuanBorderlineEntryPhase | undefined;
   fairValueFallbackReason?: string | undefined;
   postProfitLowSideSetup?: boolean | undefined;
   stagedEntry?: boolean | undefined;
   plannedOppositeSide?: OutcomeSide | undefined;
   plannedOppositeQty?: number | undefined;
+  plannedOppositeFilledQty?: number | undefined;
+  plannedOppositeMissingQty?: number | undefined;
+  plannedOppositeAgeSec?: number | undefined;
+  plannedPairGroupOpenedAt?: number | undefined;
+  plannedLowSideAvg?: number | undefined;
   negativeEdgeUsdc: number;
   verdict: "ok" | "up_depth" | "down_depth" | "pair_cap" | "orphan_risk";
   selectedMode?: StrategyExecutionMode | undefined;
@@ -205,6 +221,8 @@ export interface SingleLegSeedCandidateTrace {
   campaignFlowTarget?: number | undefined;
   addedDebtUSDC?: number | undefined;
   cycleSkippedReason?: string | undefined;
+  xuanSeedRhythmWaitSec?: number | undefined;
+  xuanSeedDelayedCount?: number | undefined;
   xuanBorderlinePhase?: XuanBorderlineEntryPhase | undefined;
   fairValueFallbackReason?: string | undefined;
   postProfitLowSideSetup?: boolean | undefined;
@@ -241,6 +259,7 @@ export interface EntryDecisionTrace {
   marketBasketDebtDeltaUSDC?: number;
   marketBasketBootstrap?: boolean;
   marketBasketContinuation?: boolean;
+  xuanMicroPairContinuation?: boolean;
   marketBasketTotalUp?: number;
   marketBasketTotalDown?: number;
   marketBasketMergeableQty?: number;
@@ -257,6 +276,13 @@ export interface EntryDecisionTrace {
     | "UNBALANCED_CAMPAIGN_RESIDUAL"
     | "RESIDUAL_COMPLETION_ACTIVE"
     | "WATCH_FOR_DEBT_REDUCER";
+  campaignState?:
+    | "OPENING_SEED"
+    | "ORPHAN_COMPLETION_DUTY"
+    | "BALANCED_DEBT_CAMPAIGN"
+    | "POST_PROFIT_CAMPAIGN"
+    | "ACCUMULATING_CONTINUATION"
+    | "MERGE_READY";
   campaignBaseLot?: number;
   executedProbeQty?: number;
   plannedContinuationQty?: number;
@@ -279,6 +305,9 @@ export interface EntryDecisionTrace {
   addedDebtUSDC?: number;
   xuanTemporalCompletionMinAgeSec?: number;
   xuanTemporalCompletionEarlyMaxEffectivePair?: number;
+  xuanRhythmWaitSec?: number;
+  xuanCompletionDelayedCount?: number;
+  xuanEarlyCompletionReason?: string;
   continuationClass?: MarketBasketContinuationClass;
   avgImprovingBudgetRemainingUSDC?: number;
   avgImprovingClipBudgetRemaining?: number;
@@ -286,6 +315,15 @@ export interface EntryDecisionTrace {
   flowShapingClipBudgetRemaining?: number;
   campaignFlowCount?: number;
   campaignFlowTarget?: number;
+  postCompletionDebtRepairActive?: boolean;
+  balancedDebtCampaignTicks?: number;
+  postCompletionRepairAttemptCount?: number;
+  postCompletionRepairOpenedCount?: number;
+  pairCapBlockedRepairCount?: number;
+  avgImprovingActionCount?: number;
+  debtReducingActionCount?: number;
+  mergeQtyOverBaseLot?: number;
+  xuanFlowCount?: number;
   stagedDebtReducingFlow?: boolean;
   initialBasketRecoveryPlan?: "none" | "weak" | "medium" | "strong";
   initialBasketRecoveryScore?: number;
@@ -299,6 +337,9 @@ export interface EntryDecisionTrace {
   bestDebtReducingQty?: number;
   bestDebtReducingEffectivePair?: number;
   recoveryPathReason?: string;
+  orphanCompletionDutyActive?: boolean;
+  oneSidedSeedUnrepairedTicks?: number;
+  stagedLowSideOpenedButOppositeMissing?: boolean;
   terminalPnlIfUp?: number;
   terminalPnlIfDown?: number;
   stateBefore?: InventoryTraceState;
@@ -310,6 +351,16 @@ export interface EntryDecisionTrace {
   stagedEntry?: boolean;
   plannedOppositeSide?: OutcomeSide;
   plannedOppositeQty?: number;
+  plannedOppositeFilledQty?: number;
+  plannedOppositeMissingQty?: number;
+  plannedOppositeAgeSec?: number;
+  plannedPairGroupOpenedAt?: number;
+  plannedLowSideAvg?: number;
+  plannedOppositeCompletionAttemptCount?: number;
+  plannedOppositeCompletionOpenedCount?: number;
+  plannedOppositeBlockedReason?: string;
+  xuanGoldenPatternMatched?: boolean;
+  mergeHeldForPlannedOpposite?: boolean;
   completionHoldSec?: number;
   recentBadCycleCount?: number;
   lastCycleNet?: number;
@@ -351,6 +402,8 @@ export interface EntryDecisionTrace {
   sideRhythmRejectedSide?: OutcomeSide | undefined;
   sideRhythmScoreDelta?: number | undefined;
   sideRhythmDecision?: "kept_priority" | "rhythm_override" | "rhythm_micro_fallback" | "no_viable_rhythm_side" | undefined;
+  xuanSeedRhythmWaitSec?: number | undefined;
+  xuanSeedDelayedCount?: number | undefined;
   childOrderIntendedSide?: OutcomeSide | undefined;
   childOrderSelectedSide?: OutcomeSide | undefined;
   childOrderReason?:
@@ -415,6 +468,7 @@ interface BalancedPairCandidate {
   marketBasketDebtDeltaUSDC?: number | undefined;
   marketBasketBootstrap?: boolean | undefined;
   marketBasketContinuation?: boolean | undefined;
+  xuanMicroPairContinuation?: boolean | undefined;
   fairValueFallbackReason?: string | undefined;
   balancedButDebted?: boolean | undefined;
   campaignMode?:
@@ -451,6 +505,7 @@ interface BalancedPairCandidate {
   flowShapingClipBudgetRemaining?: number | undefined;
   campaignFlowCount?: number | undefined;
   campaignFlowTarget?: number | undefined;
+  postCompletionDebtRepairActive?: boolean | undefined;
   feeUSDC: number;
   expectedNetIfMerged: number;
   cycleQualityLabel: CycleQualityLabel;
@@ -484,6 +539,8 @@ interface TemporalSeedCandidate {
   fairValueDecision: { allowed: boolean; reason?: string | undefined };
   classifierScore: number;
   skipReason?: string | undefined;
+  xuanSeedRhythmWaitSec?: number | undefined;
+  xuanSeedDelayedCount?: number | undefined;
 }
 
 export function chooseEntryBuys(
@@ -540,6 +597,112 @@ interface XuanBorderlineEntryPolicy {
 
 function normalizeTraceNumber(value: number): number {
   return Number(value.toFixed(6));
+}
+
+function xuanRhythmCompletionGate(args: {
+  config: XuanStrategyConfig;
+  partialAgeSec: number;
+  secsToClose: number;
+  repairCost: number;
+  currentMatchedEffectivePair: number;
+  unbalancedCampaignResidual: boolean;
+  plannedOppositeCompletionAllowed: boolean;
+  campaignResidualFallbackAllowed: boolean;
+}): { shouldWait: boolean; waitSec: number; earlyReason?: string | undefined } {
+  if (args.config.botMode !== "XUAN" || args.config.xuanCloneMode !== "PUBLIC_FOOTPRINT") {
+    return { shouldWait: false, waitSec: 0 };
+  }
+  if (
+    args.secsToClose <= args.config.finalWindowCompletionOnlySec ||
+    args.plannedOppositeCompletionAllowed ||
+    args.repairCost <= args.config.xuanCompletionEarlyReleaseMaxEffectivePair + 1e-9
+  ) {
+    return {
+      shouldWait: false,
+      waitSec: 0,
+      earlyReason:
+        args.repairCost <= args.config.xuanCompletionEarlyReleaseMaxEffectivePair + 1e-9
+          ? "profitable_completion"
+          : "forced_or_debt_reducing",
+    };
+  }
+  if (args.campaignResidualFallbackAllowed && args.repairCost <= 1 + 1e-9) {
+    return { shouldWait: false, waitSec: 0, earlyReason: "forced_or_debt_reducing" };
+  }
+
+  const debtPositiveBasket = Number.isFinite(args.currentMatchedEffectivePair) && args.currentMatchedEffectivePair > 1 + 1e-9;
+  const waitSec = xuanRhythmWaitForCost(
+    args.config,
+    args.repairCost,
+    debtPositiveBasket || args.unbalancedCampaignResidual,
+  );
+
+  return {
+    shouldWait: args.partialAgeSec < waitSec,
+    waitSec,
+  };
+}
+
+function xuanRhythmWaitForCost(config: XuanStrategyConfig, effectiveCost: number, debtPositive = false): number {
+  if (effectiveCost <= 1 + 1e-9) {
+    return config.xuanRhythmMinWaitSec;
+  }
+  if (effectiveCost <= config.xuanTemporalCompletionEarlyMaxEffectivePair + 1e-9) {
+    return Math.max(config.xuanRhythmMinWaitSec, Math.min(config.xuanRhythmBaseWaitSec, 12));
+  }
+  if (effectiveCost <= 1.025 + 1e-9) {
+    return config.xuanRhythmBaseWaitSec;
+  }
+  return debtPositive
+    ? config.xuanRhythmMaxWaitSec
+    : Math.max(config.xuanRhythmBaseWaitSec, Math.min(config.xuanRhythmMaxWaitSec, 20));
+}
+
+function lastTemporalSeedFill(state: XuanMarketState): FillRecord | undefined {
+  return [...state.fillHistory]
+    .reverse()
+    .find(
+      (fill) =>
+        fill.side === "BUY" &&
+        (fill.executionMode === "TEMPORAL_SINGLE_LEG_SEED" || fill.executionMode === "PAIRGROUP_COVERED_SEED"),
+    );
+}
+
+function xuanTemporalSeedRhythmSkipReason(args: {
+  config: XuanStrategyConfig;
+  state: XuanMarketState;
+  ctx: EntryLadderContext;
+  referencePairCost: number;
+  completingExistingResidual: boolean;
+  completingExistingResidualDebtReducing: boolean;
+  candidateSide: OutcomeSide;
+}): { skipReason?: string; waitSec?: number; ageSec?: number } {
+  if (args.config.botMode !== "XUAN" || args.config.xuanCloneMode !== "PUBLIC_FOOTPRINT") {
+    return {};
+  }
+  if (args.ctx.secsToClose <= args.config.finalWindowCompletionOnlySec) {
+    return {};
+  }
+  const lastSeed = lastTemporalSeedFill(args.state);
+  if (!lastSeed) {
+    return {};
+  }
+  const nowTs = args.state.market.startTs + args.ctx.secsFromOpen;
+  const ageSec = Math.max(0, nowTs - lastSeed.timestamp);
+  const debtPositive = Number.isFinite(args.referencePairCost) && args.referencePairCost > 1 + 1e-9;
+  const waitSec = xuanRhythmWaitForCost(args.config, args.referencePairCost, debtPositive);
+  const sameSideSpam = lastSeed.outcome === args.candidateSide;
+  const earlyRelease =
+    args.referencePairCost <= 1 + 1e-9 ||
+    (args.completingExistingResidual && args.completingExistingResidualDebtReducing);
+  if (!earlyRelease && ageSec < waitSec) {
+    return {
+      skipReason: sameSideSpam ? "xuan_seed_rhythm_same_side_wait" : "xuan_seed_rhythm_wait",
+      waitSec,
+      ageSec,
+    };
+  }
+  return { waitSec, ageSec };
 }
 
 function inventoryTraceState(state: XuanMarketState): InventoryTraceState {
@@ -896,12 +1059,36 @@ interface MarketBasketStateTrace {
   needsContinuation: boolean;
   balancedButDebted: boolean;
   campaignActive: boolean;
-  campaignMode?: "BASKET_CAMPAIGN_ACTIVE";
+  campaignMode?: "BASKET_CAMPAIGN_ACTIVE" | "UNBALANCED_CAMPAIGN_RESIDUAL";
+  campaignState?:
+    | "ORPHAN_COMPLETION_DUTY"
+    | "BALANCED_DEBT_CAMPAIGN"
+    | "POST_PROFIT_CAMPAIGN"
+    | "MERGE_READY";
+  orphanCompletionDutyActive?: boolean;
+  stagedLowSideOpenedButOppositeMissing?: boolean;
+  plannedOppositeSide?: OutcomeSide;
+  plannedOppositeQty?: number;
+  plannedOppositeFilledQty?: number;
+  plannedOppositeMissingQty?: number;
+  plannedOppositeAgeSec?: number;
+  plannedPairGroupOpenedAt?: number;
+  plannedLowSideAvg?: number;
 }
 
 function estimateTraceCampaignFlowCount(state: XuanMarketState): number {
   const buys = state.fillHistory
-    .filter((fill) => fill.side === "BUY")
+    .filter(
+      (fill) =>
+        fill.side === "BUY" &&
+        (
+          fill.executionMode === "TEMPORAL_SINGLE_LEG_SEED" ||
+          fill.executionMode === "PAIRGROUP_COVERED_SEED" ||
+          fill.executionMode === "XUAN_HARD_PAIR_SWEEP" ||
+          fill.executionMode === "XUAN_SOFT_PAIR_SWEEP" ||
+          fill.executionMode === "STRICT_PAIR_SWEEP"
+        ),
+    )
     .sort((left, right) => left.timestamp - right.timestamp);
   let flowCount = 0;
   let lastTimestamp: number | undefined;
@@ -938,7 +1125,54 @@ function effectiveInventoryCost(state: XuanMarketState, side: OutcomeSide, feeRa
   return lots.reduce((sum, lot) => sum + lot.size * (lot.price + takerFeePerShare(lot.price, feeRate)), 0);
 }
 
+function isCampaignSeedMode(mode: StrategyExecutionMode | undefined): boolean {
+  return (
+    mode === "TEMPORAL_SINGLE_LEG_SEED" ||
+    mode === "PAIRGROUP_COVERED_SEED" ||
+    mode === "XUAN_HARD_PAIR_SWEEP" ||
+    mode === "XUAN_SOFT_PAIR_SWEEP" ||
+    mode === "STRICT_PAIR_SWEEP" ||
+    mode === "PARTIAL_FAST_COMPLETION" ||
+    mode === "PARTIAL_SOFT_COMPLETION" ||
+    mode === "HIGH_LOW_COMPLETION_CHASE"
+  );
+}
+
+function hasCampaignSeedFill(state: XuanMarketState): boolean {
+  return state.fillHistory.some((fill) => fill.side === "BUY" && isCampaignSeedMode(fill.executionMode));
+}
+
+function oneSidedCampaignSeedAgeSec(state: XuanMarketState, residualSide: OutcomeSide, nowTs: number): number | undefined {
+  const campaignSeedTimestamps = state.fillHistory
+    .filter((fill) => fill.side === "BUY" && fill.outcome === residualSide && isCampaignSeedMode(fill.executionMode))
+    .map((fill) => fill.timestamp);
+  if (campaignSeedTimestamps.length === 0) {
+    return undefined;
+  }
+  return Math.max(0, nowTs - Math.min(...campaignSeedTimestamps));
+}
+
+function hasStagedLowSideOpenedButOppositeMissing(
+  state: XuanMarketState,
+  residualSide: OutcomeSide | "BALANCED",
+  residualQty: number,
+): boolean {
+  if (residualSide === "BALANCED" || residualQty <= 1e-6) {
+    return false;
+  }
+  return state.fillHistory.some(
+    (fill) =>
+      fill.side === "BUY" &&
+      fill.outcome === residualSide &&
+      fill.executionMode === "PAIRGROUP_COVERED_SEED",
+  );
+}
+
 function marketBasketStateTrace(config: XuanStrategyConfig, state: XuanMarketState): MarketBasketStateTrace {
+  const nowTs = Math.max(
+    state.market.startTs,
+    ...state.fillHistory.map((fill) => fill.timestamp),
+  );
   const mergeableQty = mergeableShares(state);
   const residualQty = Math.abs(state.upShares - state.downShares);
   const residualSide: OutcomeSide | "BALANCED" =
@@ -956,23 +1190,18 @@ function marketBasketStateTrace(config: XuanStrategyConfig, state: XuanMarketSta
     mergeableQty >= config.marketBasketContinuationMinMatchedShares - 1e-9 &&
     residualQty <= Math.max(config.postMergeFlatDustShares, 1e-6) + 1e-9 &&
     basketDebtUSDC > config.marketBasketMinDebtUsdc + 1e-9;
-  const campaignSeedActive = state.fillHistory.some(
-    (fill) =>
-      fill.side === "BUY" &&
-      (
-        fill.executionMode === "TEMPORAL_SINGLE_LEG_SEED" ||
-        fill.executionMode === "PAIRGROUP_COVERED_SEED" ||
-        fill.executionMode === "XUAN_HARD_PAIR_SWEEP" ||
-        fill.executionMode === "XUAN_SOFT_PAIR_SWEEP" ||
-        fill.executionMode === "STRICT_PAIR_SWEEP" ||
-        fill.executionMode === "PARTIAL_FAST_COMPLETION" ||
-        fill.executionMode === "PARTIAL_SOFT_COMPLETION" ||
-        fill.executionMode === "HIGH_LOW_COMPLETION_CHASE"
-      ),
-  );
+  const campaignSeedActive = hasCampaignSeedFill(state);
   const campaignFlowCount = estimateTraceCampaignFlowCount(state);
   const campaignFlowTarget = Math.max(1, config.xuanBasketCampaignMinFlows);
   const campaignMergeTargetQty = publicFootprintBasketMergeTargetQty(config);
+  const orphanCampaignSeedActive =
+    config.xuanBasketCampaignEnabled &&
+    config.marketBasketContinuationEnabled &&
+    config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
+    campaignSeedActive &&
+    residualSide !== "BALANCED" &&
+    residualQty >= Math.max(config.repairMinQty, config.completionMinQty) - 1e-9 &&
+    mergeableQty < campaignMergeTargetQty - 1e-9;
   const debtPositiveCampaignActive =
     config.xuanBasketCampaignEnabled &&
     config.marketBasketContinuationEnabled &&
@@ -993,7 +1222,26 @@ function marketBasketStateTrace(config: XuanStrategyConfig, state: XuanMarketSta
     basketEffectiveAvg <= config.marketBasketMergeEffectivePairCap + 1e-9 &&
     mergeableQty < campaignMergeTargetQty - 1e-9 &&
     campaignFlowCount < campaignFlowTarget;
-  const campaignActive = debtPositiveCampaignActive || postProfitCampaignActive;
+  const campaignActive = debtPositiveCampaignActive || postProfitCampaignActive || orphanCampaignSeedActive;
+  const campaignState =
+    orphanCampaignSeedActive
+      ? "ORPHAN_COMPLETION_DUTY"
+      : debtPositiveCampaignActive
+        ? "BALANCED_DEBT_CAMPAIGN"
+        : postProfitCampaignActive
+          ? "POST_PROFIT_CAMPAIGN"
+          : mergeableQty >= campaignMergeTargetQty - 1e-9 &&
+              basketEffectiveAvg <= config.marketBasketMergeEffectivePairCap + 1e-9
+            ? "MERGE_READY"
+            : undefined;
+  const plannedOpposite = plannedOppositeCompletionState(state, nowTs, Math.max(config.postMergeFlatDustShares, 1e-6));
+  const stagedLowSideOpenedButOppositeMissing =
+    plannedOpposite !== undefined ||
+    hasStagedLowSideOpenedButOppositeMissing(
+      state,
+      residualSide,
+      residualQty,
+    );
   return {
     totalUp: normalizeTraceNumber(state.upShares),
     totalDown: normalizeTraceNumber(state.downShares),
@@ -1006,11 +1254,26 @@ function marketBasketStateTrace(config: XuanStrategyConfig, state: XuanMarketSta
     terminalPnlIfDown: normalizeTraceNumber(state.downShares - totalEffectiveCost),
     needsContinuation:
       balancedButDebted ||
+      orphanCampaignSeedActive ||
       campaignActive ||
       (mergeableQty > 1e-6 && basketEffectiveAvg > config.marketBasketGoodAvgCap + 1e-9),
     balancedButDebted,
     campaignActive,
-    ...(campaignActive ? { campaignMode: "BASKET_CAMPAIGN_ACTIVE" } : {}),
+    ...(campaignActive ? { campaignMode: orphanCampaignSeedActive ? "UNBALANCED_CAMPAIGN_RESIDUAL" : "BASKET_CAMPAIGN_ACTIVE" } : {}),
+    ...(campaignState ? { campaignState } : {}),
+    ...(orphanCampaignSeedActive ? { orphanCompletionDutyActive: true } : {}),
+    ...(stagedLowSideOpenedButOppositeMissing ? { stagedLowSideOpenedButOppositeMissing: true } : {}),
+    ...(plannedOpposite
+      ? {
+          plannedOppositeSide: plannedOpposite.plannedOppositeSide,
+          plannedOppositeQty: plannedOpposite.plannedOppositeQty,
+          plannedOppositeFilledQty: plannedOpposite.plannedOppositeFilledQty,
+          plannedOppositeMissingQty: plannedOpposite.plannedOppositeMissingQty,
+          plannedOppositeAgeSec: plannedOpposite.plannedOppositeAgeSec,
+          plannedPairGroupOpenedAt: plannedOpposite.plannedPairGroupOpenedAt,
+          plannedLowSideAvg: plannedOpposite.plannedLowSideAvg,
+        }
+      : {}),
   };
 }
 
@@ -1029,6 +1292,21 @@ function basketTraceFields(config: XuanStrategyConfig, state: XuanMarketState): 
     marketBasketDebtUSDC: basket.basketDebtUSDC,
     marketBasketNeedsContinuation: basket.needsContinuation,
     balancedButDebted: basket.balancedButDebted,
+    ...(basket.campaignState ? { campaignState: basket.campaignState } : {}),
+    ...(basket.orphanCompletionDutyActive ? { orphanCompletionDutyActive: true } : {}),
+    ...(basket.stagedLowSideOpenedButOppositeMissing ? { stagedLowSideOpenedButOppositeMissing: true } : {}),
+    ...(basket.plannedOppositeSide ? { plannedOppositeSide: basket.plannedOppositeSide } : {}),
+    ...(basket.plannedOppositeQty !== undefined ? { plannedOppositeQty: basket.plannedOppositeQty } : {}),
+    ...(basket.plannedOppositeFilledQty !== undefined ? { plannedOppositeFilledQty: basket.plannedOppositeFilledQty } : {}),
+    ...(basket.plannedOppositeMissingQty !== undefined ? { plannedOppositeMissingQty: basket.plannedOppositeMissingQty } : {}),
+    ...(basket.plannedOppositeAgeSec !== undefined ? { plannedOppositeAgeSec: basket.plannedOppositeAgeSec } : {}),
+    ...(basket.plannedPairGroupOpenedAt !== undefined ? { plannedPairGroupOpenedAt: basket.plannedPairGroupOpenedAt } : {}),
+    ...(basket.plannedLowSideAvg !== undefined ? { plannedLowSideAvg: basket.plannedLowSideAvg } : {}),
+    ...(basket.mergeableQty >= config.marketBasketMinMergeShares - 1e-9 &&
+    xuanFlowCount(state) >= 2 &&
+    !basket.stagedLowSideOpenedButOppositeMissing
+      ? { xuanGoldenPatternMatched: true }
+      : {}),
     ...(basket.campaignMode
       ? {
           campaignMode: basket.campaignMode,
@@ -1049,25 +1327,16 @@ function isUnbalancedCampaignResidual(
     !config.xuanBasketCampaignEnabled ||
     !config.marketBasketContinuationEnabled ||
     config.xuanCloneMode !== "PUBLIC_FOOTPRINT" ||
-    shareGap <= Math.max(config.repairMinQty, config.completionMinQty) + 1e-9
+    shareGap <= Math.max(config.controlledOverlapMinResidualShares, config.microRepairMaxQty) + 1e-9
   ) {
     return false;
   }
   const matchedQty = mergeableShares(state);
-  if (matchedQty < config.xuanBasketCampaignMinMatchedShares - 1e-9) {
+  const hasSeedDuty = hasCampaignSeedFill(state);
+  if (matchedQty < config.xuanBasketCampaignMinMatchedShares - 1e-9 && !hasSeedDuty) {
     return false;
   }
-  return state.fillHistory.some(
-    (fill) =>
-      fill.side === "BUY" &&
-      (
-        fill.executionMode === "TEMPORAL_SINGLE_LEG_SEED" ||
-        fill.executionMode === "PAIRGROUP_COVERED_SEED" ||
-        fill.executionMode === "XUAN_HARD_PAIR_SWEEP" ||
-        fill.executionMode === "XUAN_SOFT_PAIR_SWEEP" ||
-        fill.executionMode === "STRICT_PAIR_SWEEP"
-      ),
-  );
+  return hasSeedDuty;
 }
 
 function residualCompletionFairValueFallback(args: {
@@ -1079,6 +1348,8 @@ function residualCompletionFairValueFallback(args: {
   executableSize: number;
   oldGap: number;
   newGap: number;
+  orphanCompletionDutyActive?: boolean | undefined;
+  phaseCap?: number | undefined;
 }): { allowed: boolean; reason?: string | undefined } {
   if (
     !args.config.allowResidualCompletionWithoutFairValue ||
@@ -1091,6 +1362,25 @@ function residualCompletionFairValueFallback(args: {
   }
   if (args.repairCost <= args.config.residualCompletionCostBasisCap + 1e-9) {
     return { allowed: true, reason: "residual_cost_basis_cap" };
+  }
+  const hasTemporalSingleLegSeed = args.state.fillHistory.some(
+    (fill) => fill.executionMode === "TEMPORAL_SINGLE_LEG_SEED" || fill.executionMode === "PAIRGROUP_COVERED_SEED",
+  );
+  if (
+    args.config.botMode === "XUAN" &&
+    args.config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
+    hasTemporalSingleLegSeed &&
+    args.orphanCompletionDutyActive &&
+    args.repairCost <= Math.max(args.config.softResidualCompletionCap, args.config.temporalRepairPatientCap) + 1e-9
+  ) {
+    return { allowed: true, reason: "xuan_orphan_seed_completion_priority" };
+  }
+  if (
+    args.orphanCompletionDutyActive &&
+    args.phaseCap !== undefined &&
+    args.repairCost <= Math.max(args.phaseCap, args.config.softResidualCompletionCap) + 1e-9
+  ) {
+    return { allowed: true, reason: "orphan_seed_completion_duty" };
   }
   if (
     Number.isFinite(args.currentMatchedEffectivePair) &&
@@ -1212,6 +1502,102 @@ function terminalCarryProjectionForPair(args: {
       args.config.terminalCarryImprovementEnabled &&
       addedDebtUSDC <= args.config.terminalCarryMaxAddedDebtUsdc + 1e-9 &&
       (evBeatsAddedDebt || minPnlImproves),
+  };
+}
+
+function isHighLowVisualPair(config: XuanStrategyConfig, upPrice: number, downPrice: number): boolean {
+  const high = Math.max(upPrice, downPrice);
+  const low = Math.min(upPrice, downPrice);
+  const spread = high - low;
+  return (
+    spread + 1e-9 >= config.highLowContinuationMinSpread &&
+    low <= config.lowSideMaxForHighCompletion + 0.06 + 1e-9 &&
+    high >= config.highSidePriceThreshold - 0.12 - 1e-9
+  );
+}
+
+function shouldAllowPostCompletionDebtCampaignPairOverride(args: {
+  config: XuanStrategyConfig;
+  basketState: MarketBasketStateTrace;
+  allowance: ReturnType<typeof pairSweepAllowance> | undefined;
+  basketProjection: ReturnType<typeof marketBasketProjection> | undefined;
+  terminalCarryProjection: TerminalCarryProjection;
+  pairCost: number;
+  requestedSize: number;
+}): boolean {
+  if (
+    args.config.botMode !== "XUAN" ||
+    args.config.xuanCloneMode !== "PUBLIC_FOOTPRINT" ||
+    !args.basketState.campaignActive ||
+    !args.basketState.balancedButDebted ||
+    !args.allowance?.marketBasketContinuation ||
+    args.allowance.continuationClass !== "AVG_IMPROVING" ||
+    !args.basketProjection
+  ) {
+    return false;
+  }
+  if (
+    args.pairCost > args.config.xuanBasketCampaignFlowShapingEffectiveCap + 1e-9 ||
+    args.pairCost > args.basketState.basketEffectiveAvg - args.config.marketBasketMinAvgImprovement + 1e-9
+  ) {
+    return false;
+  }
+  if (args.basketProjection.improvement < args.config.marketBasketMinAvgImprovement - 1e-9) {
+    return false;
+  }
+  if (
+    args.allowance.avgImprovingClipBudgetRemaining !== undefined &&
+    args.allowance.avgImprovingClipBudgetRemaining <= 0
+  ) {
+    return false;
+  }
+  const addedDebtUSDC = Math.max(0, args.pairCost - 1) * args.requestedSize;
+  const maxAddedDebt = Math.max(
+    args.config.maxAvgImprovingAddedDebtUsdc,
+    args.config.xuanBasketCampaignAvgImprovementMaxAddedDebtUsdc,
+    Math.min(Math.max(args.basketState.basketDebtUSDC * 0.35, 0.75), 2.5),
+  );
+  if (
+    args.allowance.avgImprovingBudgetRemainingUSDC !== undefined &&
+    addedDebtUSDC > args.allowance.avgImprovingBudgetRemainingUSDC + 1e-9
+  ) {
+    return false;
+  }
+  if (addedDebtUSDC > maxAddedDebt + 1e-9) {
+    return false;
+  }
+  const terminalAllowedDrag = Math.min(maxAddedDebt, Math.max(0.25, args.basketState.basketDebtUSDC * 0.2));
+  if (args.terminalCarryProjection.deltaTerminalMinPnl < -terminalAllowedDrag - 1e-9) {
+    return false;
+  }
+  return true;
+}
+
+function xuanFlowCount(state: XuanMarketState): number {
+  return estimateTraceCampaignFlowCount(state);
+}
+
+function traceRepairCounters(traces: BalancedPairCandidateTrace[]): Partial<EntryDecisionTrace> {
+  const postCompletionRepairAttemptCount = traces.filter((trace) => trace.postCompletionDebtRepairActive).length;
+  const postCompletionRepairOpenedCount = traces.filter(
+    (trace) => trace.postCompletionDebtRepairActive && trace.verdict === "ok",
+  ).length;
+  const pairCapBlockedRepairCount = traces.filter(
+    (trace) => trace.postCompletionDebtRepairActive && trace.verdict === "pair_cap",
+  ).length;
+  const avgImprovingActionCount = traces.filter(
+    (trace) => trace.verdict === "ok" && trace.continuationClass === "AVG_IMPROVING",
+  ).length;
+  const debtReducingActionCount = traces.filter(
+    (trace) => trace.verdict === "ok" && trace.continuationClass === "DEBT_REDUCING",
+  ).length;
+
+  return {
+    ...(postCompletionRepairAttemptCount > 0 ? { postCompletionRepairAttemptCount } : {}),
+    ...(postCompletionRepairOpenedCount > 0 ? { postCompletionRepairOpenedCount } : {}),
+    ...(pairCapBlockedRepairCount > 0 ? { pairCapBlockedRepairCount } : {}),
+    ...(avgImprovingActionCount > 0 ? { avgImprovingActionCount } : {}),
+    ...(debtReducingActionCount > 0 ? { debtReducingActionCount } : {}),
   };
 }
 
@@ -1373,6 +1759,7 @@ function basketTraceFromCandidate(candidate: BalancedPairCandidate): Partial<Ent
       : {}),
     ...(candidate.marketBasketBootstrap ? { marketBasketBootstrap: true } : {}),
     ...(candidate.marketBasketContinuation ? { marketBasketContinuation: true } : {}),
+    ...(candidate.xuanMicroPairContinuation ? { xuanMicroPairContinuation: true } : {}),
     ...(candidate.fairValueFallbackReason ? { fairValueFallbackReason: candidate.fairValueFallbackReason } : {}),
     ...(candidate.balancedButDebted ? { balancedButDebted: true } : {}),
     ...(candidate.campaignMode ? { campaignMode: candidate.campaignMode } : {}),
@@ -1420,6 +1807,7 @@ function basketTraceFromCandidate(candidate: BalancedPairCandidate): Partial<Ent
       : {}),
     ...(candidate.campaignFlowCount !== undefined ? { campaignFlowCount: candidate.campaignFlowCount } : {}),
     ...(candidate.campaignFlowTarget !== undefined ? { campaignFlowTarget: candidate.campaignFlowTarget } : {}),
+    ...(candidate.postCompletionDebtRepairActive ? { postCompletionDebtRepairActive: true } : {}),
     ...(candidate.addedDebtUSDC !== undefined ? { addedDebtUSDC: candidate.addedDebtUSDC } : {}),
   };
 }
@@ -2145,6 +2533,10 @@ export function evaluateEntryBuys(
       ...(freshCycleStats.lastCycle ? { lastCycleClosedAt: freshCycleStats.lastCycle.closedAt } : {}),
       ...(inspected.bestRawPair !== undefined ? { bestRawPair: inspected.bestRawPair } : {}),
       ...(inspected.bestEffectivePair !== undefined ? { bestEffectivePair: inspected.bestEffectivePair } : {}),
+      ...(currentBasketState.campaignState === "BALANCED_DEBT_CAMPAIGN" ? { balancedDebtCampaignTicks: 1 } : {}),
+      xuanFlowCount: xuanFlowCount(state),
+      mergeQtyOverBaseLot: normalizeTraceNumber(mergeableShares(state) / Math.max(ctx.lot, 1e-9)),
+      ...traceRepairCounters(inspected.traces),
       candidates: inspected.traces,
     };
 
@@ -2400,6 +2792,8 @@ export function evaluateEntryBuys(
           reason === "avg_improving_budget_exhausted" ||
           reason === "avg_improving_qty_cap" ||
           reason === "debt_reducing_qty_cap" ||
+          reason === "high_low_effective_not_debt_reducing" ||
+          reason === "projected_basket_too_expensive" ||
           reason === "continuation_not_debt_reducing_or_avg_improving" ||
           reason === "market_basket_continuation_rejected"
         );
@@ -2413,6 +2807,7 @@ export function evaluateEntryBuys(
       temporalSeedEvaluation.trace.find((seedTrace) => seedTrace.cycleSkippedReason)?.cycleSkippedReason ??
       seedEvaluation.trace.find((seedTrace) => seedTrace.cycleSkippedReason)?.cycleSkippedReason ??
       inspected.traces.find((candidateTrace) => candidateTrace.cycleSkippedReason)?.cycleSkippedReason;
+    const pairSkipReason = determineBalancedPairSkipReason(inspected.maxCandidateSize, inspected.traces);
 
     return {
       decisions: [],
@@ -2421,8 +2816,10 @@ export function evaluateEntryBuys(
         seedCandidates: [...temporalSeedEvaluation.trace, ...seedEvaluation.trace],
         skipReason:
           temporalSeedEvaluation.trace.length > 0 || seedEvaluation.trace.length > 0
-            ? `${determineBalancedPairSkipReason(inspected.maxCandidateSize, inspected.traces)}+single_leg_seed`
-            : determineBalancedPairSkipReason(inspected.maxCandidateSize, inspected.traces),
+            ? pairSkipReason === "high_low_effective_not_debt_reducing"
+              ? pairSkipReason
+              : `${pairSkipReason}+single_leg_seed`
+            : pairSkipReason,
         ...(cycleSkippedReason ? { cycleSkippedReason } : {}),
       },
     };
@@ -2634,7 +3031,9 @@ export function evaluateEntryBuys(
     config.completionQtyMode === "ALLOW_OVERSHOOT"
       ? shareGap + config.maxCompletionOvershootShares
       : shareGap;
+  const nowTs = state.market.endTs - ctx.secsToClose;
   const unbalancedCampaignResidual = isUnbalancedCampaignResidual(config, state, shareGap);
+  const orphanCompletionDutyActive = unbalancedCampaignResidual && mergeableShares(state) < config.xuanBasketCampaignMinMatchedShares - 1e-9;
   const currentMatchedEffectiveForHedge =
     mergeableShares(state) > 1e-6 ? matchedEffectivePairCost(state, config.cryptoTakerFeeRate) : Number.POSITIVE_INFINITY;
   const debtPositiveCampaignHedgeQtyCap =
@@ -2689,6 +3088,13 @@ export function evaluateEntryBuys(
           campaignMode: "UNBALANCED_CAMPAIGN_RESIDUAL",
           campaignBaseLot: config.liveSmallLotLadder[0] ?? config.defaultLot,
           marketBasketMergeableQty: normalizeTraceNumber(mergeableShares(state)),
+          ...(orphanCompletionDutyActive ? { orphanCompletionDutyActive: true } : {}),
+          ...(oneSidedCampaignSeedAgeSec(state, leadingSide, nowTs) !== undefined
+            ? { oneSidedSeedUnrepairedTicks: normalizeTraceNumber(oneSidedCampaignSeedAgeSec(state, leadingSide, nowTs) ?? 0) }
+            : {}),
+          ...(hasStagedLowSideOpenedButOppositeMissing(state, leadingSide, shareGap)
+            ? { stagedLowSideOpenedButOppositeMissing: true }
+            : {}),
         }
       : {}),
   };
@@ -2709,46 +3115,6 @@ export function evaluateEntryBuys(
     return residualJanitorPair;
   }
 
-  if (
-    shouldHoldHighLowOvershootResidual({
-      config,
-      state,
-      leadingSide,
-      shareGap,
-      secsFromOpen: ctx.secsFromOpen,
-      exactPriorActive: Boolean(exactCompletionQtyPrior),
-    })
-  ) {
-    return withCloneOverlapFallback({
-      decisions: [],
-      trace: {
-        ...trace,
-        overlapRepairOutcome: "wait",
-        skipReason: "high_low_residual_redeem_hold",
-      },
-    });
-  }
-
-  if (
-    shouldHoldLateSmallResidual({
-      config,
-      shareGap,
-      secsFromOpen: ctx.secsFromOpen,
-      secsToClose: ctx.secsToClose,
-      residualSeverityLevel: residualSeverity.level,
-      exactPriorActive: Boolean(exactCompletionQtyPrior),
-    })
-  ) {
-    return withCloneOverlapFallback({
-      decisions: [],
-      trace: {
-        ...trace,
-        overlapRepairOutcome: "wait",
-        skipReason: "late_small_residual_hold",
-      },
-    });
-  }
-
   if (repairSize <= 0) {
     return {
       decisions: [],
@@ -2759,15 +3125,25 @@ export function evaluateEntryBuys(
     };
   }
 
-  const nowTs = state.market.endTs - ctx.secsToClose;
   const residualTimestamp = oldestResidualLotTimestamp(state, leadingSide);
   const partialAgeSec =
     residualTimestamp !== undefined ? Math.max(0, nowTs - residualTimestamp) : config.partialSoftWindowSec;
+  const plannedOpposite = plannedOppositeCompletionState(state, nowTs, Math.max(config.postMergeFlatDustShares, 1e-6));
+  const plannedOppositeMaterialQty = Math.max(
+    config.controlledOverlapMinResidualShares,
+    config.microRepairMaxQty + state.market.minOrderSize,
+  );
+  const plannedOppositeDutyActive =
+    plannedOpposite !== undefined &&
+    plannedOpposite.plannedOppositeSide === laggingSide &&
+    plannedOpposite.plannedOppositeMissingQty >= plannedOppositeMaterialQty - 1e-9 &&
+    plannedOpposite.plannedLowSideAvg <= config.lowSideMaxForHighCompletion + 1e-9;
   const stagedResidualAgeSec = borderlineStagedResidualAgeSec(state, leadingSide, nowTs);
   if (
     config.borderlinePairStagedEntryEnabled &&
     stagedResidualAgeSec !== undefined &&
     stagedResidualAgeSec < config.borderlinePairReevaluateAfterSec &&
+    !plannedOppositeDutyActive &&
     ctx.secsToClose > config.finalWindowCompletionOnlySec
   ) {
     return withCloneOverlapFallback({
@@ -2839,13 +3215,24 @@ export function evaluateEntryBuys(
   );
   const effectiveRepairSize =
     residualCarryQty > 0 && residualAwareRepairSize > 0 ? Math.min(phasedRepairSize, residualAwareRepairSize) : phasedRepairSize;
-  const repairCandidateSizes = buildResidualRepairCandidateSizes({
+  const baseRepairCandidateSizes = buildResidualRepairCandidateSizes({
     config,
     standardSize: effectiveRepairSize,
     shareGap,
     exactPriorActive: Boolean(exactCompletionQtyPrior),
     campaignCompletionSizing,
   });
+  const plannedOppositeQty =
+    plannedOppositeDutyActive && plannedOpposite
+      ? normalizeOrderSize(
+          Math.min(plannedOpposite.plannedOppositeMissingQty, shareGap, config.marketBasketContinuationMaxQty),
+          config.repairMinQty,
+        )
+      : 0;
+  const repairCandidateSizes =
+    plannedOppositeQty > 0 && !baseRepairCandidateSizes.some((size) => Math.abs(size - plannedOppositeQty) <= 1e-6)
+      ? [plannedOppositeQty, ...baseRepairCandidateSizes]
+      : baseRepairCandidateSizes;
   let lastBlockedRepairEvaluation: EntryEvaluation | undefined;
   let bestRepairEvaluation: EntryEvaluation | undefined;
   let bestRepairScore = Number.POSITIVE_INFINITY;
@@ -2897,6 +3284,50 @@ export function evaluateEntryBuys(
       execution.averagePrice,
       config.cryptoTakerFeeRate,
     );
+    const plannedOppositeCandidate =
+      plannedOppositeDutyActive &&
+      plannedOpposite !== undefined &&
+      executableSize <= plannedOpposite.plannedOppositeMissingQty + config.maxCompletionOvershootShares + 1e-9;
+    const plannedOppositeCompletionAllowed =
+      plannedOppositeCandidate &&
+      ctx.secsToClose > config.finalWindowNoChaseSec &&
+      repairCost <= 1.025 + 1e-9;
+    const plannedOppositeDebtReducing =
+      plannedOppositeCandidate &&
+      repairCost <= config.marketBasketGoodAvgCap + 1e-9;
+    const expensiveCampaignCompletionThreshold = Math.max(1.045, config.fullRebalanceOnlyIfEffectivePairBelow);
+    const expensiveCampaignPartialHedgeMaxQty =
+      unbalancedCampaignResidual &&
+      !plannedOppositeCompletionAllowed &&
+      repairCost > expensiveCampaignCompletionThreshold + 1e-9 &&
+      oldGap > config.completionMinQty + 1e-9
+        ? Math.max(
+            config.completionMinQty,
+            Math.min(
+              oldGap,
+              oldGap * Math.max(0.1, Math.min(config.initialDebtyCampaignMaxHedgeRatio, 0.65)),
+            ),
+          )
+        : undefined;
+    if (
+      expensiveCampaignPartialHedgeMaxQty !== undefined &&
+      executableSize > expensiveCampaignPartialHedgeMaxQty + config.maxCompletionOvershootShares + 1e-9
+    ) {
+      lastBlockedRepairEvaluation = {
+        decisions: [],
+        trace: {
+          ...trace,
+          repairSizingMode,
+          repairCandidateCount: repairCandidateSizes.length,
+          repairFilledSize: executableSize,
+          repairFinalQty: executableSize,
+          repairOldGap: oldGap,
+          repairNewGap: newGap,
+          skipReason: "expensive_completion_partial_hedge_cap",
+        },
+      };
+      continue;
+    }
     const allowance = completionAllowance(config, state, {
       costWithFees: repairCost,
       candidateSize: executableSize,
@@ -2923,12 +3354,15 @@ export function evaluateEntryBuys(
       executableSize,
       oldGap,
       newGap,
+      orphanCompletionDutyActive,
+      phaseCap,
     });
-    const campaignPhaseCapOverride = campaignResidualFallback.allowed;
+    const campaignPhaseCapOverride = campaignResidualFallback.allowed || plannedOppositeCompletionAllowed;
     const earlyTemporalLaggingRebalanceWait =
       config.botMode === "XUAN" &&
-      config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
+      config.xuanCloneMode !== "PUBLIC_FOOTPRINT" &&
       !exactCompletionQtyPrior &&
+      !plannedOppositeCompletionAllowed &&
       partialAgeSec < config.xuanTemporalCompletionMinAgeSec &&
       ctx.secsToClose > config.finalWindowCompletionOnlySec &&
       repairCost > config.xuanTemporalCompletionEarlyMaxEffectivePair + 1e-9;
@@ -2965,6 +3399,7 @@ export function evaluateEntryBuys(
       unbalancedCampaignResidual &&
       oldGap >= Math.max(config.controlledOverlapMinResidualShares, config.microRepairMaxQty) - 1e-9 &&
       !campaignResidualFallback.allowed &&
+      !plannedOppositeCompletionAllowed &&
       ctx.secsToClose > config.finalWindowCompletionOnlySec;
     if (campaignResidualCostBasisBlocked) {
       lastBlockedRepairEvaluation = {
@@ -2992,7 +3427,7 @@ export function evaluateEntryBuys(
     }
     if (
       (repairCost > phaseCap && !highLowPhaseCapOverride && !campaignPhaseCapOverride) ||
-      executableSize > campaignPhaseMaxQty
+      (executableSize > campaignPhaseMaxQty && !plannedOppositeCompletionAllowed)
     ) {
       lastBlockedRepairEvaluation = {
       decisions: [],
@@ -3023,7 +3458,7 @@ export function evaluateEntryBuys(
       repairCost <= config.temporalRepairUltraFastMissingFairValueCap &&
       allowance.allowed;
     const fairValueRequired =
-      ultraFastCloneFairValueFallback || campaignResidualFallback.allowed
+      ultraFastCloneFairValueFallback || campaignResidualFallback.allowed || plannedOppositeCompletionAllowed
         ? false
         : allowance.highLowMismatch && allowance.allowed && !allowance.requiresFairValue
           ? false
@@ -3031,7 +3466,7 @@ export function evaluateEntryBuys(
               config.allowStrictResidualCompletionWithoutFairValue &&
               repairCost <= config.strictResidualCompletionCap
             ) || Boolean(allowance.requiresFairValue);
-    const fairValueDecision = ultraFastCloneFairValueFallback || campaignResidualFallback.allowed
+    const fairValueDecision = ultraFastCloneFairValueFallback || campaignResidualFallback.allowed || plannedOppositeCompletionAllowed
       ? { allowed: true as const }
       : fairValueGate({
           config,
@@ -3063,6 +3498,11 @@ export function evaluateEntryBuys(
       exactPriorActive: Boolean(exactCompletionQtyPrior),
       fairValueAllowed: strictHighSideFairValueDecision.allowed,
     });
+    const campaignHighSideCompletionOverride =
+      (campaignResidualFallback.allowed || plannedOppositeCompletionAllowed) &&
+      unbalancedCampaignResidual &&
+      executableSize <= oldGap + config.maxCompletionOvershootShares + 1e-9 &&
+      repairCost <= Math.max(config.temporalRepairPatientCap, config.highSideCompletionMaxCost) + 1e-9;
     const qualitySkipReason = completionQualitySkipReason(config, state, {
       costWithFees: repairCost,
       candidateSize: executableSize,
@@ -3081,7 +3521,9 @@ export function evaluateEntryBuys(
         partialAgeSec,
       });
     const repairMode: StrategyExecutionMode =
-      allowance.highLowMismatch && allowance.allowed
+      plannedOppositeCompletionAllowed && (allowance.highLowMismatch || plannedOppositeDebtReducing)
+        ? "HIGH_LOW_COMPLETION_CHASE"
+        : allowance.highLowMismatch && allowance.allowed
         ? "HIGH_LOW_COMPLETION_CHASE"
         : cheapLateCompletionChase
           ? "CHEAP_LATE_COMPLETION_CHASE"
@@ -3095,12 +3537,26 @@ export function evaluateEntryBuys(
       oppositeAveragePrice,
       missingSidePrice: execution.averagePrice,
       exactPriorActive: Boolean(exactCompletionQtyPrior),
-      exceptionalMode: Boolean(allowance.highLowMismatch) || cheapLateCompletionChase || campaignResidualFallback.allowed,
+      exceptionalMode:
+        Boolean(allowance.highLowMismatch) ||
+        cheapLateCompletionChase ||
+        campaignResidualFallback.allowed ||
+        plannedOppositeCompletionAllowed,
       ...(ctx.recentSeedFlowCount !== undefined ? { recentSeedFlowCount: ctx.recentSeedFlowCount } : {}),
       ...(ctx.activeIndependentFlowCount !== undefined ? { activeIndependentFlowCount: ctx.activeIndependentFlowCount } : {}),
       ...(ctx.completionPatienceMultiplier !== undefined
         ? { completionPatienceMultiplier: ctx.completionPatienceMultiplier }
         : {}),
+    });
+    const xuanRhythmGate = xuanRhythmCompletionGate({
+      config,
+      partialAgeSec,
+      secsToClose: ctx.secsToClose,
+      repairCost,
+      currentMatchedEffectivePair,
+      unbalancedCampaignResidual,
+      plannedOppositeCompletionAllowed,
+      campaignResidualFallbackAllowed: campaignResidualFallback.allowed,
     });
     const detailedTrace: EntryDecisionTrace = {
       ...trace,
@@ -3128,10 +3584,28 @@ export function evaluateEntryBuys(
             currentBasketEffectiveAvg: normalizeTraceNumber(currentMatchedEffectivePair),
           }
         : {}),
+      ...(plannedOppositeCompletionAllowed && plannedOpposite
+        ? {
+            campaignMode: "RESIDUAL_COMPLETION_ACTIVE",
+            residualCompletionFairValueFallback: true,
+            residualCompletionFallbackReason: plannedOppositeDebtReducing
+              ? "planned_opposite_debt_reducing"
+              : "planned_opposite_completion",
+            plannedOppositeSide: plannedOpposite.plannedOppositeSide,
+            plannedOppositeQty: plannedOpposite.plannedOppositeQty,
+            plannedOppositeFilledQty: plannedOpposite.plannedOppositeFilledQty,
+            plannedOppositeMissingQty: plannedOpposite.plannedOppositeMissingQty,
+            plannedOppositeAgeSec: plannedOpposite.plannedOppositeAgeSec,
+            plannedOppositeCompletionAttemptCount: 1,
+            plannedOppositeCompletionOpenedCount: 1,
+          }
+        : {}),
       completionCalibrationPatienceMultiplier: completionDelayProfile.calibrationPatienceMultiplier,
       completionRolePatienceMultiplier: completionDelayProfile.rolePatienceMultiplier,
       completionEffectivePatienceMultiplier: completionDelayProfile.effectivePatienceMultiplier,
       completionWaitUntilSec: completionDelayProfile.waitUntilSec,
+      xuanRhythmWaitSec: normalizeTraceNumber(xuanRhythmGate.waitSec),
+      ...(xuanRhythmGate.earlyReason ? { xuanEarlyCompletionReason: xuanRhythmGate.earlyReason } : {}),
     };
     if (
       ctx.secsToClose <= config.partialNoChaseLastSec &&
@@ -3148,18 +3622,22 @@ export function evaluateEntryBuys(
       };
       continue;
     }
-    if (!allowance.allowed || (!fairValueDecision.allowed && !campaignResidualFallback.allowed)) {
+    if (
+      !allowance.allowed &&
+      !plannedOppositeCompletionAllowed ||
+      (!fairValueDecision.allowed && !campaignResidualFallback.allowed && !plannedOppositeCompletionAllowed)
+    ) {
       lastBlockedRepairEvaluation = {
       decisions: [],
       trace: {
         ...detailedTrace,
         overlapRepairOutcome: "blocked",
-        skipReason: !allowance.allowed ? "repair_cap" : fairValueDecision.reason ?? "repair_fair_value",
+        skipReason: !allowance.allowed && !plannedOppositeCompletionAllowed ? "repair_cap" : fairValueDecision.reason ?? "repair_fair_value",
       },
       };
       continue;
     }
-    if (highSideQualitySkipReason) {
+    if (highSideQualitySkipReason && !campaignHighSideCompletionOverride && !plannedOppositeCompletionAllowed) {
       lastBlockedRepairEvaluation = {
       decisions: [],
       trace: {
@@ -3170,7 +3648,7 @@ export function evaluateEntryBuys(
       };
       continue;
     }
-    if (qualitySkipReason) {
+    if (qualitySkipReason && !campaignResidualFallback.allowed && !plannedOppositeCompletionAllowed) {
       lastBlockedRepairEvaluation = {
       decisions: [],
       trace: {
@@ -3181,7 +3659,21 @@ export function evaluateEntryBuys(
       };
       continue;
     }
-    if (completionDelayProfile.shouldDelay && !campaignResidualFallback.allowed) {
+    if (xuanRhythmGate.shouldWait) {
+      lastBlockedRepairEvaluation = {
+      decisions: [],
+      trace: {
+        ...detailedTrace,
+        completionHoldSec: normalizeTraceNumber(xuanRhythmGate.waitSec - partialAgeSec),
+        xuanCompletionDelayedCount: 1,
+        continuationRejectedReason: "xuan_rhythm_wait",
+        overlapRepairOutcome: "wait",
+        skipReason: "xuan_rhythm_wait",
+      },
+      };
+      continue;
+    }
+    if (completionDelayProfile.shouldDelay && !campaignResidualFallback.allowed && !plannedOppositeCompletionAllowed) {
       lastBlockedRepairEvaluation = {
       decisions: [],
       trace: {
@@ -3651,6 +4143,13 @@ function shouldPreferTemporalCloneCycleOverBalancedPair(args: {
   flowPressureState: FlowPressureBudgetState;
 }): boolean {
   if (args.config.botMode !== "XUAN") {
+    return false;
+  }
+  if (
+    args.bestCandidate.marketBasketContinuation &&
+    (args.bestCandidate.continuationClass === "AVG_IMPROVING" ||
+      args.bestCandidate.continuationClass === "DEBT_REDUCING")
+  ) {
     return false;
   }
   const openPrior = resolveBundledOpenSequencePrior(args.state.market.slug);
@@ -4185,30 +4684,6 @@ function buildHighLowRepairOvershootQty(args: {
   return overshootQty;
 }
 
-function shouldHoldLateSmallResidual(args: {
-  config: XuanStrategyConfig;
-  shareGap: number;
-  secsFromOpen: number;
-  secsToClose: number;
-  residualSeverityLevel: "flat" | "micro" | "small" | "medium" | "aggressive";
-  exactPriorActive: boolean;
-}): boolean {
-  if (args.config.botMode !== "XUAN" || args.exactPriorActive) {
-    return false;
-  }
-  const holdableSeverity =
-    args.residualSeverityLevel === "micro" ||
-    args.residualSeverityLevel === "small" ||
-    (args.residualSeverityLevel === "flat" && args.shareGap > 0.5);
-  if (!holdableSeverity) {
-    return false;
-  }
-  if (args.shareGap > 5 + 1e-6) {
-    return false;
-  }
-  return args.secsFromOpen >= 240 || args.secsToClose <= args.config.finalWindowSoftStartSec;
-}
-
 function shouldHoldHighLowOvershootResidual(args: {
   config: XuanStrategyConfig;
   state: XuanMarketState;
@@ -4429,12 +4904,18 @@ function evaluateTemporalSingleLegSeed(
       Number.isFinite(matchedEffectivePair) &&
       referencePairCost <= config.softResidualCompletionCap + 1e-9 &&
       referencePairCost < matchedEffectivePair - config.residualCompletionImprovementThreshold + 1e-9;
+    const protectedCampaignResidualCompletion =
+      completingExistingResidual &&
+      isUnbalancedCampaignResidual(config, state, oldGap) &&
+      referencePairCost <= Math.max(config.temporalRepairPatientCap, config.highSideCompletionMaxCost) + 1e-9 &&
+      executableSize <= oldGap + config.maxCompletionOvershootShares + 1e-9;
     const protectedResidualCostBasisAllowed =
       !completingExistingResidual ||
       dustOnlyResidual ||
       microOverlapResidual ||
       protectedResidualDebtReducing ||
-      protectedResidualAverageImproving;
+      protectedResidualAverageImproving ||
+      protectedCampaignResidualCompletion;
     const cheapSeedExpensiveCompletionBlocked = shouldBlockCheapSeedExpensiveCompletionSetup({
       config,
       state,
@@ -4450,6 +4931,15 @@ function evaluateTemporalSingleLegSeed(
       (ctx.protectedResidualShares ?? 0) > Math.max(config.repairMinQty, config.completionMinQty) &&
       ctx.protectedResidualSide === side &&
       overlapSequencePrior?.scope !== "exact";
+    const seedRhythm = xuanTemporalSeedRhythmSkipReason({
+      config,
+      state,
+      ctx,
+      referencePairCost,
+      completingExistingResidual,
+      completingExistingResidualDebtReducing: protectedResidualDebtReducing || protectedResidualAverageImproving,
+      candidateSide: side,
+    });
     let skipReason: string | undefined;
 
     if (denseCycleThrottle) {
@@ -4480,6 +4970,8 @@ function evaluateTemporalSingleLegSeed(
         skipReason = "protected_residual_overlap_seed_cost_basis_cap";
       } else if (sameSideOverlapAmplificationBlocked) {
         skipReason = "overlap_same_side_amplification";
+      } else if (seedRhythm.skipReason !== undefined) {
+        skipReason = seedRhythm.skipReason;
       } else if (state.consecutiveSeedSide === side && state.consecutiveSeedCount >= config.maxConsecutiveSingleLegSeedsPerSide) {
         skipReason = "temporal_seed_side_limit";
       } else if (initialSeedFilledSize <= 0 || executableSize <= 0) {
@@ -4526,13 +5018,13 @@ function evaluateTemporalSingleLegSeed(
       : undefined;
     if (skipReason === undefined && protectedResidualHighSideCompletion) {
       const imbalanceRatio = Math.abs(state.upShares - state.downShares) / Math.max(state.upShares + state.downShares, 1e-9);
-      if (executableSize > config.highSideCompletionMaxQty + 1e-9) {
+      if (!protectedCampaignResidualCompletion && executableSize > config.highSideCompletionMaxQty + 1e-9) {
         skipReason = "high_side_completion_qty_cap";
-      } else if (referencePairCost > config.highSideCompletionMaxCost + 1e-9) {
+      } else if (!protectedCampaignResidualCompletion && referencePairCost > config.highSideCompletionMaxCost + 1e-9) {
         skipReason = "high_side_completion_cost_cap";
-      } else if (config.highSideCompletionRequiresHardImbalance && imbalanceRatio < config.hardImbalanceRatio) {
+      } else if (!protectedCampaignResidualCompletion && config.highSideCompletionRequiresHardImbalance && imbalanceRatio < config.hardImbalanceRatio) {
         skipReason = "high_side_completion_imbalance";
-      } else if (config.highSideCompletionRequiresFairValue && !highSideCompletionFairValueDecision?.allowed) {
+      } else if (!protectedCampaignResidualCompletion && config.highSideCompletionRequiresFairValue && !highSideCompletionFairValueDecision?.allowed) {
         skipReason = "high_side_completion_fair_value";
       }
     }
@@ -4585,6 +5077,8 @@ function evaluateTemporalSingleLegSeed(
       fairValueDecision,
       classifierScore,
       skipReason,
+      ...(seedRhythm.waitSec !== undefined ? { xuanSeedRhythmWaitSec: seedRhythm.waitSec } : {}),
+      ...(seedRhythm.skipReason !== undefined ? { xuanSeedDelayedCount: 1 } : {}),
     };
   };
   const standardCandidates = (["UP", "DOWN"] as OutcomeSide[]).map((side) =>
@@ -4705,8 +5199,16 @@ function evaluateTemporalSingleLegSeed(
       ...(candidate.skipReason === "fresh_cycle_borderline_pair" ||
       candidate.skipReason === "fresh_cycle_bad_pair" ||
       candidate.skipReason === "opening_weak_pair_no_followup_plan" ||
-      candidate.skipReason === "early_mid_pair_repeat_fee_guard"
+      candidate.skipReason === "early_mid_pair_repeat_fee_guard" ||
+      candidate.skipReason === "xuan_seed_rhythm_wait" ||
+      candidate.skipReason === "xuan_seed_rhythm_same_side_wait"
         ? { cycleSkippedReason: candidate.skipReason }
+        : {}),
+      ...(candidate.xuanSeedRhythmWaitSec !== undefined
+        ? { xuanSeedRhythmWaitSec: normalizeTraceNumber(candidate.xuanSeedRhythmWaitSec) }
+        : {}),
+      ...(candidate.xuanSeedDelayedCount !== undefined
+        ? { xuanSeedDelayedCount: candidate.xuanSeedDelayedCount }
         : {}),
       negativeEdgeUsdc: candidate.negativeEdgeUsdc,
       orphanRisk: candidate.orphanRisk,
@@ -5162,30 +5664,132 @@ function inspectBalancedPairCandidates(
       upExecution.fullyFilled &&
       downExecution.fullyFilled &&
       terminalCarryProjection.allowed;
+    const postCompletionDebtCampaignOverride = shouldAllowPostCompletionDebtCampaignPairOverride({
+      config,
+      basketState,
+      allowance,
+      basketProjection,
+      terminalCarryProjection,
+      pairCost,
+      requestedSize,
+    });
+    const postCompletionDebtCampaignFairValueFallback =
+      postCompletionDebtCampaignOverride &&
+      fairValueReasons.length > 0 &&
+      fairValueReasons.every((reason) => reason === "fair_value_missing" || reason === "fair_value_missing_side");
+    const buyFillCount = state.fillHistory.filter((fill) => fill.side === "BUY").length;
+    const balancedMicroPairReady =
+      config.xuanMicroPairContinuationEnabled &&
+      config.botMode === "XUAN" &&
+      config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
+      buyFillCount < config.xuanMinFillCountForPass &&
+      secsToClose > config.finalWindowCompletionOnlySec &&
+      Math.abs(state.upShares - state.downShares) <= Math.max(config.postMergeFlatDustShares, 1e-6) + 1e-9 &&
+      mergeableShares(state) >= config.xuanBasketCampaignMinMatchedShares - 1e-9 &&
+      requestedSize <= Math.max(state.market.minOrderSize, config.xuanMicroPairMaxQty) + 1e-9 &&
+      upExecution.fullyFilled &&
+      downExecution.fullyFilled &&
+      basketProjection !== undefined &&
+      pairCost <= config.marketBasketContinuationMaxEffectivePair + 1e-9 &&
+      !allowance?.continuationRejectedReason?.startsWith("flow_shaping_") &&
+      !allowance?.continuationRejectedReason?.startsWith("avg_improving_") &&
+      !staleCheapOppositeQuote;
+    const xuanMicroPairContinuation =
+      balancedMicroPairReady &&
+      basketProjection.projectedEffectivePair <= config.xuanMicroPairProjectedEffectiveCap + 1e-9;
+    const xuanMicroPairProjectedTooExpensive =
+      balancedMicroPairReady &&
+      basketProjection.projectedEffectivePair > config.xuanMicroPairProjectedEffectiveCap + 1e-9;
+    const xuanBalancedPairContinuationOverride =
+      config.botMode === "XUAN" &&
+      config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
+      secsToClose > config.finalWindowCompletionOnlySec &&
+      Math.abs(state.upShares - state.downShares) <= Math.max(config.postMergeFlatDustShares, 1e-6) + 1e-9 &&
+      mergeableShares(state) >= config.xuanBasketCampaignMinMatchedShares - 1e-9 &&
+      upExecution.fullyFilled &&
+      downExecution.fullyFilled &&
+      !staleCheapOppositeQuote &&
+      (
+        xuanMicroPairContinuation ||
+        pairCost <= 1.01 + 1e-9 ||
+        (
+          basketProjection !== undefined &&
+          basketProjection.improvement >= config.marketBasketMinAvgImprovement - 1e-9 &&
+          basketProjection.projectedEffectivePair < basketState.basketEffectiveAvg - 1e-9
+        )
+      );
+    const effectiveFairValueAllowed =
+      fairValueAllowed || postCompletionDebtCampaignFairValueFallback || xuanBalancedPairContinuationOverride;
+    const selectedMode =
+      allowance?.mode ??
+      (terminalCarryPairOverride || postCompletionDebtCampaignOverride || xuanBalancedPairContinuationOverride
+        ? "XUAN_HARD_PAIR_SWEEP"
+        : undefined);
+    const highLowVisualPair = isHighLowVisualPair(config, upExecution.averagePrice, downExecution.averagePrice);
+    const avgImprovingHighLowContinuationAllowed =
+      allowance?.marketBasketContinuation === true &&
+      allowance.continuationClass === "AVG_IMPROVING" &&
+      (basketState.campaignActive || basketState.balancedButDebted);
+    const strictHighLowHardSweepBlocked =
+      highLowVisualPair &&
+      config.botMode === "XUAN" &&
+      (basketState.campaignActive || basketState.balancedButDebted) &&
+      pairCost > config.highLowDebtReducingEffectiveCap + 1e-9 &&
+      !terminalCarryPairOverride &&
+      !postCompletionDebtCampaignOverride &&
+      !xuanBalancedPairContinuationOverride &&
+      !avgImprovingHighLowContinuationAllowed;
+    const xuanBalancedPairFreshCycleBypass =
+      xuanBalancedPairContinuationOverride &&
+      (freshCycleSkipReason === "late_fresh_seed_cutoff" ||
+        (xuanMicroPairContinuation && freshCycleSkipReason === "fresh_cycle_bad_pair"));
     const effectiveFreshCycleSkipReason =
-      terminalCarryPairOverride || (allowance?.allowed === true && allowance.marketBasketContinuation === true)
+      terminalCarryPairOverride ||
+      postCompletionDebtCampaignOverride ||
+      xuanBalancedPairFreshCycleBypass ||
+      (allowance?.allowed === true && allowance.marketBasketContinuation === true)
         ? undefined
         : freshCycleSkipReason;
-    const orphanRiskAllowed = (upOrphanRisk.allowed && downOrphanRisk.allowed) || basketContinuationPairOverride;
-    const allowanceAllowed = Boolean(allowance?.allowed || terminalCarryPairOverride);
-    const selectedMode = allowance?.mode ?? (terminalCarryPairOverride ? "XUAN_HARD_PAIR_SWEEP" : undefined);
+    const orphanRiskAllowed =
+      (upOrphanRisk.allowed && downOrphanRisk.allowed) ||
+      basketContinuationPairOverride ||
+      postCompletionDebtCampaignOverride ||
+      xuanBalancedPairContinuationOverride;
+    const allowanceAllowed = Boolean(
+      allowance?.allowed ||
+      terminalCarryPairOverride ||
+      postCompletionDebtCampaignOverride ||
+      xuanBalancedPairContinuationOverride,
+    );
     const verdict =
       !upExecution.fullyFilled
         ? "up_depth"
         : !downExecution.fullyFilled
           ? "down_depth"
-          : allowanceAllowed && fairValueAllowed && !staleCheapOppositeQuote && orphanRiskAllowed && !effectiveFreshCycleSkipReason
+          : allowanceAllowed &&
+              effectiveFairValueAllowed &&
+              !staleCheapOppositeQuote &&
+              !strictHighLowHardSweepBlocked &&
+              orphanRiskAllowed &&
+              !effectiveFreshCycleSkipReason
             ? "ok"
-            : allowanceAllowed && fairValueAllowed && !staleCheapOppositeQuote && !effectiveFreshCycleSkipReason && !orphanRiskAllowed
+            : allowanceAllowed &&
+                effectiveFairValueAllowed &&
+                !staleCheapOppositeQuote &&
+                !strictHighLowHardSweepBlocked &&
+                !effectiveFreshCycleSkipReason &&
+                !orphanRiskAllowed
               ? "orphan_risk"
               : "pair_cap";
     const gateReason =
       verdict === "pair_cap"
-        ? effectiveFreshCycleSkipReason
-          ? effectiveFreshCycleSkipReason
+        ? strictHighLowHardSweepBlocked
+          ? "high_low_effective_not_debt_reducing"
+          : effectiveFreshCycleSkipReason
+            ? effectiveFreshCycleSkipReason
           : staleCheapOppositeQuote
           ? "pair_stale_cheap_quote"
-          : fairValueAllowed
+          : effectiveFairValueAllowed
           ? describePairGate(config, pairCost, requestedSize, allowance, secsToClose, cap)
           : upFairValue.reason ?? downFairValue.reason ?? "pair_fair_value"
         : verdict === "orphan_risk"
@@ -5236,9 +5840,18 @@ function inspectBalancedPairCandidates(
           }
         : {}),
       ...(allowance?.marketBasketBootstrap ? { marketBasketBootstrap: true } : {}),
-      ...(allowance?.marketBasketContinuation || terminalCarryPairOverride ? { marketBasketContinuation: true } : {}),
+      ...(allowance?.marketBasketContinuation ||
+      terminalCarryPairOverride ||
+      postCompletionDebtCampaignOverride ||
+      xuanBalancedPairContinuationOverride
+        ? { marketBasketContinuation: true }
+        : {}),
+      ...(xuanMicroPairContinuation ? { xuanMicroPairContinuation: true } : {}),
       ...(marketBasketContinuationFairValueFallback
         ? { fairValueFallbackReason: "market_basket_continuation" }
+        : {}),
+      ...(postCompletionDebtCampaignFairValueFallback
+        ? { fairValueFallbackReason: "post_completion_debt_campaign" }
         : {}),
       ...(basketState.balancedButDebted ? { balancedButDebted: true } : {}),
       ...(basketState.campaignActive
@@ -5262,6 +5875,9 @@ function inspectBalancedPairCandidates(
       ...(continuationRejectedReason ? { continuationRejectedReason } : {}),
       ...(continuationRejectedReason ? { cycleSkippedReason: continuationRejectedReason } : {}),
       ...(terminalCarryPairOverride ? { terminalCarryMode: true } : {}),
+      ...(xuanBalancedPairContinuationOverride
+        ? { fairValueFallbackReason: xuanMicroPairContinuation ? "xuan_micro_pair_continuation" : "xuan_balanced_pair_continuation" }
+        : {}),
       deltaTerminalMinPnl: terminalCarryProjection.deltaTerminalMinPnl,
       ...(terminalCarryProjection.deltaTerminalExpectedPnl !== undefined
         ? {
@@ -5292,10 +5908,13 @@ function inspectBalancedPairCandidates(
         : {}),
       ...(allowance?.campaignFlowCount !== undefined ? { campaignFlowCount: allowance.campaignFlowCount } : {}),
       ...(allowance?.campaignFlowTarget !== undefined ? { campaignFlowTarget: allowance.campaignFlowTarget } : {}),
-      ...(effectiveFreshCycleSkipReason && !continuationRejectedReason
-        ? { cycleSkippedReason: effectiveFreshCycleSkipReason }
-        : {}),
-      negativeEdgeUsdc: allowance?.negativeEdgeUsdc ?? 0,
+      ...(allowance?.postCompletionDebtRepairActive ? { postCompletionDebtRepairActive: true } : {}),
+      ...(xuanMicroPairProjectedTooExpensive
+          ? { cycleSkippedReason: "projected_basket_too_expensive" }
+        : effectiveFreshCycleSkipReason && !continuationRejectedReason
+          ? { cycleSkippedReason: effectiveFreshCycleSkipReason }
+          : {}),
+      negativeEdgeUsdc: terminalCarryPairOverride || xuanBalancedPairContinuationOverride ? 0 : allowance?.negativeEdgeUsdc ?? 0,
       verdict,
       ...(selectedMode ? { selectedMode } : {}),
       ...(gateReason ? { gateReason } : {}),
@@ -5328,10 +5947,22 @@ function inspectBalancedPairCandidates(
               marketBasketDebtDeltaUSDC: basketProjection.debtDeltaUSDC,
             }
           : {}),
-        ...(allowance!.marketBasketBootstrap ? { marketBasketBootstrap: true } : {}),
-        ...(allowance?.marketBasketContinuation || terminalCarryPairOverride ? { marketBasketContinuation: true } : {}),
+        ...(allowance?.marketBasketBootstrap ? { marketBasketBootstrap: true } : {}),
+      ...(allowance?.marketBasketContinuation ||
+        terminalCarryPairOverride ||
+        postCompletionDebtCampaignOverride ||
+        xuanBalancedPairContinuationOverride
+          ? { marketBasketContinuation: true }
+          : {}),
+        ...(xuanMicroPairContinuation ? { xuanMicroPairContinuation: true } : {}),
         ...(marketBasketContinuationFairValueFallback
           ? { fairValueFallbackReason: "market_basket_continuation" }
+          : {}),
+        ...(postCompletionDebtCampaignFairValueFallback
+          ? { fairValueFallbackReason: "post_completion_debt_campaign" }
+          : {}),
+        ...(xuanBalancedPairContinuationOverride
+          ? { fairValueFallbackReason: xuanMicroPairContinuation ? "xuan_micro_pair_continuation" : "xuan_balanced_pair_continuation" }
           : {}),
         ...(basketState.balancedButDebted ? { balancedButDebted: true } : {}),
         ...(basketState.campaignActive
@@ -5384,11 +6015,15 @@ function inspectBalancedPairCandidates(
           : {}),
         ...(allowance?.campaignFlowCount !== undefined ? { campaignFlowCount: allowance.campaignFlowCount } : {}),
         ...(allowance?.campaignFlowTarget !== undefined ? { campaignFlowTarget: allowance.campaignFlowTarget } : {}),
+        ...(allowance?.postCompletionDebtRepairActive ? { postCompletionDebtRepairActive: true } : {}),
         feeUSDC: cycleTrace.feeUSDC,
         expectedNetIfMerged: cycleTrace.expectedNetIfMerged,
         cycleQualityLabel: cycleTrace.cycleQualityLabel,
         mode: selectedMode!,
-        negativeEdgeUsdc: terminalCarryPairOverride ? 0 : allowance!.negativeEdgeUsdc,
+        negativeEdgeUsdc:
+          terminalCarryPairOverride || xuanBalancedPairContinuationOverride
+            ? 0
+            : allowance?.negativeEdgeUsdc ?? 0,
         upExecution,
         downExecution,
       };
@@ -5950,6 +6585,7 @@ function evaluateSingleLegSeed(
       skipReason === "flow_shaping_budget_exhausted" ||
       skipReason === "flow_shaping_qty_cap" ||
       skipReason === "debt_reducing_qty_cap" ||
+      skipReason === "high_low_effective_not_debt_reducing" ||
       skipReason === "continuation_not_debt_reducing_or_avg_improving" ||
       skipReason === "market_basket_continuation_rejected"
         ? { cycleSkippedReason: skipReason }
@@ -6123,6 +6759,7 @@ function determineBalancedPairSkipReason(
   if (gateReasons.has("pair_daily_budget")) return "pair_daily_budget";
   if (gateReasons.has("pair_qty_limit")) return "pair_qty_limit";
   if (gateReasons.has("pair_time_gate")) return "pair_time_gate";
+  if (gateReasons.has("high_low_effective_not_debt_reducing")) return "high_low_effective_not_debt_reducing";
   if ([...gateReasons].some((reason) => reason.includes("orphan"))) return "orphan_risk";
 
   const hasPairCap = traces.some((trace) => trace.verdict === "pair_cap");

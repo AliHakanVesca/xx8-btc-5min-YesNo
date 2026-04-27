@@ -13,6 +13,7 @@ import {
 import {
   countActiveIndependentFlowCount,
   countRecentSeedFlowCount,
+  plannedOppositeCompletionState,
   type XuanMarketState,
 } from "./marketState.js";
 import { OrderBookState } from "./orderBookState.js";
@@ -77,6 +78,13 @@ export interface CompletionDecision {
   microRepairMaxQty?: number;
   residualCompletionFairValueFallback?: boolean;
   residualCompletionFallbackReason?: string;
+  plannedOppositeSide?: OutcomeSide;
+  plannedOppositeQty?: number;
+  plannedOppositeFilledQty?: number;
+  plannedOppositeMissingQty?: number;
+  plannedOppositeAgeSec?: number;
+  plannedOppositeCompletionAttemptCount?: number;
+  plannedOppositeCompletionOpenedCount?: number;
   overlapRepairArbitration?: "no_overlap_lock" | "standard_pair_reentry" | "favor_independent_overlap" | "favor_residual_repair";
   arbitrationOutcome?: "completion" | "hold";
 }
@@ -177,6 +185,20 @@ function chooseCompletion(
 
   const oldGap = absoluteShareGap(state);
   const leadingSide: OutcomeSide = sideToBuy === "UP" ? "DOWN" : "UP";
+  const plannedOpposite = plannedOppositeCompletionState(
+    state,
+    ctx.nowTs ?? state.market.startTs,
+    Math.max(config.postMergeFlatDustShares, 1e-6),
+  );
+  const plannedOppositeMaterialQty = Math.max(
+    config.controlledOverlapMinResidualShares,
+    config.microRepairMaxQty + state.market.minOrderSize,
+  );
+  const plannedOppositeDutyActive =
+    plannedOpposite !== undefined &&
+    plannedOpposite.plannedOppositeSide === sideToBuy &&
+    plannedOpposite.plannedOppositeMissingQty >= plannedOppositeMaterialQty - 1e-9 &&
+    plannedOpposite.plannedLowSideAvg <= config.lowSideMaxForHighCompletion + 1e-9;
   const recentSeedFlowCount =
     ctx.recentSeedFlowCount ??
     (ctx.nowTs !== undefined ? countRecentSeedFlowCount(state.fillHistory, ctx.nowTs) : 0);
@@ -279,6 +301,8 @@ function chooseCompletion(
     unbalancedCampaignResidual && !exactCompletionQtyPrior
       ? resolveCampaignCompletionSizing(config, missingShares)
       : undefined;
+  const orphanCompletionDutyActive =
+    unbalancedCampaignResidual && mergeableShares(state) < config.xuanBasketCampaignMinMatchedShares - 1e-9;
   const phaseMaxQty =
     exactCompletionQtyPrior && Number.isFinite(phase.maxQty)
       ? Math.max(phase.maxQty, exactCompletionQtyPrior.qty)
@@ -356,6 +380,38 @@ function chooseCompletion(
     }
 
     const costWithFees = completionCost(existingAverage, execution.averagePrice, config.cryptoTakerFeeRate);
+    const plannedOppositeCandidate =
+      plannedOppositeDutyActive &&
+      plannedOpposite !== undefined &&
+      candidateSize <= plannedOpposite.plannedOppositeMissingQty + config.maxCompletionOvershootShares + 1e-9;
+    const plannedOppositeCompletionAllowed =
+      plannedOppositeCandidate &&
+      ctx.secsToClose > config.finalWindowNoChaseSec &&
+      costWithFees <= 1.025 + 1e-9;
+    const plannedOppositeDebtReducing =
+      plannedOppositeCandidate &&
+      costWithFees <= config.marketBasketGoodAvgCap + 1e-9;
+    const expensiveCampaignCompletionThreshold = Math.max(1.045, config.fullRebalanceOnlyIfEffectivePairBelow);
+    const expensiveCampaignPartialHedgeMaxQty =
+      unbalancedCampaignResidual &&
+      !plannedOppositeCompletionAllowed &&
+      !exactCompletionQtyPrior &&
+      costWithFees > expensiveCampaignCompletionThreshold + 1e-9 &&
+      oldGap > config.completionMinQty + 1e-9
+        ? Math.max(
+            config.completionMinQty,
+            Math.min(
+              oldGap,
+              oldGap * Math.max(0.1, Math.min(config.initialDebtyCampaignMaxHedgeRatio, 0.65)),
+            ),
+          )
+        : undefined;
+    if (
+      expensiveCampaignPartialHedgeMaxQty !== undefined &&
+      candidateSize > expensiveCampaignPartialHedgeMaxQty + config.maxCompletionOvershootShares + 1e-9
+    ) {
+      continue;
+    }
     const marketBasketProjection = projectMarketBasketCompletion({
       config,
       state,
@@ -380,6 +436,7 @@ function chooseCompletion(
     if (
       candidateSize > campaignPhaseMaxQty &&
       !marketBasketProjection?.phaseMaxOverrideAllowed &&
+      !plannedOppositeCompletionAllowed &&
       !temporalCostReducingPhaseOverride
     ) {
       continue;
@@ -399,6 +456,8 @@ function chooseCompletion(
       executableSize: candidateSize,
       oldGap,
       newGap: projectedGap,
+      orphanCompletionDutyActive,
+      phaseCap: phase.cap,
     });
     const temporalOrphanFallback = temporalSingleLegOrphanCompletionFallback({
       config,
@@ -424,7 +483,8 @@ function chooseCompletion(
     if (earlyTemporalCompletionWait) {
       continue;
     }
-    const campaignPhaseCapOverride = campaignResidualFallback.allowed || temporalOrphanFallback.allowed;
+    const campaignPhaseCapOverride =
+      campaignResidualFallback.allowed || temporalOrphanFallback.allowed || plannedOppositeCompletionAllowed;
     if (
       costWithFees > phase.cap &&
       !highLowPhaseCapOverride &&
@@ -448,7 +508,7 @@ function chooseCompletion(
               config.allowStrictResidualCompletionWithoutFairValue &&
               costWithFees <= config.strictResidualCompletionCap
             ) || Boolean(allowance.requiresFairValue);
-    const fairValueDecision = ultraFastCloneFairValueFallback || campaignResidualFallback.allowed || temporalOrphanFallback.allowed
+    const fairValueDecision = ultraFastCloneFairValueFallback || campaignResidualFallback.allowed || temporalOrphanFallback.allowed || plannedOppositeCompletionAllowed
       ? { allowed: true as const }
       : fairValueGate({
           config,
@@ -521,13 +581,13 @@ function chooseCompletion(
         ? { completionPatienceMultiplier: ctx.completionPatienceMultiplier }
         : {}),
     });
-    if (!allowance.allowed && !temporalOrphanFallback.allowed) {
+    if (!allowance.allowed && !temporalOrphanFallback.allowed && !plannedOppositeCompletionAllowed) {
       continue;
     }
-    if (highSideQualitySkipReason && !temporalOrphanFallback.allowed) {
+    if (highSideQualitySkipReason && !temporalOrphanFallback.allowed && !campaignResidualFallback.allowed && !plannedOppositeCompletionAllowed) {
       continue;
     }
-    if (qualitySkipReason && !temporalOrphanFallback.allowed) {
+    if (qualitySkipReason && !temporalOrphanFallback.allowed && !campaignResidualFallback.allowed && !plannedOppositeCompletionAllowed) {
       continue;
     }
     if (
@@ -541,8 +601,8 @@ function chooseCompletion(
         exceptionalMode:
           Boolean(allowance.highLowMismatch) ||
           cheapLateCompletionChase ||
-          campaignResidualFallback.allowed ||
-          temporalOrphanFallback.allowed,
+          temporalOrphanFallback.allowed ||
+          plannedOppositeCompletionAllowed,
         recentSeedFlowCount,
         activeIndependentFlowCount,
         flowPressureState,
@@ -554,6 +614,7 @@ function chooseCompletion(
       !fairValueDecision.allowed &&
       !campaignResidualFallback.allowed &&
       !temporalOrphanFallback.allowed &&
+      !plannedOppositeCompletionAllowed &&
       (phase.requiresFairValue || phase.mode === "POST_MERGE_RESIDUAL_COMPLETION")
     ) {
       continue;
@@ -562,11 +623,17 @@ function chooseCompletion(
       !fairValueDecision.allowed &&
       !campaignResidualFallback.allowed &&
       !temporalOrphanFallback.allowed &&
+      !plannedOppositeCompletionAllowed &&
       phase.mode !== "POST_MERGE_RESIDUAL_COMPLETION"
     ) {
       continue;
     }
-    if (completionDelayProfile.shouldDelay && !campaignResidualFallback.allowed && !temporalOrphanFallback.allowed) {
+    if (
+      completionDelayProfile.shouldDelay &&
+      !campaignResidualFallback.allowed &&
+      !temporalOrphanFallback.allowed &&
+      !plannedOppositeCompletionAllowed
+    ) {
       continue;
     }
 
@@ -614,7 +681,9 @@ function chooseCompletion(
     }
 
     const selectedMode: StrategyExecutionMode =
-      allowance.highLowMismatch && allowance.allowed
+      plannedOppositeCompletionAllowed && (allowance.highLowMismatch || plannedOppositeDebtReducing)
+        ? "HIGH_LOW_COMPLETION_CHASE"
+        : allowance.highLowMismatch && allowance.allowed
         ? "HIGH_LOW_COMPLETION_CHASE"
         : cheapLateCompletionChase
           ? "CHEAP_LATE_COMPLETION_CHASE"
@@ -683,6 +752,22 @@ function chooseCompletion(
             ...(temporalOrphanFallback.reason
               ? { residualCompletionFallbackReason: temporalOrphanFallback.reason }
               : {}),
+          }
+        : {}),
+      ...(plannedOppositeCompletionAllowed && plannedOpposite
+        ? {
+            campaignMode: "RESIDUAL_COMPLETION_ACTIVE",
+            residualCompletionFairValueFallback: true,
+            residualCompletionFallbackReason: plannedOppositeDebtReducing
+              ? "planned_opposite_debt_reducing"
+              : "planned_opposite_completion",
+            plannedOppositeSide: plannedOpposite.plannedOppositeSide,
+            plannedOppositeQty: plannedOpposite.plannedOppositeQty,
+            plannedOppositeFilledQty: plannedOpposite.plannedOppositeFilledQty,
+            plannedOppositeMissingQty: plannedOpposite.plannedOppositeMissingQty,
+            plannedOppositeAgeSec: plannedOpposite.plannedOppositeAgeSec,
+            plannedOppositeCompletionAttemptCount: 1,
+            plannedOppositeCompletionOpenedCount: 1,
           }
         : {}),
       overlapRepairArbitration,
@@ -984,7 +1069,11 @@ function shouldDeferNibbleCompletionUnderFlowPressure(args: {
   if (!denseRecentFlow && !independentFlowPressure) {
     return false;
   }
-  if (!args.flowPressureState.supportive || args.flowPressureState.remainingBudget < 0.3) {
+  const confirmedMultiFlowPressure = denseRecentFlow && independentFlowPressure;
+  if (
+    !confirmedMultiFlowPressure &&
+    (!args.flowPressureState.supportive || args.flowPressureState.remainingBudget < 0.3)
+  ) {
     return false;
   }
   const leavesMaterialResidual = args.residualAfter >= args.config.completionMinQty * 2;
@@ -1016,12 +1105,11 @@ function isUnbalancedCampaignResidual(
     !config.xuanBasketCampaignEnabled ||
     !config.marketBasketContinuationEnabled ||
     config.xuanCloneMode !== "PUBLIC_FOOTPRINT" ||
-    shareGap <= Math.max(config.repairMinQty, config.completionMinQty) + 1e-9 ||
-    mergeableShares(state) < config.xuanBasketCampaignMinMatchedShares - 1e-9
+    shareGap <= Math.max(config.controlledOverlapMinResidualShares, config.microRepairMaxQty) + 1e-9
   ) {
     return false;
   }
-  return state.fillHistory.some(
+  const hasCampaignSeed = state.fillHistory.some(
     (fill) =>
       fill.side === "BUY" &&
       (
@@ -1032,6 +1120,13 @@ function isUnbalancedCampaignResidual(
         fill.executionMode === "STRICT_PAIR_SWEEP"
       ),
   );
+  const matchedQty = mergeableShares(state);
+  if (matchedQty < config.xuanBasketCampaignMinMatchedShares - 1e-9) {
+    return state.fillHistory.some(
+      (fill) => fill.side === "BUY" && fill.executionMode === "PAIRGROUP_COVERED_SEED",
+    );
+  }
+  return hasCampaignSeed;
 }
 
 function residualCompletionFairValueFallback(args: {
@@ -1043,6 +1138,8 @@ function residualCompletionFairValueFallback(args: {
   executableSize: number;
   oldGap: number;
   newGap: number;
+  orphanCompletionDutyActive?: boolean | undefined;
+  phaseCap?: number | undefined;
 }): { allowed: boolean; reason?: string | undefined } {
   if (
     !args.config.allowResidualCompletionWithoutFairValue ||
@@ -1055,6 +1152,25 @@ function residualCompletionFairValueFallback(args: {
   }
   if (args.repairCost <= args.config.residualCompletionCostBasisCap + 1e-9) {
     return { allowed: true, reason: "residual_cost_basis_cap" };
+  }
+  const hasTemporalSingleLegSeed = args.state.fillHistory.some(
+    (fill) => fill.executionMode === "TEMPORAL_SINGLE_LEG_SEED" || fill.executionMode === "PAIRGROUP_COVERED_SEED",
+  );
+  if (
+    args.config.botMode === "XUAN" &&
+    args.config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
+    hasTemporalSingleLegSeed &&
+    args.orphanCompletionDutyActive &&
+    args.repairCost <= Math.max(args.config.softResidualCompletionCap, args.config.temporalRepairPatientCap) + 1e-9
+  ) {
+    return { allowed: true, reason: "xuan_orphan_seed_completion_priority" };
+  }
+  if (
+    args.orphanCompletionDutyActive &&
+    args.phaseCap !== undefined &&
+    args.repairCost <= Math.max(args.phaseCap, args.config.softResidualCompletionCap) + 1e-9
+  ) {
+    return { allowed: true, reason: "orphan_seed_completion_duty" };
   }
   if (
     Number.isFinite(args.currentMatchedEffectivePair) &&
@@ -1090,10 +1206,10 @@ function temporalSingleLegOrphanCompletionFallback(args: {
     return { allowed: false };
   }
 
-  const hasTemporalOrphan = (args.leadingSide === "UP" ? args.state.upLots : args.state.downLots).some(
-    (lot) => lot.executionMode === "TEMPORAL_SINGLE_LEG_SEED",
+  const hasTemporalOrStagedOrphan = (args.leadingSide === "UP" ? args.state.upLots : args.state.downLots).some(
+    (lot) => lot.executionMode === "TEMPORAL_SINGLE_LEG_SEED" || lot.executionMode === "PAIRGROUP_COVERED_SEED",
   );
-  if (!hasTemporalOrphan) {
+  if (!hasTemporalOrStagedOrphan) {
     return { allowed: false };
   }
 
@@ -1102,10 +1218,13 @@ function temporalSingleLegOrphanCompletionFallback(args: {
     return { allowed: false };
   }
 
-  const minReleaseAgeSec = Math.max(
-    args.config.xuanTemporalCompletionMinAgeSec,
-    Math.min(args.config.completionUrgencyPatientSec, args.config.completionTargetMaxDelaySec),
-  );
+  const minReleaseAgeSec =
+    args.config.xuanCloneMode === "PUBLIC_FOOTPRINT"
+      ? args.config.xuanTemporalCompletionMinAgeSec
+      : Math.max(
+          args.config.xuanTemporalCompletionMinAgeSec,
+          Math.min(args.config.completionUrgencyPatientSec, args.config.completionTargetMaxDelaySec),
+        );
   if (args.partialAgeSec < minReleaseAgeSec) {
     return { allowed: false };
   }

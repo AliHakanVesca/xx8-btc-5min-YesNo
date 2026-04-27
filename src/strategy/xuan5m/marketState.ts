@@ -56,6 +56,66 @@ export interface XuanMarketState {
   postMergeCompletionOnlyUntil?: number | undefined;
 }
 
+export interface PlannedOppositeCompletionState {
+  plannedOppositeSide: OutcomeSide;
+  plannedOppositeQty: number;
+  plannedOppositeFilledQty: number;
+  plannedOppositeMissingQty: number;
+  plannedOppositeAgeSec: number;
+  plannedPairGroupOpenedAt: number;
+  plannedLowSideAvg: number;
+}
+
+function normalizeTraceNumber(value: number): number {
+  return Number(value.toFixed(6));
+}
+
+function oppositeSide(side: OutcomeSide): OutcomeSide {
+  return side === "UP" ? "DOWN" : "UP";
+}
+
+export function plannedOppositeCompletionState(
+  state: XuanMarketState,
+  nowTs: number,
+  dustShares = 1e-6,
+): PlannedOppositeCompletionState | undefined {
+  const candidates = (["UP", "DOWN"] as OutcomeSide[])
+    .map((side) => {
+      const lots = side === "UP" ? state.upLots : state.downLots;
+      const stagedLots = lots.filter((lot) => lot.executionMode === "PAIRGROUP_COVERED_SEED");
+      const plannedQty = stagedLots.reduce((sum, lot) => sum + lot.size, 0);
+      if (plannedQty <= dustShares || stagedLots.length === 0) {
+        return undefined;
+      }
+      const plannedCost = stagedLots.reduce((sum, lot) => sum + lot.size * lot.price, 0);
+      const openedAt = Math.min(...stagedLots.map((lot) => lot.timestamp));
+      const opposite = oppositeSide(side);
+      const oppositeLots = opposite === "UP" ? state.upLots : state.downLots;
+      const oppositeShares = oppositeLots
+        .filter((lot) => lot.timestamp >= openedAt && lot.executionMode === "HIGH_LOW_COMPLETION_CHASE")
+        .reduce((sum, lot) => sum + lot.size, 0);
+      const sameShares = side === "UP" ? state.upShares : state.downShares;
+      const existingOppositeCoverage = Math.min(oppositeShares, plannedQty);
+      const missingQty = Math.max(0, Math.min(plannedQty, sameShares) - existingOppositeCoverage);
+      if (missingQty <= dustShares) {
+        return undefined;
+      }
+      return {
+        plannedOppositeSide: opposite,
+        plannedOppositeQty: normalizeTraceNumber(plannedQty),
+        plannedOppositeFilledQty: normalizeTraceNumber(existingOppositeCoverage),
+        plannedOppositeMissingQty: normalizeTraceNumber(missingQty),
+        plannedOppositeAgeSec: normalizeTraceNumber(Math.max(0, nowTs - openedAt)),
+        plannedPairGroupOpenedAt: openedAt,
+        plannedLowSideAvg: normalizeTraceNumber(plannedCost / plannedQty),
+      };
+    })
+    .filter((item): item is PlannedOppositeCompletionState => item !== undefined)
+    .sort((left, right) => right.plannedOppositeMissingQty - left.plannedOppositeMissingQty);
+
+  return candidates[0];
+}
+
 function isRecentSeedFill(fill: FillRecord, nowTs: number, windowSec: number): boolean {
   return (
     fill.side === "BUY" &&

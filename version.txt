@@ -1,6 +1,16 @@
 
 ##############################################
 
+Version : V.0.0.37
+Date    : 27.04.2026
+Author  : Ali Hakan Çakır
+Changes : - Planned opposite completion ve campaign duty runtime akislari eklendi.
+          - XUAN campaign continuation ve merge davranisi test kapsami genisletildi.
+
+##############################################
+
+##############################################
+
 Version : V.0.0.36
 Date    : 27.04.2026
 Author  : Ali Hakan Çakır

@@ -1,6 +1,6 @@
 import type { XuanStrategyConfig } from "../../config/strategyPresets.js";
 import { imbalance, matchedEffectivePairCost, mergeableShares } from "./inventoryState.js";
-import type { XuanMarketState } from "./marketState.js";
+import { plannedOppositeCompletionState, type XuanMarketState } from "./marketState.js";
 import { resolveBundledMergeClusterPrior, resolveBundledMergeTimingPrior } from "../../analytics/xuanExactReference.js";
 import { classifyFlowPressureBudget, type FlowPressureBudgetState } from "./modePolicy.js";
 
@@ -38,6 +38,7 @@ export interface MergeGateDecision extends MergeBatchMetrics {
     | "cluster_window"
     | "public_footprint_hold"
     | "basket_debt_hold"
+    | "planned_opposite_hold"
     | "cycle_target"
     | "basket_target"
     | "age_target"
@@ -153,6 +154,7 @@ export function evaluateDelayedMergeGate(
     | "minCompletedCyclesBeforeFirstMerge"
     | "minFirstMatchedAgeBeforeMergeSec"
     | "maxMatchedAgeBeforeForcedMergeSec"
+    | "xuanRhythmMaxWaitSec"
     | "requireMinAgeForCycleTargetMerge"
     | "mergeShieldSecFromOpen"
     | "forceMergeInLast30S"
@@ -214,6 +216,10 @@ export function evaluateDelayedMergeGate(
   const maxMatchedAgeBeforeForcedMergeSec = exactTimingPrior
     ? Math.min(config.maxMatchedAgeBeforeForcedMergeSec, exactTimingPrior.forcedAgeSec)
     : config.maxMatchedAgeBeforeForcedMergeSec;
+  const debtPositiveMaxHoldSec =
+    config.xuanCloneMode === "PUBLIC_FOOTPRINT"
+      ? Math.max(config.xuanRhythmMaxWaitSec * 2, config.finalWindowCompletionOnlySec)
+      : config.maxMatchedAgeBeforeForcedMergeSec;
   const flowPressureState =
     args.flowPressureState ??
     classifyFlowPressureBudget({
@@ -274,6 +280,27 @@ export function evaluateDelayedMergeGate(
     config.marketBasketScoringEnabled && metrics.pendingMatchedQty > 1e-6
       ? matchedEffectivePairCost(state, config.cryptoTakerFeeRate)
       : undefined;
+  const plannedOpposite = plannedOppositeCompletionState(
+    state,
+    args.nowTs,
+    Math.max(config.marketBasketMinMergeShares * 0.01, 1e-6),
+  );
+  const plannedOppositeHoldActive =
+    publicFootprintHoldWithoutPrior &&
+    plannedOpposite !== undefined &&
+    plannedOpposite.plannedOppositeMissingQty >= Math.max(state.market.minOrderSize, config.marketBasketMinMergeShares * 0.1) - 1e-9 &&
+    args.secsToClose > config.finalWindowCompletionOnlySec;
+
+  if (plannedOppositeHoldActive) {
+    return {
+      allow: false,
+      forced: false,
+      reason: "planned_opposite_hold",
+      mergeVsCarryDecision: "CARRY_TO_SETTLEMENT",
+      mergeVsCarryReason: "merge_held_for_planned_opposite_completion",
+      ...metrics,
+    };
+  }
 
   if (config.forceMergeOnHardImbalance && imbalance(state) >= config.hardImbalanceRatio) {
     const hardImbalanceShareGap = Math.abs(state.upShares - state.downShares);
@@ -350,23 +377,6 @@ export function evaluateDelayedMergeGate(
     const debtPositiveFinalWindow =
       basketEffectivePair !== undefined &&
       basketEffectivePair > config.marketBasketMergeEffectivePairCap + 1e-9;
-    const shouldCarrySmallDebtPositiveBasket =
-      publicFootprintHoldWithoutPrior &&
-      debtPositiveFinalWindow &&
-      metrics.pendingMatchedQty < basketMergeTargetShares - 1e-9 &&
-      args.usdcBalance >= config.minUsdcBalanceForNewEntry &&
-      imbalance(state) < config.hardImbalanceRatio;
-    if (shouldCarrySmallDebtPositiveBasket) {
-      return {
-        allow: false,
-        forced: false,
-        reason: "basket_debt_hold",
-        ...(basketEffectivePair !== undefined ? { basketEffectivePair: normalize(basketEffectivePair) } : {}),
-        mergeVsCarryDecision: "CARRY_TO_SETTLEMENT",
-        mergeVsCarryReason: "small_debt_positive_basket_below_xuan_merge_target",
-        ...metrics,
-      };
-    }
     return {
       allow: true,
       forced: true,
@@ -407,7 +417,7 @@ export function evaluateDelayedMergeGate(
     metrics.oldestMatchedAgeSec !== undefined &&
     metrics.oldestMatchedAgeSec >= maxMatchedAgeBeforeForcedMergeSec
   ) {
-    if (basketDebtHoldActive) {
+    if (basketDebtHoldActive && metrics.oldestMatchedAgeSec < debtPositiveMaxHoldSec) {
       return {
         allow: false,
         forced: false,
@@ -415,7 +425,7 @@ export function evaluateDelayedMergeGate(
         ...metrics,
       };
     }
-    if (forcedAgePublicFootprintBasketHold) {
+    if (forcedAgePublicFootprintBasketHold && metrics.oldestMatchedAgeSec < debtPositiveMaxHoldSec) {
       return {
         allow: false,
         forced: false,

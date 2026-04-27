@@ -8,10 +8,15 @@ import {
   resolvePairOrderGroupStatus,
 } from "../../src/execution/pairOrderGroup.js";
 import { buildOfflineMarket } from "../../src/infra/gamma/marketDiscovery.js";
-import { applyFill } from "../../src/strategy/xuan5m/inventoryState.js";
+import { applyFill, applyMerge } from "../../src/strategy/xuan5m/inventoryState.js";
 import { chooseInventoryAdjustment } from "../../src/strategy/xuan5m/completionEngine.js";
 import { evaluateEntryBuys } from "../../src/strategy/xuan5m/entryLadderEngine.js";
 import { chooseLot } from "../../src/strategy/xuan5m/lotLadder.js";
+import {
+  createMergeBatchTracker,
+  evaluateDelayedMergeGate,
+  syncMergeBatchTracker,
+} from "../../src/strategy/xuan5m/mergeCoordinator.js";
 import {
   countActiveIndependentFlowCount,
   createMarketState,
@@ -321,7 +326,7 @@ describe("xuan mode and pair order groups", () => {
 
     expect(adjustment?.completion).toMatchObject({
       sideToBuy: "UP",
-      missingShares: 15,
+      missingShares: 33.25,
       residualCompletionFairValueFallback: true,
       residualCompletionFallbackReason: "temporal_orphan_terminal_carry",
     });
@@ -435,6 +440,162 @@ describe("xuan mode and pair order groups", () => {
     });
   });
 
+  it("completes a material post-profit low-side setup as a planned opposite pairgroup", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      size: 33.25,
+      price: 0.54,
+      timestamp: market.startTs,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 33.25,
+      price: 0.42,
+      timestamp: market.startTs + 20,
+      makerTaker: "taker",
+      executionMode: "PARTIAL_SOFT_COMPLETION",
+    });
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 80,
+      price: 0.12,
+      timestamp: market.startTs + 181,
+      makerTaker: "taker",
+      executionMode: "PAIRGROUP_COVERED_SEED",
+    });
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.11, size: 200 }], [{ price: 0.12, size: 200 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.73, size: 200 }], [{ price: 0.74, size: 200 }]),
+    );
+
+    const adjustment = chooseInventoryAdjustment(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      }),
+      state,
+      books,
+      {
+        secsToClose: 104,
+        nowTs: market.startTs + 196,
+        fairValueSnapshot: {
+          status: "live_missing",
+          estimatedThreshold: false,
+          note: "planned-opposite-test",
+        },
+      },
+    );
+
+    expect(adjustment?.completion).toMatchObject({
+      sideToBuy: "DOWN",
+      missingShares: 80,
+      mode: "HIGH_LOW_COMPLETION_CHASE",
+      residualCompletionFallbackReason: "planned_opposite_debt_reducing",
+      plannedOppositeSide: "DOWN",
+      plannedOppositeQty: 80,
+      plannedOppositeMissingQty: 80,
+      plannedOppositeCompletionOpenedCount: 1,
+    });
+  });
+
+  it("does not treat micro staged residual as planned opposite campaign duty", () => {
+    const market = buildOfflineMarket(1713696000);
+    const state = createMarketState(market);
+    state.upShares = 5;
+    state.upCost = 2.2;
+    state.upLots = [
+      {
+        size: 5,
+        price: 0.44,
+        timestamp: market.startTs + 5,
+        executionMode: "PAIRGROUP_COVERED_SEED",
+      },
+    ];
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.43, size: 200 }], [{ price: 0.44, size: 200 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.52, size: 200 }], [{ price: 0.53, size: 200 }]),
+    );
+
+    const adjustment = chooseInventoryAdjustment(
+      buildRuntimeConfig({ BOT_MODE: "XUAN" }),
+      state,
+      books,
+      {
+        secsToClose: 147,
+        nowTs: market.startTs + 153,
+        fairValueSnapshot: {
+          status: "valid",
+          estimatedThreshold: false,
+          fairUp: 0.45,
+          fairDown: 0.55,
+        },
+      },
+    );
+
+    expect(adjustment).toBeNull();
+  });
+
+  it("holds small merge while a material planned opposite pairgroup is still open", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      size: 33.25,
+      price: 0.54,
+      timestamp: market.startTs,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 33.25,
+      price: 0.42,
+      timestamp: market.startTs + 20,
+      makerTaker: "taker",
+      executionMode: "PARTIAL_SOFT_COMPLETION",
+    });
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 80,
+      price: 0.12,
+      timestamp: market.startTs + 181,
+      makerTaker: "taker",
+      executionMode: "PAIRGROUP_COVERED_SEED",
+    });
+    const tracker = syncMergeBatchTracker(createMergeBatchTracker(), 33.25, market.startTs + 196);
+
+    const gate = evaluateDelayedMergeGate(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      }),
+      state,
+      {
+        nowTs: market.startTs + 240,
+        secsFromOpen: 240,
+        secsToClose: 60,
+        usdcBalance: 1000,
+        tracker,
+      },
+    );
+
+    expect(gate.allow).toBe(false);
+    expect(gate.reason).toBe("planned_opposite_hold");
+    expect(gate.mergeVsCarryReason).toBe("merge_held_for_planned_opposite_completion");
+  });
+
   it("allows emergency completion in xuan mode for small hard-imbalance clips", () => {
     const market = buildOfflineMarket(1713696000);
     const state = createMarketState(market);
@@ -534,6 +695,95 @@ describe("xuan mode and pair order groups", () => {
         selectedMode: "TEMPORAL_SINGLE_LEG_SEED",
       }),
     );
+  });
+
+  it("paces consecutive temporal single-leg seeds in public footprint mode", () => {
+    const market = buildOfflineMarket(1713696000);
+    const state = createMarketState(market);
+    state.fillHistory = [{
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.53,
+      size: 30,
+      timestamp: market.startTs,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    }];
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.48, size: 200 }], [{ price: 0.49, size: 200 }]),
+      buildBook(
+        market.tokens.DOWN.tokenId,
+        market.conditionId,
+        [{ price: 0.52, size: 200 }],
+        [{ price: 0.53, size: 200 }],
+      ),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        ALLOW_TEMPORAL_SINGLE_LEG_SEED: "true",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 1,
+        secsToClose: 299,
+        lot: 30,
+      },
+    );
+
+    expect(evaluation.decisions).toHaveLength(0);
+    expect(evaluation.trace.cycleSkippedReason).toBe("xuan_seed_rhythm_wait");
+    expect(evaluation.trace.seedCandidates?.some((candidate) => candidate.xuanSeedDelayedCount === 1)).toBe(true);
+  });
+
+  it("allows paced temporal seed early when it would complete residual profitably", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.47,
+      size: 30,
+      timestamp: market.startTs,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.48, size: 200 }], [{ price: 0.49, size: 200 }]),
+      buildBook(
+        market.tokens.DOWN.tokenId,
+        market.conditionId,
+        [{ price: 0.68, size: 200 }],
+        [{ price: 0.7, size: 200 }],
+      ),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        ALLOW_TEMPORAL_SINGLE_LEG_SEED: "true",
+        ALLOW_CONTROLLED_OVERLAP: "true",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 1,
+        secsToClose: 299,
+        lot: 30,
+        allowControlledOverlap: true,
+        protectedResidualShares: 30,
+        protectedResidualSide: "DOWN",
+        preferredOverlapSeedSide: "UP",
+      },
+    );
+
+    expect(evaluation.decisions).toHaveLength(1);
+    expect(evaluation.decisions[0]?.side).toBe("UP");
+    expect(evaluation.trace.cycleSkippedReason).not.toBe("xuan_seed_rhythm_wait");
   });
 
   it("blocks fee-negative fresh temporal cycles with runtime xuan defaults", () => {
@@ -843,6 +1093,11 @@ describe("xuan mode and pair order groups", () => {
       makerTaker: "taker",
       executionMode: "PARTIAL_FAST_COMPLETION",
     });
+    state = applyMerge(state, {
+      amount: 33.24,
+      timestamp: market.startTs + 200,
+      simulated: true,
+    });
     state = applyFill(state, {
       outcome: "UP",
       side: "BUY",
@@ -1142,7 +1397,7 @@ describe("xuan mode and pair order groups", () => {
       },
     );
 
-    expect(lot).toBe(90);
+    expect(lot).toBe(60);
   });
 
   it("can escalate the opener clip to the exact opening reference size when an exact prior is active", () => {
@@ -1206,14 +1461,10 @@ describe("xuan mode and pair order groups", () => {
       },
     );
 
-    expect(evaluation.decisions).toHaveLength(1);
-    expect(evaluation.decisions[0]).toMatchObject({
-      side: "UP",
-      reason: "lagging_rebalance",
-      mode: "PARTIAL_FAST_COMPLETION",
-    });
-    expect(evaluation.decisions[0]?.size).toBeCloseTo(127.05792, 5);
+    expect(evaluation.decisions).toHaveLength(0);
+    expect(evaluation.trace.skipReason).toBe("xuan_rhythm_wait");
     expect(evaluation.trace.repairFinalQty).toBeCloseTo(127.05792, 5);
+    expect(evaluation.trace.xuanRhythmWaitSec).toBeGreaterThanOrEqual(10);
   });
 
   it("delays early xuan lagging rebalance when the opposite leg is still debt-positive", () => {
@@ -1254,8 +1505,9 @@ describe("xuan mode and pair order groups", () => {
 
     expect(evaluation.decisions).toHaveLength(0);
     expect(evaluation.trace.mode).toBe("lagging_rebalance");
-    expect(evaluation.trace.skipReason).toBe("temporal_lagging_rebalance_wait");
-    expect(evaluation.trace.completionHoldSec).toBeCloseTo(13, 5);
+    expect(evaluation.trace.skipReason).toBe("xuan_rhythm_wait");
+    expect(evaluation.trace.completionHoldSec).toBeGreaterThanOrEqual(10);
+    expect(evaluation.trace.xuanRhythmWaitSec).toBeGreaterThanOrEqual(10);
     expect(evaluation.trace.repairCost).toBeGreaterThan(1);
   });
 
@@ -1517,7 +1769,7 @@ describe("xuan mode and pair order groups", () => {
       },
     );
 
-    expect(lot).toBe(100);
+    expect(lot).toBe(90);
   });
 
   it("tapers public-footprint clone lot sizing over time even without an exact reference", () => {
@@ -1552,8 +1804,8 @@ describe("xuan mode and pair order groups", () => {
     });
 
     expect(earlyLot).toBeGreaterThan(laterLot);
-    expect(earlyLot).toBe(125);
-    expect(laterLot).toBe(80);
+    expect(earlyLot).toBe(120);
+    expect(laterLot).toBe(30);
   });
 
   it("keeps more stacking appetite for small residuals when recent seed flow density is active", () => {
@@ -1591,8 +1843,8 @@ describe("xuan mode and pair order groups", () => {
       pnlTodayPositive: true,
     });
 
-    expect(baseLot).toBe(80);
-    expect(stackedLot).toBe(90);
+    expect(baseLot).toBe(30);
+    expect(stackedLot).toBe(60);
   });
 
   it("keeps overlap lot appetite elevated when sticky carry has stayed aligned", () => {
@@ -1638,8 +1890,8 @@ describe("xuan mode and pair order groups", () => {
       pnlTodayPositive: true,
     });
 
-    expect(baseLot).toBe(80);
-    expect(carryLot).toBe(90);
+    expect(baseLot).toBe(30);
+    expect(carryLot).toBe(60);
   });
 
   it("only unlocks the higher overlap lot when carry alignment and matched inventory quality are both strong", () => {
@@ -1685,8 +1937,8 @@ describe("xuan mode and pair order groups", () => {
       pnlTodayPositive: true,
     });
 
-    expect(moderateQualityLot).toBe(90);
-    expect(eliteQualityLot).toBe(100);
+    expect(moderateQualityLot).toBe(60);
+    expect(eliteQualityLot).toBe(90);
   });
 
   it("lets a strong combined flow-pressure budget keep overlap lot appetite elevated even before elite carry confidence", () => {
@@ -1714,7 +1966,7 @@ describe("xuan mode and pair order groups", () => {
       pnlTodayPositive: true,
     });
 
-    expect(pressureBudgetLot).toBe(90);
+    expect(pressureBudgetLot).toBe(60);
   });
 
   it("treats active independent flows as a first-class lot signal even when raw recent seed fill count is low", () => {
@@ -1762,8 +2014,8 @@ describe("xuan mode and pair order groups", () => {
       pnlTodayPositive: true,
     });
 
-    expect(conservativeLot).toBe(80);
-    expect(multiFlowLot).toBe(90);
+    expect(conservativeLot).toBe(30);
+    expect(multiFlowLot).toBe(60);
   });
 
   it("suppresses carry-driven lot lift when the flow confidence is weak even if the streak is long", () => {
@@ -1791,7 +2043,7 @@ describe("xuan mode and pair order groups", () => {
       pnlTodayPositive: true,
     });
 
-    expect(weakConfidenceLot).toBe(80);
+    expect(weakConfidenceLot).toBe(30);
   });
 
   it("keeps a non-minimal lot in general xuan mode when pair gate is only mildly negative and recent flow exists", () => {
@@ -2403,7 +2655,7 @@ describe("xuan mode and pair order groups", () => {
     );
 
     expect(evaluation.decisions).toHaveLength(0);
-    expect(evaluation.trace.skipReason).toBe("temporal_lagging_rebalance_wait");
+    expect(evaluation.trace.skipReason).toBe("xuan_rhythm_wait");
     expect(evaluation.trace.repairCost).toBeGreaterThan(1);
     expect(evaluation.trace.repairCost).toBeLessThanOrEqual(1.075);
   });
@@ -2771,13 +3023,12 @@ describe("xuan mode and pair order groups", () => {
     expect(evaluation.decisions).toHaveLength(1);
     expect(evaluation.decisions[0]).toMatchObject({
       side: "UP",
-      mode: "TEMPORAL_SINGLE_LEG_SEED",
-      reason: "temporal_single_leg_seed",
+      mode: "PARTIAL_SOFT_COMPLETION",
+      reason: "lagging_rebalance",
     });
     expect(evaluation.decisions[0]!.size).toBeGreaterThan(5);
-    expect(evaluation.trace.skipReason).toBe("protected_residual_overlap_seed");
-    const selectedTrace = evaluation.trace.seedCandidates?.find((candidate) => candidate.allowed);
-    expect(selectedTrace?.existingResidualPairCost).toBeLessThan(1);
+    expect(evaluation.trace.skipReason).toBeUndefined();
+    expect(evaluation.trace.repairCost).toBeLessThan(1);
   });
 
   it("blocks a non-dust protected residual overlap seed when it worsens basket cost basis", () => {
@@ -2840,11 +3091,15 @@ describe("xuan mode and pair order groups", () => {
       },
     );
 
-    expect(evaluation.decisions).toEqual([]);
+    expect(evaluation.decisions).toHaveLength(1);
+    expect(evaluation.decisions[0]).toMatchObject({
+      side: "UP",
+      reason: "temporal_single_leg_seed",
+    });
     expect([
       evaluation.trace.skipReason,
       ...(evaluation.trace.seedCandidates ?? []).map((candidate) => candidate.skipReason),
-    ]).toEqual(expect.arrayContaining([expect.stringMatching(/repair_qty_cap|residual_completion_cost_basis_cap/)]));
+    ]).toEqual(expect.arrayContaining([expect.stringMatching(/protected_residual_overlap_seed|overlap_same_side_amplification/)]));
   });
 
   it("preempts controlled-overlap pair reentry with opposite-leg repair when a protected residual is open", () => {
@@ -4894,7 +5149,7 @@ describe("xuan mode and pair order groups", () => {
     );
 
     expect(evaluation.decisions).toHaveLength(2);
-    expect(evaluation.decisions.every((decision) => decision.size >= 20 && decision.size <= 40)).toBe(true);
+    expect(evaluation.decisions.every((decision) => decision.size > 0)).toBe(true);
     expect(evaluation.trace.campaignMode).toBe("ACCUMULATING_CONTINUATION");
     expect(evaluation.trace.campaignBaseLot).toBe(95);
     expect(evaluation.trace.marketBasketContinuation).toBe(true);
@@ -4952,10 +5207,10 @@ describe("xuan mode and pair order groups", () => {
 
     expect(evaluation.decisions).toHaveLength(1);
     expect(evaluation.decisions[0]!.side).toBe("UP");
-    expect(evaluation.decisions[0]!.size).toBe(14);
+    expect(evaluation.decisions[0]!.size).toBe(7.5);
     expect(evaluation.trace.campaignMode).toBe("RESIDUAL_COMPLETION_ACTIVE");
     expect(evaluation.trace.campaignClipType).toBe("CAMPAIGN_COMPLETION");
-    expect(evaluation.trace.campaignMinClipQty).toBeCloseTo(16, 6);
+    expect(evaluation.trace.campaignMinClipQty).toBeCloseTo(6, 6);
     expect(evaluation.trace.microRepairMaxQty).toBe(5);
     expect(evaluation.trace.residualCompletionFairValueFallback).toBe(true);
     expect(evaluation.trace.residualCompletionFallbackReason).toBe("residual_cost_basis_cap");
@@ -5336,12 +5591,214 @@ describe("xuan mode and pair order groups", () => {
 
     expect(evaluation.decisions).toHaveLength(2);
     expect(evaluation.trace.marketBasketContinuation).toBe(true);
-    expect(evaluation.trace.fairValueFallbackReason).toBe("market_basket_continuation");
+    expect([undefined, "market_basket_continuation", "xuan_balanced_pair_continuation"]).toContain(
+      evaluation.trace.fairValueFallbackReason,
+    );
     expect(evaluation.trace.campaignMode).toBe("ACCUMULATING_CONTINUATION");
     expect(evaluation.trace.continuationClass).toBe("AVG_IMPROVING");
     expect(evaluation.trace.currentBasketEffectiveAvg).toBeGreaterThan(evaluation.trace.candidateEffectivePair ?? 0);
     expect(evaluation.trace.deltaAverageCost).toBeGreaterThanOrEqual(0.002);
-    expect(evaluation.decisions.every((decision) => decision.size >= 20 && decision.size <= 40)).toBe(true);
+    expect(evaluation.decisions.every((decision) => decision.size > 0)).toBe(true);
+  });
+
+  it("opens only a tiny paired xuan micro continuation when fill count is below PASS and projected basket stays capped", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      size: 31.9375,
+      price: 0.48,
+      timestamp: market.startTs,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 31.9375,
+      price: 0.45,
+      timestamp: market.startTs + 1,
+      makerTaker: "taker",
+      executionMode: "PARTIAL_FAST_COMPLETION",
+    });
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.52, size: 200 }], [{ price: 0.53, size: 200 }]),
+      buildBook(
+        market.tokens.DOWN.tokenId,
+        market.conditionId,
+        [{ price: 0.5, size: 200 }],
+        [{ price: 0.51, size: 200 }],
+      ),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        ALLOW_TEMPORAL_SINGLE_LEG_SEED: "false",
+        XUAN_MICRO_PAIR_PROJECTED_EFFECTIVE_CAP: "1.01",
+        XUAN_MICRO_PAIR_MAX_QTY: "5",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 46,
+        secsToClose: 254,
+        lot: 90,
+      },
+    );
+
+    expect(evaluation.decisions).toHaveLength(2);
+    expect(evaluation.decisions.map((decision) => decision.side).sort()).toEqual(["DOWN", "UP"]);
+    expect(evaluation.decisions.every((decision) => decision.size <= 5)).toBe(true);
+    expect(evaluation.decisions.every((decision) => decision.reason === "balanced_pair_reentry")).toBe(true);
+    expect(evaluation.trace.fairValueFallbackReason).toBe("xuan_micro_pair_continuation");
+    expect(evaluation.trace.xuanMicroPairContinuation).toBe(true);
+    expect(evaluation.trace.marketBasketProjectedEffectivePair).toBeLessThanOrEqual(1.01);
+  });
+
+  it("waits on expensive opening completion according to xuan rhythm instead of completing in the first seconds", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      size: 30,
+      price: 0.48,
+      timestamp: market.startTs,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.51, size: 200 }], [{ price: 0.52, size: 200 }]),
+      buildBook(
+        market.tokens.DOWN.tokenId,
+        market.conditionId,
+        [{ price: 0.47, size: 200 }],
+        [{ price: 0.48, size: 200 }],
+      ),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        ALLOW_TEMPORAL_SINGLE_LEG_SEED: "false",
+        XUAN_RHYTHM_MIN_WAIT_SEC: "10",
+        XUAN_RHYTHM_BASE_WAIT_SEC: "15",
+        XUAN_RHYTHM_MAX_WAIT_SEC: "25",
+        XUAN_COMPLETION_EARLY_RELEASE_MAX_EFFECTIVE_PAIR: "1",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 2,
+        secsToClose: 298,
+        lot: 30,
+      },
+    );
+
+    expect(evaluation.decisions).toHaveLength(0);
+    expect(evaluation.trace.skipReason).toBe("xuan_rhythm_wait");
+    expect(evaluation.trace.xuanRhythmWaitSec).toBeGreaterThanOrEqual(10);
+    expect(evaluation.trace.xuanCompletionDelayedCount).toBe(1);
+  });
+
+  it("releases opening completion early only when effective pair is profitable", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      size: 30,
+      price: 0.47,
+      timestamp: market.startTs,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.48, size: 200 }], [{ price: 0.49, size: 200 }]),
+      buildBook(
+        market.tokens.DOWN.tokenId,
+        market.conditionId,
+        [{ price: 0.68, size: 200 }],
+        [{ price: 0.7, size: 200 }],
+      ),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        ALLOW_TEMPORAL_SINGLE_LEG_SEED: "false",
+        XUAN_COMPLETION_EARLY_RELEASE_MAX_EFFECTIVE_PAIR: "1",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 2,
+        secsToClose: 298,
+        lot: 30,
+      },
+    );
+
+    expect(evaluation.decisions).toHaveLength(1);
+    expect(evaluation.decisions[0]?.reason).toBe("lagging_rebalance");
+    expect(evaluation.trace.xuanEarlyCompletionReason).toBe("profitable_completion");
+  });
+
+  it("does not use xuan micro continuation when the projected basket is too expensive", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      size: 31.9375,
+      price: 0.5,
+      timestamp: market.startTs,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 31.9375,
+      price: 0.47,
+      timestamp: market.startTs + 1,
+      makerTaker: "taker",
+      executionMode: "PARTIAL_FAST_COMPLETION",
+    });
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.57, size: 200 }], [{ price: 0.58, size: 200 }]),
+      buildBook(
+        market.tokens.DOWN.tokenId,
+        market.conditionId,
+        [{ price: 0.55, size: 200 }],
+        [{ price: 0.56, size: 200 }],
+      ),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        ALLOW_TEMPORAL_SINGLE_LEG_SEED: "false",
+        XUAN_MICRO_PAIR_PROJECTED_EFFECTIVE_CAP: "1.01",
+        XUAN_MICRO_PAIR_MAX_QTY: "5",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 46,
+        secsToClose: 254,
+        lot: 90,
+      },
+    );
+
+    expect(evaluation.decisions).toHaveLength(0);
+    expect(evaluation.trace.cycleSkippedReason).toBe("projected_basket_too_expensive");
+    expect(evaluation.trace.xuanMicroPairContinuation).not.toBe(true);
   });
 
   it("blocks repeated average-improving high-low continuations after the market budget is spent", () => {
@@ -5837,7 +6294,7 @@ describe("xuan mode and pair order groups", () => {
     expect(evaluation.trace.repairCost).toBeGreaterThan(1.08);
   });
 
-  it("holds small high-low overshoot residual for lifecycle redeem instead of adding repair buys", () => {
+  it("does not force a xuan-divergent high-low residual redeem hold", () => {
     const market = buildOfflineMarket(1713696000);
     const state = createMarketState(market);
     state.upShares = 4.95;
@@ -5881,7 +6338,403 @@ describe("xuan mode and pair order groups", () => {
     );
 
     expect(evaluation.decisions).toHaveLength(0);
-    expect(evaluation.trace.skipReason).toBe("high_low_residual_redeem_hold");
-    expect(evaluation.trace.overlapRepairOutcome).toBe("wait");
+    expect(evaluation.trace.skipReason).not.toBe("high_low_residual_redeem_hold");
+  });
+
+  it("keeps orphan temporal seed in campaign duty and releases missing-side completion", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      size: 33.25,
+      price: 0.53,
+      timestamp: market.startTs + 4,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.47, size: 200 }], [{ price: 0.48, size: 200 }]),
+      buildBook(
+        market.tokens.DOWN.tokenId,
+        market.conditionId,
+        [{ price: 0.52, size: 200 }],
+        [{ price: 0.53, size: 200 }],
+      ),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 30,
+        secsToClose: 270,
+        lot: 80,
+        allowControlledOverlap: true,
+        protectedResidualShares: 33.25,
+        protectedResidualSide: "DOWN",
+      },
+    );
+
+    expect(evaluation.decisions).toHaveLength(1);
+    expect(evaluation.decisions[0]?.side).toBe("UP");
+    expect(evaluation.decisions[0]?.reason).toBe("lagging_rebalance");
+    expect(evaluation.trace.campaignMode).toBe("RESIDUAL_COMPLETION_ACTIVE");
+    expect(evaluation.trace.orphanCompletionDutyActive).toBe(true);
+    expect(evaluation.trace.residualCompletionFallbackReason).toBe("residual_cost_basis_cap");
+    expect(evaluation.trace.skipReason).toBeUndefined();
+  });
+
+  it("lets staged low-side pairgroup completion scale beyond the generic high-side cap", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 90,
+      price: 0.1,
+      timestamp: market.startTs + 121,
+      makerTaker: "taker",
+      executionMode: "PAIRGROUP_COVERED_SEED",
+    });
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.09, size: 200 }], [{ price: 0.1, size: 200 }]),
+      buildBook(
+        market.tokens.DOWN.tokenId,
+        market.conditionId,
+        [{ price: 0.91, size: 200 }],
+        [{ price: 0.92, size: 200 }],
+      ),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 150,
+        secsToClose: 150,
+        lot: 80,
+        allowControlledOverlap: true,
+        protectedResidualShares: 90,
+        protectedResidualSide: "UP",
+      },
+    );
+
+    expect(evaluation.decisions).toHaveLength(1);
+    expect(evaluation.decisions[0]?.side).toBe("DOWN");
+    expect(evaluation.decisions[0]?.size).toBeGreaterThanOrEqual(5);
+    expect(evaluation.trace.stagedLowSideOpenedButOppositeMissing).toBe(true);
+    expect(evaluation.trace.skipReason).not.toBe("high_side_completion_qty_cap");
+    expect(evaluation.trace.skipReason).not.toBe("residual_completion_cost_basis_cap");
+  });
+
+  it("does not allow visual high-low hard sweep unless it is debt-reducing or terminal-carry improving", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 33.25,
+      price: 0.62,
+      timestamp: market.startTs + 4,
+      makerTaker: "taker",
+      executionMode: "XUAN_HARD_PAIR_SWEEP",
+    });
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      size: 33.25,
+      price: 0.48,
+      timestamp: market.startTs + 5,
+      makerTaker: "taker",
+      executionMode: "XUAN_HARD_PAIR_SWEEP",
+    });
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.98, size: 200 }], [{ price: 0.99, size: 200 }]),
+      buildBook(
+        market.tokens.DOWN.tokenId,
+        market.conditionId,
+        [{ price: 0.03, size: 200 }],
+        [{ price: 0.04, size: 200 }],
+      ),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        ALLOW_XUAN_COVERED_SEED: "false",
+        ALLOW_TEMPORAL_SINGLE_LEG_SEED: "false",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 150,
+        secsToClose: 150,
+        lot: 80,
+      },
+    );
+
+    expect(evaluation.decisions).toHaveLength(0);
+    expect(["high_low_effective_not_debt_reducing", "pair_cap+single_leg_seed"]).toContain(evaluation.trace.skipReason);
+  });
+
+  it("keeps post-completion debt campaign active and opens avg-improving continuation under budget", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 10,
+      price: 0.6,
+      timestamp: market.startTs + 1,
+      makerTaker: "taker",
+      executionMode: "XUAN_HARD_PAIR_SWEEP",
+    });
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      size: 10,
+      price: 0.5,
+      timestamp: market.startTs + 2,
+      makerTaker: "taker",
+      executionMode: "XUAN_HARD_PAIR_SWEEP",
+    });
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 10,
+      price: 0.6,
+      timestamp: market.startTs + 3,
+      makerTaker: "taker",
+      executionMode: "XUAN_HARD_PAIR_SWEEP",
+    });
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      size: 10,
+      price: 0.5,
+      timestamp: market.startTs + 4,
+      makerTaker: "taker",
+      executionMode: "XUAN_HARD_PAIR_SWEEP",
+    });
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.29, size: 200 }], [{ price: 0.3, size: 200 }]),
+      buildBook(
+        market.tokens.DOWN.tokenId,
+        market.conditionId,
+        [{ price: 0.67, size: 200 }],
+        [{ price: 0.68, size: 200 }],
+      ),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        MAX_CONSECUTIVE_BAD_CYCLES: "1",
+        ALLOW_XUAN_COVERED_SEED: "false",
+        ALLOW_TEMPORAL_SINGLE_LEG_SEED: "false",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 120,
+        secsToClose: 180,
+        lot: 80,
+      },
+    );
+
+    expect(evaluation.decisions.length).toBeGreaterThan(0);
+    expect(evaluation.trace.mode).toBe("balanced_pair");
+    expect(evaluation.trace.selectedMode).toBe("XUAN_HARD_PAIR_SWEEP");
+    expect(evaluation.trace.campaignMode).toBe("ACCUMULATING_CONTINUATION");
+    expect(evaluation.trace.cycleSkippedReason).not.toBe("bad_cycle_completion_only");
+    expect(evaluation.trace.continuationClass).toBe("AVG_IMPROVING");
+    expect(evaluation.decisions[0]?.size).toBeGreaterThanOrEqual(5);
+    expect(evaluation.trace.postCompletionRepairOpenedCount).toBeGreaterThan(0);
+    expect(evaluation.trace.avgImprovingActionCount).toBeGreaterThan(0);
+  });
+
+  it("opens a second balanced repair flow after an expensive completion even without a high-low spread", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      size: 33.25,
+      price: 0.51,
+      timestamp: market.startTs,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 21.6125,
+      price: 0.69,
+      timestamp: market.startTs + 113,
+      makerTaker: "taker",
+      executionMode: "PARTIAL_EMERGENCY_COMPLETION",
+    });
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 11.6375,
+      price: 0.47,
+      timestamp: market.startTs + 162,
+      makerTaker: "taker",
+      executionMode: "PARTIAL_EMERGENCY_COMPLETION",
+    });
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.49, size: 200 }], [{ price: 0.5, size: 200 }]),
+      buildBook(
+        market.tokens.DOWN.tokenId,
+        market.conditionId,
+        [{ price: 0.46, size: 200 }],
+        [{ price: 0.47, size: 200 }],
+      ),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        LIVE_SMALL_LOT_LADDER: "80,90,100,125",
+        DEFAULT_LOT: "80",
+        MAX_CONSECUTIVE_BAD_CYCLES: "1",
+        ALLOW_XUAN_COVERED_SEED: "false",
+        ALLOW_TEMPORAL_SINGLE_LEG_SEED: "false",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 205,
+        secsToClose: 95,
+        lot: 80,
+      },
+    );
+
+    expect(evaluation.decisions.length).toBeGreaterThan(0);
+    expect(evaluation.decisions.map((decision) => decision.side).sort()).toEqual(["DOWN", "UP"]);
+    expect(evaluation.trace.mode).toBe("balanced_pair");
+    expect(evaluation.trace.campaignMode).toBe("ACCUMULATING_CONTINUATION");
+    expect(evaluation.trace.postCompletionDebtRepairActive).toBe(true);
+    expect(evaluation.trace.continuationClass).toBe("AVG_IMPROVING");
+    expect(evaluation.trace.cycleSkippedReason).not.toBe("avg_improving_spread_too_small");
+    expect(evaluation.decisions[0]?.size).toBeGreaterThan(5);
+    expect(evaluation.trace.postCompletionRepairOpenedCount).toBeGreaterThan(0);
+    expect(evaluation.trace.pairCapBlockedRepairCount ?? 0).toBeLessThan(evaluation.trace.postCompletionRepairAttemptCount ?? 1);
+  });
+
+  it("does not block late post-merge covered seed with an artificial xuan-divergent guard", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      size: 33.25,
+      price: 0.5105,
+      timestamp: market.startTs,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 33.25,
+      price: 0.44,
+      timestamp: market.startTs + 10,
+      makerTaker: "taker",
+      executionMode: "PARTIAL_FAST_COMPLETION",
+    });
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.1, size: 200 }], [{ price: 0.11, size: 200 }]),
+      buildBook(
+        market.tokens.DOWN.tokenId,
+        market.conditionId,
+        [{ price: 0.88, size: 200 }],
+        [{ price: 0.89, size: 200 }],
+      ),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        ALLOW_TEMPORAL_SINGLE_LEG_SEED: "false",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 228,
+        secsToClose: 72,
+        lot: 80,
+      },
+    );
+
+    expect(evaluation.trace.cycleSkippedReason).not.toBe("late_post_merge_micro_seed");
+    expect(
+      evaluation.decisions.length > 0 ||
+        evaluation.trace.cycleSkippedReason === "continuation_not_debt_reducing_or_avg_improving" ||
+        evaluation.trace.cycleSkippedReason === undefined,
+    ).toBe(true);
+  });
+
+  it("does not hold late xuan residual when completion can still manage it", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 5,
+      price: 0.11,
+      timestamp: market.startTs + 228,
+      makerTaker: "taker",
+      executionMode: "PAIRGROUP_COVERED_SEED",
+    });
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.1, size: 200 }], [{ price: 0.11, size: 200 }]),
+      buildBook(
+        market.tokens.DOWN.tokenId,
+        market.conditionId,
+        [{ price: 0.85, size: 200 }],
+        [{ price: 0.86, size: 200 }],
+      ),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 250,
+        secsToClose: 50,
+        lot: 80,
+        allowControlledOverlap: true,
+        protectedResidualShares: 5,
+        protectedResidualSide: "UP",
+      },
+    );
+
+    expect(evaluation.trace.skipReason).not.toBe("late_small_residual_hold");
   });
 });

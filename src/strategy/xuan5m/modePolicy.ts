@@ -34,6 +34,7 @@ export interface PairSweepAllowance {
   flowShapingClipBudgetRemaining?: number | undefined;
   campaignFlowCount?: number | undefined;
   campaignFlowTarget?: number | undefined;
+  postCompletionDebtRepairActive?: boolean | undefined;
 }
 
 export type MarketBasketContinuationClass = "DEBT_REDUCING" | "AVG_IMPROVING" | "FLOW_SHAPING" | "BAD";
@@ -76,6 +77,7 @@ export interface MarketBasketContinuationProjection {
   flowShapingClipBudgetRemaining?: number;
   campaignFlowCount?: number;
   campaignFlowTarget?: number;
+  postCompletionDebtRepairActive?: boolean;
   rejectedReason?: string;
   quality: "STRONG_BASKET" | "GOOD_BASKET" | "BORDERLINE_BASKET" | "BAD_BASKET";
 }
@@ -85,9 +87,27 @@ interface AverageImprovingUsage {
   clipCount: number;
 }
 
+function postCompletionAvgImprovingAddedDebtBudget(config: XuanStrategyConfig, currentDebtUSDC: number): number {
+  return Math.max(
+    config.xuanBasketCampaignAvgImprovementMaxAddedDebtUsdc,
+    config.maxAvgImprovingAddedDebtUsdc,
+    Math.min(Math.max(currentDebtUSDC * 0.35, 0.75), 2.5),
+  );
+}
+
 function estimateCampaignFlowCount(state: XuanMarketState): number {
   const buys = state.fillHistory
-    .filter((fill) => fill.side === "BUY")
+    .filter(
+      (fill) =>
+        fill.side === "BUY" &&
+        (
+          fill.executionMode === "TEMPORAL_SINGLE_LEG_SEED" ||
+          fill.executionMode === "PAIRGROUP_COVERED_SEED" ||
+          fill.executionMode === "XUAN_HARD_PAIR_SWEEP" ||
+          fill.executionMode === "XUAN_SOFT_PAIR_SWEEP" ||
+          fill.executionMode === "STRICT_PAIR_SWEEP"
+        ),
+    )
     .sort((left, right) => left.timestamp - right.timestamp);
   let flowCount = 0;
   let lastTimestamp: number | undefined;
@@ -382,16 +402,27 @@ export function marketBasketContinuationProjection(args: {
   const edgePerPair = 1 - args.costWithFees;
   const addedDebtUSDC = Math.max(0, args.costWithFees - 1) * args.candidateSize;
   const averageImprovingUsage = estimateAverageImprovingContinuationUsage(args.config, args.state);
+  const postCompletionDebtRepairActive =
+    debtPositiveCampaignActive &&
+    currentEffectivePair > Math.max(args.config.marketBasketGoodAvgCap, args.config.highLowAvgImprovingMaxEffectivePair) + 1e-9 &&
+    campaignFlowCount < campaignFlowTarget &&
+    args.secsToClose > args.config.finalWindowCompletionOnlySec;
+  const dynamicAvgImprovingAddedDebtBudgetUSDC = postCompletionDebtRepairActive
+    ? postCompletionAvgImprovingAddedDebtBudget(args.config, currentDebtUSDC)
+    : Math.min(
+        args.config.xuanBasketCampaignAvgImprovementMaxAddedDebtUsdc,
+        args.config.maxAvgImprovingAddedDebtUsdc,
+      );
+  const dynamicAvgImprovingClipBudget = postCompletionDebtRepairActive
+    ? Math.max(args.config.maxAvgImprovingClipsPerMarket, campaignFlowTarget - campaignFlowCount, 2)
+    : args.config.maxAvgImprovingClipsPerMarket;
   const avgImprovingBudgetRemainingUSDC = Math.max(
     0,
-    Math.min(
-      args.config.xuanBasketCampaignAvgImprovementMaxAddedDebtUsdc,
-      args.config.maxAvgImprovingAddedDebtUsdc,
-    ) - averageImprovingUsage.addedDebtUSDC,
+    dynamicAvgImprovingAddedDebtBudgetUSDC - averageImprovingUsage.addedDebtUSDC,
   );
   const avgImprovingClipBudgetRemaining = Math.max(
     0,
-    args.config.maxAvgImprovingClipsPerMarket - averageImprovingUsage.clipCount,
+    dynamicAvgImprovingClipBudget - averageImprovingUsage.clipCount,
   );
   const flowShapingBudgetRemainingUSDC = Math.max(
     0,
@@ -426,7 +457,9 @@ export function marketBasketContinuationProjection(args: {
     priceSpread: args.priceSpread,
   });
   const spreadEligible =
-    args.priceSpread === undefined || args.priceSpread + 1e-9 >= args.config.highLowContinuationMinSpread;
+    args.priceSpread === undefined ||
+    args.priceSpread + 1e-9 >= args.config.highLowContinuationMinSpread ||
+    postCompletionDebtRepairActive;
   const improvesBorderlineBasket =
     projectedEffectivePair <= args.config.marketBasketBorderlineAvgCap + 1e-9 &&
     deltaBasketDebtUSDC >= args.config.marketBasketMinAvgImprovement * Math.max(args.candidateSize, 1);
@@ -482,7 +515,7 @@ export function marketBasketContinuationProjection(args: {
         ? "avg_improving_pair_too_expensive"
         : "continuation_not_debt_reducing_or_avg_improving"
       : flowShapingTraceOnly
-        ? "flow_shaping_trace_only"
+      ? "flow_shaping_trace_only"
       : continuationClass === "FLOW_SHAPING" && campaignFlowCount >= campaignFlowTarget
         ? "flow_shaping_flow_target_met"
       : continuationClass === "FLOW_SHAPING" && flowShapingClipBudgetRemaining <= 0
@@ -535,6 +568,7 @@ export function marketBasketContinuationProjection(args: {
     flowShapingClipBudgetRemaining,
     campaignFlowCount,
     campaignFlowTarget,
+    ...(postCompletionDebtRepairActive ? { postCompletionDebtRepairActive: true } : {}),
     ...(rejectedReason && !allowed ? { rejectedReason } : {}),
     quality,
   };
@@ -1136,6 +1170,7 @@ export function pairSweepAllowance(args: {
       flowShapingClipBudgetRemaining: basketContinuation.flowShapingClipBudgetRemaining,
       campaignFlowCount: basketContinuation.campaignFlowCount,
       campaignFlowTarget: basketContinuation.campaignFlowTarget,
+      postCompletionDebtRepairActive: basketContinuation.postCompletionDebtRepairActive,
     };
   }
 
@@ -1156,6 +1191,7 @@ export function pairSweepAllowance(args: {
       flowShapingClipBudgetRemaining: basketContinuation.flowShapingClipBudgetRemaining,
       campaignFlowCount: basketContinuation.campaignFlowCount,
       campaignFlowTarget: basketContinuation.campaignFlowTarget,
+      postCompletionDebtRepairActive: basketContinuation.postCompletionDebtRepairActive,
       ...(basketContinuation.rejectedReason
         ? { continuationRejectedReason: basketContinuation.rejectedReason }
         : {}),

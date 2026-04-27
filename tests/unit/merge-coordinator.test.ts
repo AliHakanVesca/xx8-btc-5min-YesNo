@@ -284,7 +284,7 @@ describe("merge coordinator", () => {
     expect(lowCollateralGate.reason).toBe("low_collateral");
   });
 
-  it("carries a small debt-positive public-footprint basket instead of forcing a tiny final merge", () => {
+  it("forces a small debt-positive public-footprint basket merge in the final window", () => {
     const config = buildConfig({
       BOT_MODE: "XUAN",
       XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
@@ -318,11 +318,11 @@ describe("merge coordinator", () => {
       tracker,
     });
 
-    expect(gate.allow).toBe(false);
-    expect(gate.forced).toBe(false);
-    expect(gate.reason).toBe("basket_debt_hold");
-    expect(gate.mergeVsCarryDecision).toBe("CARRY_TO_SETTLEMENT");
-    expect(gate.mergeVsCarryReason).toBe("small_debt_positive_basket_below_xuan_merge_target");
+    expect(gate.allow).toBe(true);
+    expect(gate.forced).toBe(true);
+    expect(gate.reason).toBe("final_window");
+    expect(gate.mergeVsCarryDecision).toBe("MERGE_NOW");
+    expect(gate.mergeVsCarryReason).toBe("debt_positive_final_window_forced_merge");
     expect(gate.basketEffectivePair).toBeGreaterThan(1);
   });
 
@@ -503,7 +503,7 @@ describe("merge coordinator", () => {
     expect(stillHeldGate.reason).toBe("public_footprint_hold");
   });
 
-  it("does not forced-age merge a debt-positive public-footprint basket before the final window", () => {
+  it("forces an aged debt-positive public-footprint basket instead of holding it until the final window", () => {
     const config = buildConfig({
       BOT_MODE: "XUAN",
       XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
@@ -546,12 +546,14 @@ describe("merge coordinator", () => {
       tracker,
     });
 
-    expect(heldGate.allow).toBe(false);
-    expect(heldGate.forced).toBe(false);
-    expect(heldGate.reason).toBe("basket_debt_hold");
-    expect(finalGate.allow).toBe(false);
-    expect(finalGate.reason).toBe("basket_debt_hold");
-    expect(finalGate.mergeVsCarryDecision).toBe("CARRY_TO_SETTLEMENT");
+    expect(heldGate.allow).toBe(true);
+    expect(heldGate.forced).toBe(true);
+    expect(heldGate.reason).toBe("forced_age");
+    expect(finalGate.allow).toBe(true);
+    expect(finalGate.forced).toBe(true);
+    expect(finalGate.reason).toBe("final_window");
+    expect(finalGate.mergeVsCarryDecision).toBe("MERGE_NOW");
+    expect(finalGate.mergeVsCarryReason).toBe("debt_positive_final_window_forced_merge");
   });
 
   it("does not hard-imbalance merge a tiny debt-positive matched basket while residual completion can continue", () => {

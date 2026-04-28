@@ -3,6 +3,10 @@ import { imbalance, matchedEffectivePairCost, mergeableShares } from "./inventor
 import { plannedOppositeCompletionState, type XuanMarketState } from "./marketState.js";
 import { resolveBundledMergeClusterPrior, resolveBundledMergeTimingPrior } from "../../analytics/xuanExactReference.js";
 import { classifyFlowPressureBudget, type FlowPressureBudgetState } from "./modePolicy.js";
+import {
+  XUAN_STRICT_CLOSEABLE_PAIR_COST_CAP,
+  XUAN_STRICT_PLANNED_OPPOSITE_DEADLINE_SEC,
+} from "./xuanStrictPlannedOppositePolicy.js";
 
 export interface MergePlan {
   mergeable: number;
@@ -317,12 +321,19 @@ export function evaluateDelayedMergeGate(
         Math.min(plannedOpposite.plannedOppositeQty, metrics.pendingMatchedQty) - plannedOppositeDustTolerance - 1e-9
       )
     );
+  const plannedOppositeStalePositiveRecycleRelease =
+    aggressiveFamilyMergeReleaseWindow &&
+    plannedOpposite !== undefined &&
+    plannedOpposite.plannedOppositeAgeSec >= XUAN_STRICT_PLANNED_OPPOSITE_DEADLINE_SEC - 1e-9 &&
+    basketEffectivePair !== undefined &&
+    basketEffectivePair <= XUAN_STRICT_CLOSEABLE_PAIR_COST_CAP + 1e-9;
   const plannedOppositeHoldActive =
     config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
     plannedOpposite !== undefined &&
     plannedOpposite.plannedOppositeMissingQty >= materialPlannedOppositeThreshold - 1e-9 &&
     args.secsToClose > config.finalWindowCompletionOnlySec &&
-    !(aggressiveFamilyMergeReleaseWindow && plannedOppositeCompleteEnoughForMerge);
+    !(aggressiveFamilyMergeReleaseWindow && plannedOppositeCompleteEnoughForMerge) &&
+    !plannedOppositeStalePositiveRecycleRelease;
   const finalResidualMergeWindow =
     args.secsToClose <= config.finalWindowCompletionOnlySec ||
     (

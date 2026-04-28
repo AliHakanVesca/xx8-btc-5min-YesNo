@@ -2,6 +2,7 @@ import type { XuanStrategyConfig } from "../../config/strategyPresets.js";
 
 export const XUAN_STRICT_PAIR_COST_TARGET_CAP = 0.982;
 export const XUAN_STRICT_CLOSEABLE_PAIR_COST_CAP = 0.995;
+export const XUAN_STRICT_PROTECTIVE_RELEASE_MIN_WAIT_SEC = 15;
 export const XUAN_STRICT_PLANNED_OPPOSITE_MIN_WAIT_SEC = 20;
 export const XUAN_STRICT_PLANNED_OPPOSITE_DEADLINE_SEC = 35;
 export const XUAN_STRICT_LATE_SEED_FINAL_MERGE_DEADLINE_SEC = 276;
@@ -94,6 +95,27 @@ export function plannedOppositeTargetReleaseReady(args: {
   return (
     args.ageSec >= plannedOppositeMinWaitSec(args.config) - 1e-9 &&
     xuanPairCostImprovesOrMeetsTarget(args.config, args.currentMatchedEffectivePair, args.costWithFees)
+  );
+}
+
+export function plannedOppositeProtectiveReleaseReady(args: {
+  config: XuanStrategyConfig;
+  ageSec: number;
+  costWithFees: number;
+  executableSize: number;
+  minOrderSize: number;
+}): boolean {
+  if (!isAggressivePublicFootprint(args.config)) {
+    return false;
+  }
+  const protectiveMinWaitSec = Math.min(
+    plannedOppositeMinWaitSec(args.config),
+    XUAN_STRICT_PROTECTIVE_RELEASE_MIN_WAIT_SEC,
+  );
+  return (
+    args.ageSec >= protectiveMinWaitSec - 1e-9 &&
+    args.executableSize >= args.minOrderSize - 1e-9 &&
+    args.costWithFees <= strictXuanCloseablePairCostCap(args.config) + 1e-9
   );
 }
 

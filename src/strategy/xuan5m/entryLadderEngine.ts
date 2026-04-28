@@ -65,7 +65,9 @@ import {
   plannedOppositeDeadlineReached as sharedPlannedOppositeDeadlineReached,
   plannedOppositeLateSeedDeadlineFits,
   plannedOppositeMinWaitSec as sharedPlannedOppositeMinWaitSec,
+  plannedOppositeProtectiveReleaseReady as sharedPlannedOppositeProtectiveReleaseReady,
   plannedOppositeTargetReleaseReady as sharedPlannedOppositeTargetReleaseReady,
+  strictXuanCloseablePairCostCap as sharedStrictXuanCloseablePairCostCap,
   strictXuanPairCostTargetCap as sharedStrictXuanPairCostTargetCap,
   xuanPairCostImprovesOrMeetsTarget as sharedXuanPairCostImprovesOrMeetsTarget,
 } from "./xuanStrictPlannedOppositePolicy.js";
@@ -377,12 +379,13 @@ export interface EntryDecisionTrace {
   plannedOppositeAgeSec?: number;
   plannedPairGroupOpenedAt?: number;
   plannedLowSideAvg?: number;
-  plannedOppositeMaxPrice?: number;
-  plannedOppositeDeadlineSec?: number;
-  plannedOppositeMinWaitSec?: number;
-  plannedOppositeDeadlineReached?: boolean;
-  plannedOppositeTargetRelease?: boolean;
-  plannedOppositeCloseableRelease?: boolean;
+	  plannedOppositeMaxPrice?: number;
+	  plannedOppositeDeadlineSec?: number;
+	  plannedOppositeMinWaitSec?: number;
+	  plannedOppositeDeadlineReached?: boolean;
+	  plannedOppositeTargetRelease?: boolean;
+	  plannedOppositeProtectiveRelease?: boolean;
+	  plannedOppositeCloseableRelease?: boolean;
   mustCloseBeforeMerge?: boolean;
   plannedOppositeCompletionAttemptCount?: number;
   plannedOppositeCompletionOpenedCount?: number;
@@ -700,6 +703,17 @@ function aggressiveOppositeReleaseHold(args: {
   }
   const waitSec = plannedOppositeMinWaitSec(args.config, secsFromOpen, args.secsToClose);
   if (ageSec >= waitSec - 1e-9) {
+    return undefined;
+  }
+  if (
+    plannedOppositeProtectiveReleaseReady({
+      config: args.config,
+      ageSec,
+      costWithFees: args.effectiveCost,
+      executableSize: args.state.market.minOrderSize,
+      minOrderSize: args.state.market.minOrderSize,
+    })
+  ) {
     return undefined;
   }
   return {
@@ -3408,7 +3422,7 @@ export function evaluateEntryBuys(
     (aggressivePublicFootprint ||
       plannedOpposite.plannedLowSideAvg <= config.lowSideMaxForHighCompletion + 1e-9 ||
       exactCompletionQtyPrior !== undefined) &&
-    plannedOppositeTimingReady;
+    (aggressivePublicFootprint || plannedOppositeTimingReady);
   const stagedResidualAgeSec = borderlineStagedResidualAgeSec(state, leadingSide, nowTs);
   if (
     config.borderlinePairStagedEntryEnabled &&
@@ -3515,17 +3529,37 @@ export function evaluateEntryBuys(
       ? "standard"
       : "micro_fallback";
     const execution = books.quoteForSize(laggingSide, "ask", repairCandidateSize);
-    const executableSize = normalizeOrderSize(execution.filledSize, config.repairMinQty);
+    const minExecutableRepairQty =
+      aggressivePublicFootprint && plannedOppositeDutyActive
+        ? Math.max(state.market.minOrderSize, config.repairMinQty)
+        : config.repairMinQty;
+    const executableSize = normalizeOrderSize(execution.filledSize, minExecutableRepairQty);
     if (executableSize <= 0) {
+      const openPlannedOppositeNoCloseablePath =
+        aggressivePublicFootprint &&
+        plannedOppositeDutyActive &&
+        plannedOpposite !== undefined &&
+        plannedOpposite.plannedOppositeAgeSec >= plannedOppositeDeadlineAgeSec(config) - 1e-9;
+      const plannedOppositeSoftWait =
+        aggressivePublicFootprint &&
+        plannedOppositeDutyActive &&
+        plannedOpposite !== undefined &&
+        plannedOpposite.plannedOppositeAgeSec < plannedOppositeMinWaitSec(config, ctx.secsFromOpen, ctx.secsToClose) - 1e-9;
+      const repairDepthSkipReason = openPlannedOppositeNoCloseablePath
+        ? "xuan_open_planned_opposite_no_closeable_path"
+        : plannedOppositeSoftWait
+          ? "xuan_planned_opposite_wait"
+          : "lagging_depth";
       lastBlockedRepairEvaluation = {
-      decisions: [],
-      trace: {
-        ...trace,
+        decisions: [],
+        trace: {
+          ...trace,
           repairSizingMode,
           repairCandidateCount: repairCandidateSizes.length,
-        repairFilledSize: executableSize,
-        skipReason: "lagging_depth",
-      },
+          repairFilledSize: executableSize,
+          continuationRejectedReason: repairDepthSkipReason,
+          skipReason: repairDepthSkipReason,
+        },
       };
       continue;
     }
@@ -3663,7 +3697,16 @@ export function evaluateEntryBuys(
         secsToClose: ctx.secsToClose,
         costWithFees: repairCost,
       });
-    const plannedOppositeMaxPrice = plannedOppositeDeadlineActive
+    const plannedOppositeProtectiveRelease =
+      plannedOppositeCandidate &&
+      plannedOppositeProtectiveReleaseReady({
+        config,
+        ageSec: plannedOppositeAgeSec,
+        costWithFees: repairCost,
+        executableSize,
+        minOrderSize: state.market.minOrderSize,
+      });
+    const plannedOppositeMaxPrice = plannedOppositeDeadlineActive || plannedOppositeProtectiveRelease
       ? plannedOppositeCloseableMaxPrice
       : plannedOppositeTargetMaxPrice;
     const plannedOppositePriceTargetMet =
@@ -3676,6 +3719,7 @@ export function evaluateEntryBuys(
       ctx.secsToClose > config.finalWindowNoChaseSec &&
       (aggressivePublicFootprint
         ? Boolean(exactCompletionQtyPrior) ||
+          plannedOppositeProtectiveRelease ||
           plannedOppositeTargetRelease ||
           plannedOppositeCloseableRelease ||
           (plannedOppositePriceTargetMet && xuanCostDisciplinedCompletion)
@@ -3692,7 +3736,7 @@ export function evaluateEntryBuys(
       effectiveCost: repairCost,
       exactPriorActive: Boolean(exactCompletionQtyPrior),
     });
-    if (aggressiveOppositeHold) {
+    if (aggressiveOppositeHold && !plannedOppositeProtectiveRelease) {
       lastBlockedRepairEvaluation = {
         decisions: [],
         trace: {
@@ -3720,6 +3764,7 @@ export function evaluateEntryBuys(
       xuanFamilyResidualDutyActive &&
       !xuanCostDisciplinedCompletion &&
       !plannedOppositeCloseableRelease &&
+      !plannedOppositeProtectiveRelease &&
       !finalResidualDutyActive &&
       !exactCompletionQtyPrior &&
       ctx.secsToClose > config.finalWindowCompletionOnlySec
@@ -3754,6 +3799,7 @@ export function evaluateEntryBuys(
       aggressivePublicFootprint &&
       (!plannedOppositePriceTargetMet || !xuanCostDisciplinedCompletion) &&
       !plannedOppositeCloseableRelease &&
+      !plannedOppositeProtectiveRelease &&
       !finalResidualDutyActive &&
       !exactCompletionQtyPrior &&
       ctx.secsToClose > config.finalWindowCompletionOnlySec
@@ -4115,6 +4161,7 @@ export function evaluateEntryBuys(
             ),
             plannedOppositeDeadlineReached: plannedOppositeDeadlineActive,
             plannedOppositeTargetRelease,
+            plannedOppositeProtectiveRelease,
             plannedOppositeCloseableRelease,
             mustCloseBeforeMerge: true,
             plannedOppositeCompletionAttemptCount: 1,
@@ -7673,6 +7720,10 @@ function strictXuanPairCostTargetCap(config: XuanStrategyConfig): number {
   return sharedStrictXuanPairCostTargetCap(config);
 }
 
+function strictXuanCloseablePairCostCap(config: XuanStrategyConfig): number {
+  return sharedStrictXuanCloseablePairCostCap(config);
+}
+
 function strictXuanSeedCostBlockReason(args: {
   config: XuanStrategyConfig;
   state: XuanMarketState;
@@ -7690,11 +7741,13 @@ function strictXuanSeedCostBlockReason(args: {
 
   const exploratoryMaxQty = Math.max(20, args.state.market.minOrderSize);
   const largeSeed = args.requestedSize > exploratoryMaxQty + 1e-9;
+  const closeableCap = strictXuanCloseablePairCostCap(args.config);
+  const pendingMatchedQty = mergeableShares(args.state);
   const targetEffectivePair = args.targetEffectivePair ?? args.referencePairCost;
   const projectedCloseablePath =
     args.hasVisibleOppositePath &&
     Number.isFinite(targetEffectivePair) &&
-    targetEffectivePair <= XUAN_STRICT_CLOSEABLE_PAIR_COST_CAP + 1e-9;
+    targetEffectivePair <= closeableCap + 1e-9;
   const largeStagedLowSideTargetAllowed =
     largeSeed &&
     args.lowSideSeed === true &&
@@ -7704,6 +7757,14 @@ function strictXuanSeedCostBlockReason(args: {
 
   if (largeSeed && !args.exactPriorActive && !projectedCloseablePath) {
     return "xuan_open_planned_opposite_no_closeable_path";
+  }
+  if (
+    largeSeed &&
+    pendingMatchedQty >= args.state.market.minOrderSize - 1e-9 &&
+    !args.exactPriorActive &&
+    (!Number.isFinite(args.referencePairCost) || args.referencePairCost > closeableCap + 1e-9)
+  ) {
+    return "xuan_seed_wait_for_recycle";
   }
   if (largeSeed && args.referencePairCost > 1.06 + 1e-9) {
     return "xuan_high_cost_seed";
@@ -7722,20 +7783,20 @@ function strictXuanSeedCostBlockReason(args: {
   if (
     args.secsFromOpen >= 200 &&
     !args.exactPriorActive &&
-    (!Number.isFinite(args.referencePairCost) || args.referencePairCost > XUAN_STRICT_CLOSEABLE_PAIR_COST_CAP + 1e-9)
+    (!Number.isFinite(args.referencePairCost) || args.referencePairCost > closeableCap + 1e-9)
   ) {
     return "xuan_late_seed_pair_cost_wait";
   }
   if (
     args.secsFromOpen >= 250 &&
-    (!Number.isFinite(args.referencePairCost) || args.referencePairCost > XUAN_STRICT_CLOSEABLE_PAIR_COST_CAP + 1e-9)
+    (!Number.isFinite(args.referencePairCost) || args.referencePairCost > closeableCap + 1e-9)
   ) {
     return "xuan_late_seed_pair_cost_wait";
   }
   if (
     args.state.mergeHistory.length > 0 &&
     !args.exactPriorActive &&
-    (!Number.isFinite(args.referencePairCost) || args.referencePairCost > XUAN_STRICT_CLOSEABLE_PAIR_COST_CAP + 1e-9)
+    (!Number.isFinite(args.referencePairCost) || args.referencePairCost > closeableCap + 1e-9)
   ) {
     return "xuan_post_merge_seed_pair_cost_wait";
   }
@@ -7937,6 +7998,16 @@ function plannedOppositeTargetReleaseReady(args: {
   currentMatchedEffectivePair: number;
 }): boolean {
   return sharedPlannedOppositeTargetReleaseReady(args);
+}
+
+function plannedOppositeProtectiveReleaseReady(args: {
+  config: XuanStrategyConfig;
+  ageSec: number;
+  costWithFees: number;
+  executableSize: number;
+  minOrderSize: number;
+}): boolean {
+  return sharedPlannedOppositeProtectiveReleaseReady(args);
 }
 
 function plannedOppositeCloseableReleaseReady(args: {

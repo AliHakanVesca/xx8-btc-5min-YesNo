@@ -48,6 +48,7 @@ import {
   plannedOppositeDeadlineAgeSec as sharedPlannedOppositeDeadlineAgeSec,
   plannedOppositeDeadlineReached as sharedPlannedOppositeDeadlineReached,
   plannedOppositeMinWaitSec as sharedPlannedOppositeMinWaitSec,
+  plannedOppositeProtectiveReleaseReady as sharedPlannedOppositeProtectiveReleaseReady,
   plannedOppositeTargetReleaseReady as sharedPlannedOppositeTargetReleaseReady,
   strictXuanCloseablePairCostCap as sharedStrictXuanCloseablePairCostCap,
   strictXuanPairCostTargetCap as sharedStrictXuanPairCostTargetCap,
@@ -172,6 +173,16 @@ function plannedOppositeTargetReleaseReady(args: {
   return sharedPlannedOppositeTargetReleaseReady(args);
 }
 
+function plannedOppositeProtectiveReleaseReady(args: {
+  config: XuanStrategyConfig;
+  ageSec: number;
+  costWithFees: number;
+  executableSize: number;
+  minOrderSize: number;
+}): boolean {
+  return sharedPlannedOppositeProtectiveReleaseReady(args);
+}
+
 function plannedOppositeCloseableReleaseReady(args: {
   config: XuanStrategyConfig;
   ageSec: number;
@@ -207,6 +218,17 @@ function aggressiveOppositeReleaseHold(args: {
     return false;
   }
   if (ageSec >= plannedOppositeMinWaitSec(args.config, secsFromOpen, args.secsToClose) - 1e-9) {
+    return false;
+  }
+  if (
+    plannedOppositeProtectiveReleaseReady({
+      config: args.config,
+      ageSec,
+      costWithFees: args.effectiveCost,
+      executableSize: args.state.market.minOrderSize,
+      minOrderSize: args.state.market.minOrderSize,
+    })
+  ) {
     return false;
   }
   return true;
@@ -629,14 +651,23 @@ function chooseCompletion(
         secsToClose: ctx.secsToClose,
         costWithFees,
       });
+    const plannedOppositeProtectiveRelease =
+      plannedOppositeCandidate &&
+      plannedOppositeProtectiveReleaseReady({
+        config,
+        ageSec: plannedOppositeAgeSec,
+        costWithFees,
+        executableSize: candidateSize,
+        minOrderSize: state.market.minOrderSize,
+      });
     if (
-      plannedOppositeCloseableRelease &&
+      (plannedOppositeCloseableRelease || plannedOppositeProtectiveRelease) &&
       xuanFamilyResidualDutyActive &&
       candidateSize <= xuanResidualDutyMaxQty + 1e-9
     ) {
       xuanResidualDutyCompletionAllowed = true;
     }
-    const plannedOppositeMaxPrice = plannedOppositeDeadlineActive
+    const plannedOppositeMaxPrice = plannedOppositeDeadlineActive || plannedOppositeProtectiveRelease
       ? plannedOppositeCloseableMaxPrice
       : plannedOppositeTargetMaxPrice;
     const xuanCloseablePlannedOppositeCompletion =
@@ -658,6 +689,7 @@ function chooseCompletion(
       ctx.secsToClose > config.finalWindowNoChaseSec &&
       (isAggressivePublicFootprint(config)
         ? xuanPriorCompletionAllowed ||
+          plannedOppositeProtectiveRelease ||
           plannedOppositeTargetRelease ||
           plannedOppositeCloseableRelease ||
           (plannedOppositePriceTargetMet && (xuanCostDisciplinedCompletion || xuanCloseablePlannedOppositeCompletion))
@@ -674,7 +706,8 @@ function chooseCompletion(
         secsToClose: ctx.secsToClose,
         effectiveCost: costWithFees,
         exactPriorActive: Boolean(exactCompletionQtyPrior),
-      })
+      }) &&
+      !plannedOppositeProtectiveRelease
     ) {
       continue;
     }
@@ -693,6 +726,7 @@ function chooseCompletion(
       isAggressivePublicFootprint(config) &&
       (!plannedOppositePriceTargetMet || (!xuanCostDisciplinedCompletion && !xuanCloseablePlannedOppositeCompletion)) &&
       !plannedOppositeCloseableRelease &&
+      !plannedOppositeProtectiveRelease &&
       !xuanPriorCompletionAllowed &&
       ctx.secsToClose > config.finalWindowCompletionOnlySec
     ) {

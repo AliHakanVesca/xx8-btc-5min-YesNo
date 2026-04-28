@@ -109,7 +109,7 @@ describe("live paper analytics", () => {
     expect(scored.blockers).toEqual([]);
   });
 
-  it("keeps negative merge pnl as an economics warning, not a behavior blocker", () => {
+  it("treats negative merge pnl as a xuan-strict blocker", () => {
     const scored = scoreXuanConformance({
       rawScore: 90,
       fillCount: 4,
@@ -124,12 +124,37 @@ describe("live paper analytics", () => {
       completionSec: 20,
       imbalanceShares: 0,
       residualShares: 0.02,
+      negativeMergePnlCount: 1,
     });
 
-    expect(scored.score).toBe(90);
-    expect(scored.status).toBe("PASS");
-    expect(scored.blockers).not.toContain("negative_merge_pnl");
+    expect(scored.score).toBe(74);
+    expect(scored.status).toBe("WARN");
+    expect(scored.blockers).toContain("negative_merge_pnl");
     expect(scored.economicsWarnings).toContain("negative_merge_pnl");
+  });
+
+  it("blocks xuan PASS for high-cost seeds and unclosed late seeds", () => {
+    const scored = scoreXuanConformance({
+      rawScore: 90,
+      fillCount: 5,
+      minFillCountForPass: 3,
+      mergedQty: 50,
+      mergeRealizedPnl: 0.2,
+      requireProfit: true,
+      pairedContinuationCount: 1,
+      independentFlowCount: 1,
+      requirePairedContinuation: true,
+      firstFillSec: 0,
+      completionSec: 20,
+      imbalanceShares: 0,
+      residualShares: 0.02,
+      highCostSeedCount: 1,
+      lateSeedUnclosedCount: 1,
+    });
+
+    expect(scored.score).toBe(74);
+    expect(scored.status).toBe("WARN");
+    expect(scored.blockers).toEqual(expect.arrayContaining(["high_cost_seed", "late_seed_unclosed"]));
   });
 
   it("does not count split completions as real xuan continuation for PASS", () => {

@@ -150,6 +150,11 @@ export interface LivePaperSummary {
   xuanPreopenBlockedCount?: number;
   xuanRiskGatedBlockedCount?: number;
   xuanFinalMergeForced?: boolean;
+  xuanHighCostSeedCount?: number;
+  xuanHighCostSeedMaxPairCost?: number;
+  xuanLateSeedUnclosedCount?: number;
+  xuanNegativeMergePnlCount?: number;
+  xuanResidualDutyBlockedTop?: string;
   xuanNoTradeReason?: string;
   xuanEarlyNoTradeReason?: string;
   xuanPassBlockers?: string[];
@@ -391,13 +396,22 @@ export function scoreXuanConformance(args: {
   sameSecondDualBuyRate?: number | undefined;
   oppositeLegGapMedianSec?: number | undefined;
   buyRowsPerMarket?: number | undefined;
+  highCostSeedCount?: number | undefined;
+  lateSeedUnclosedCount?: number | undefined;
+  negativeMergePnlCount?: number | undefined;
 }): { score: number; status: "PASS" | "WARN" | "FAIL"; blockers: string[]; economicsWarnings: string[] } {
+  const negativeMergePnlActive =
+    args.requireProfit === true &&
+    ((args.negativeMergePnlCount ?? 0) > 0 || (args.mergeRealizedPnl ?? 0) < 0);
   const economicsWarnings = [
-    ...(args.requireProfit === true && (args.mergeRealizedPnl ?? 0) < 0 ? ["negative_merge_pnl"] : []),
+    ...(negativeMergePnlActive ? ["negative_merge_pnl"] : []),
   ];
   const blockers = [
     ...(args.mergedQty > 0 ? [] : ["missing_merge"]),
     ...(args.fillCount >= args.minFillCountForPass ? [] : ["insufficient_fill_count"]),
+    ...(negativeMergePnlActive ? ["negative_merge_pnl"] : []),
+    ...((args.highCostSeedCount ?? 0) > 0 ? ["high_cost_seed"] : []),
+    ...((args.lateSeedUnclosedCount ?? 0) > 0 ? ["late_seed_unclosed"] : []),
     ...(args.requirePairedContinuation !== true || (args.pairedContinuationCount ?? 0) > 0
       ? []
       : ["missing_paired_continuation"]),
@@ -407,7 +421,7 @@ export function scoreXuanConformance(args: {
     ...((args.debtHoldMaxSec ?? 0) >= 270 ? ["debt_carried_too_long"] : []),
     ...(args.firstFillSec !== undefined && args.firstFillSec <= 15 ? [] : ["late_or_missing_first_fill"]),
     ...(args.completionSec !== undefined && args.completionSec <= 120 ? [] : ["late_or_missing_completion"]),
-    ...(args.imbalanceShares <= 1 && args.residualShares <= 1 ? [] : ["residual_not_flat"]),
+    ...(args.imbalanceShares <= 0.02 && args.residualShares <= 0.02 ? [] : ["residual_not_flat"]),
     ...((args.sameSecondDualBuyRate ?? 0) <= 0.12 ? [] : ["same_second_dual_buy_rate_high"]),
     ...(args.oppositeLegGapMedianSec === undefined || args.oppositeLegGapMedianSec >= 8
       ? []
@@ -1110,9 +1124,38 @@ function enrichSummaryWithExecution(args: {
   const mergedExecutions = args.merges.filter((merge) => merge.status === "merged");
   const mergeRealizedPnl = normalize(mergedExecutions.reduce((acc, merge) => acc + merge.realizedPnl, 0));
   const lastMergeRealizedPnl = normalize(mergedExecutions.at(-1)?.realizedPnl ?? 0);
+  const negativeMergePnlCount = mergedExecutions.filter((merge) => merge.realizedPnl < -1e-9).length;
   const imbalanceShares = normalize(Math.abs(finalState.upShares - finalState.downShares));
   const residualShares = normalize(finalState.upShares + finalState.downShares);
   const pairUnderOneFillCount = buyFills.filter((execution) => execution.averagePrice <= 0.5).length;
+  const highCostSeedPairs = buyFills
+    .filter(
+      (execution) =>
+        isXuanStagedSeed(execution) &&
+        execution.filledShares > 20 + 1e-9 &&
+        (execution.pairCostWithFees ?? execution.projectedBasketEffectivePair ?? 0) > 1.06 + 1e-9,
+    )
+    .map((execution) => execution.pairCostWithFees ?? execution.projectedBasketEffectivePair ?? 0)
+    .filter((pairCost) => Number.isFinite(pairCost) && pairCost > 0);
+  const highCostSeedMaxPairCost =
+    highCostSeedPairs.length > 0 ? normalize(Math.max(...highCostSeedPairs)) : undefined;
+  const lateStagedSeeds = buyFills.filter(
+    (execution) => isXuanStagedSeed(execution) && execution.timestamp - args.marketStartTs >= 200,
+  );
+  const residualDominantSide: OutcomeSide | undefined =
+    residualShares > 0.02
+      ? finalState.upShares > finalState.downShares + 0.02
+        ? "UP"
+        : finalState.downShares > finalState.upShares + 0.02
+          ? "DOWN"
+          : undefined
+      : undefined;
+  const lateSeedUnclosedCount =
+    residualShares > 0.02
+      ? lateStagedSeeds.filter(
+          (execution) => residualDominantSide === undefined || execution.outcome === residualDominantSide,
+        ).length
+      : 0;
   const mergeReadyButSkippedCount = args.merges.filter(
     (merge) => merge.status === "skipped" && merge.requestedShares > 0,
   ).length;
@@ -1135,6 +1178,21 @@ function enrichSummaryWithExecution(args: {
     firstDebtHoldTs !== undefined && lastDebtHoldTs !== undefined
       ? Math.max(0, lastDebtHoldTs - firstDebtHoldTs)
       : 0;
+  const residualDutyReasonPrefixes = [
+    "lagging_depth",
+    "residual_completion_cost_basis_cap",
+    "repair_phase_cap",
+    "repair_qty_cap",
+    "below_min",
+    "rebalance_imbalance",
+    "planned_opposite_hold",
+    "xuan_pair_cost_wait",
+    "pair_cap+single_leg_seed",
+    "temporal_cycle_density",
+  ];
+  const residualDutyBlockedTop = [...args.noTradeReasons.entries()]
+    .filter(([reason]) => residualDutyReasonPrefixes.some((prefix) => reason === prefix || reason.startsWith(`${prefix}:`)))
+    .sort((left, right) => right[1] - left[1])[0]?.[0];
   const scoreParts = [
     firstFillTs !== undefined && firstFillTs - args.marketStartTs <= 15 ? 20 : 0,
     completionTs !== undefined && completionTs - args.marketStartTs <= 120 ? 20 : 0,
@@ -1162,6 +1220,9 @@ function enrichSummaryWithExecution(args: {
     sameSecondDualBuyRate,
     ...(oppositeLegGapMedianSec !== undefined ? { oppositeLegGapMedianSec } : {}),
     buyRowsPerMarket: buyFills.length,
+    highCostSeedCount: highCostSeedPairs.length,
+    lateSeedUnclosedCount,
+    negativeMergePnlCount,
   });
   const xuanNoTradeReason = [...args.noTradeReasons.entries()].sort((left, right) => right[1] - left[1])[0]?.[0];
   const xuanFinalMergeForced = args.merges.some((merge) => merge.status === "merged" && merge.forced);
@@ -1225,6 +1286,11 @@ function enrichSummaryWithExecution(args: {
     xuanPreopenBlockedCount: args.preopenBlockedCount,
     xuanRiskGatedBlockedCount: args.riskGatedBlockedCount,
     xuanFinalMergeForced,
+    xuanHighCostSeedCount: highCostSeedPairs.length,
+    ...(highCostSeedMaxPairCost !== undefined ? { xuanHighCostSeedMaxPairCost: highCostSeedMaxPairCost } : {}),
+    xuanLateSeedUnclosedCount: lateSeedUnclosedCount,
+    xuanNegativeMergePnlCount: negativeMergePnlCount,
+    ...(residualDutyBlockedTop ? { xuanResidualDutyBlockedTop: residualDutyBlockedTop } : {}),
     ...(xuanNoTradeReason ? { xuanNoTradeReason } : {}),
     xuanPassBlockers: xuanScore.blockers,
     xuanEconomicsWarnings: xuanScore.economicsWarnings,

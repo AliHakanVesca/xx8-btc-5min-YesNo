@@ -281,6 +281,98 @@ function medianNumber(values: number[]): number | undefined {
   return ((sorted[middle - 1] ?? 0) + (sorted[middle] ?? 0)) / 2;
 }
 
+const XUAN_STAGED_OPPOSITE_MIN_GAP_SEC = 8;
+const XUAN_STAGED_OPPOSITE_MAX_GAP_SEC = 180;
+
+export interface XuanLivePaperBehaviorMetrics {
+  stagedOppositeSeedCount: number;
+  stagedOppositeReleaseCount: number;
+  stagedOppositeReleaseRate: number;
+  pairedContinuationCount: number;
+  independentFlowCount: number;
+  debtReducingContinuationCount: number;
+}
+
+function isXuanStagedSeed(execution: LivePaperOrderExecution): boolean {
+  return execution.mode === "PAIRGROUP_COVERED_SEED" || execution.mode === "TEMPORAL_SINGLE_LEG_SEED";
+}
+
+function isXuanStagedRelease(execution: LivePaperOrderExecution): boolean {
+  return (
+    execution.kind === "completion" ||
+    execution.reason === "lagging_rebalance" ||
+    execution.mode === "PARTIAL_SOFT_COMPLETION" ||
+    execution.mode === "PARTIAL_FAST_COMPLETION" ||
+    execution.mode === "CHEAP_LATE_COMPLETION_CHASE" ||
+    execution.mode === "HIGH_LOW_COMPLETION_CHASE"
+  );
+}
+
+export function computeXuanLivePaperBehaviorMetrics(
+  executions: LivePaperOrderExecution[],
+): XuanLivePaperBehaviorMetrics {
+  const buyFills = executions
+    .filter((execution) => execution.tradeSide === "BUY" && execution.filledShares > 1e-9)
+    .sort((left, right) => left.timestamp - right.timestamp);
+  const sameTickContinuationGroups = new Map<number, Set<OutcomeSide>>();
+  let debtReducingContinuationCount = 0;
+  for (const execution of buyFills) {
+    const isSameTickPairContinuation =
+      execution.kind === "entry" &&
+      execution.reason !== "lagging_rebalance" &&
+      (execution.reason === "balanced_pair_reentry" ||
+        execution.mode === "STRICT_PAIR_SWEEP" ||
+        execution.mode === "XUAN_SOFT_PAIR_SWEEP" ||
+        execution.mode === "XUAN_HARD_PAIR_SWEEP" ||
+        execution.projectedBasketEffectivePair !== undefined);
+    if (!isSameTickPairContinuation) {
+      continue;
+    }
+    const sides = sameTickContinuationGroups.get(execution.timestamp) ?? new Set<OutcomeSide>();
+    sides.add(execution.outcome);
+    sameTickContinuationGroups.set(execution.timestamp, sides);
+  }
+  const sameTickPairedContinuationCount = [...sameTickContinuationGroups.values()].filter(
+    (sides) => sides.has("UP") && sides.has("DOWN"),
+  ).length;
+  let stagedOppositeReleaseCount = 0;
+  for (let index = 1; index < buyFills.length; index += 1) {
+    const execution = buyFills[index]!;
+    if (!isXuanStagedRelease(execution)) {
+      continue;
+    }
+    const previousOpposite = [...buyFills]
+      .slice(0, index)
+      .reverse()
+      .find((candidate) => candidate.outcome !== execution.outcome);
+    if (!previousOpposite) {
+      continue;
+    }
+    const gapSec = execution.timestamp - previousOpposite.timestamp;
+    if (gapSec < XUAN_STAGED_OPPOSITE_MIN_GAP_SEC || gapSec > XUAN_STAGED_OPPOSITE_MAX_GAP_SEC) {
+      continue;
+    }
+    stagedOppositeReleaseCount += 1;
+    const effectivePair = execution.projectedBasketEffectivePair ?? execution.pairCostWithFees;
+    if (effectivePair !== undefined && effectivePair <= 1 + 1e-9) {
+      debtReducingContinuationCount += 1;
+    }
+  }
+  const stagedOppositeSeedCount = buyFills.filter(isXuanStagedSeed).length;
+  const stagedOppositeReleaseRate = Math.min(
+    1,
+    stagedOppositeReleaseCount / Math.max(stagedOppositeSeedCount, 1),
+  );
+  return {
+    stagedOppositeSeedCount,
+    stagedOppositeReleaseCount,
+    stagedOppositeReleaseRate: normalize(stagedOppositeReleaseRate),
+    pairedContinuationCount: sameTickPairedContinuationCount + stagedOppositeReleaseCount,
+    independentFlowCount: stagedOppositeReleaseCount,
+    debtReducingContinuationCount,
+  };
+}
+
 export function scoreXuanConformance(args: {
   rawScore: number;
   fillCount: number;
@@ -1006,39 +1098,9 @@ function enrichSummaryWithExecution(args: {
     }, []);
   const oppositeLegGapMedianSec = medianNumber(oppositeLegGaps);
   const medianTradeSize = medianNumber(buyFills.map((execution) => execution.filledShares));
-  const stagedOppositeSeedCount = buyFills.filter((execution) => execution.mode === "PAIRGROUP_COVERED_SEED").length;
-  const stagedOppositeReleaseCount = completionFills.filter(
-    (execution) => execution.mode === "HIGH_LOW_COMPLETION_CHASE",
-  ).length;
-  const stagedOppositeReleaseRate = stagedOppositeReleaseCount / Math.max(stagedOppositeSeedCount, 1);
-  const pairedContinuationGroups = new Map<number, Set<OutcomeSide>>();
-  let debtReducingContinuationCount = 0;
-  for (const execution of buyFills) {
-    const isPairedContinuation =
-      execution.kind === "entry" &&
-      execution.reason !== "lagging_rebalance" &&
-      (execution.reason === "balanced_pair_reentry" ||
-        execution.mode === "STRICT_PAIR_SWEEP" ||
-        execution.mode === "XUAN_SOFT_PAIR_SWEEP" ||
-        execution.mode === "XUAN_HARD_PAIR_SWEEP" ||
-        execution.projectedBasketEffectivePair !== undefined);
-    if (!isPairedContinuation) {
-      continue;
-    }
-    const sides = pairedContinuationGroups.get(execution.timestamp) ?? new Set<OutcomeSide>();
-    sides.add(execution.outcome);
-    pairedContinuationGroups.set(execution.timestamp, sides);
-    if (
-      execution.projectedBasketEffectivePair !== undefined &&
-      execution.projectedBasketEffectivePair <= 1 + 1e-9
-    ) {
-      debtReducingContinuationCount += 1;
-    }
-  }
-  const pairedContinuationCount = [...pairedContinuationGroups.values()].filter(
-    (sides) => sides.has("UP") && sides.has("DOWN"),
-  ).length;
-  const independentFlowCount = pairedContinuationCount;
+  const behaviorMetrics = computeXuanLivePaperBehaviorMetrics(filledExecutions);
+  const pairedContinuationCount = behaviorMetrics.pairedContinuationCount;
+  const independentFlowCount = behaviorMetrics.independentFlowCount;
   const completionOnlyFillCount = completionFills.length;
   const firstFillTs = buyFills.length > 0 ? Math.min(...buyFills.map((execution) => execution.timestamp)) : undefined;
   const completionTs =
@@ -1148,10 +1210,10 @@ function enrichSummaryWithExecution(args: {
     xuanSameSecondDualBuyRate: normalize(sameSecondDualBuyRate),
     ...(oppositeLegGapMedianSec !== undefined ? { xuanOppositeLegGapMedianSec: normalize(oppositeLegGapMedianSec) } : {}),
     ...(medianTradeSize !== undefined ? { xuanMedianTradeSize: normalize(medianTradeSize) } : {}),
-    xuanStagedOppositeSeedCount: stagedOppositeSeedCount,
-    xuanStagedOppositeReleaseCount: stagedOppositeReleaseCount,
-    xuanStagedOppositeReleaseRate: normalize(stagedOppositeReleaseRate),
-    xuanDebtReducingContinuationCount: Math.floor(debtReducingContinuationCount / 2),
+    xuanStagedOppositeSeedCount: behaviorMetrics.stagedOppositeSeedCount,
+    xuanStagedOppositeReleaseCount: behaviorMetrics.stagedOppositeReleaseCount,
+    xuanStagedOppositeReleaseRate: behaviorMetrics.stagedOppositeReleaseRate,
+    xuanDebtReducingContinuationCount: behaviorMetrics.debtReducingContinuationCount,
     xuanDebtHoldMaxSec: normalize(debtHoldMaxSec),
     ...(args.xuanRhythmWaitSec !== undefined ? { xuanRhythmWaitSec: normalize(args.xuanRhythmWaitSec) } : {}),
     xuanCompletionDelayedCount: args.xuanCompletionDelayedCount,

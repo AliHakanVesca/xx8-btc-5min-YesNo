@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 import {
   buildLivePaperSample,
   buildLivePaperTick,
+  computeXuanLivePaperBehaviorMetrics,
   scoreXuanConformance,
   summarizeLivePaperSamples,
+  type LivePaperOrderExecution,
 } from "../../src/analytics/livePaper.js";
 import { buildOfflineMarket } from "../../src/infra/gamma/marketDiscovery.js";
 import { parseEnv } from "../../src/config/env.js";
@@ -21,6 +23,44 @@ function buildBook(assetId: string, market: string, bid: number, ask: number, ti
     tickSize: 0.01,
     minOrderSize: 5,
     negRisk: false,
+  };
+}
+
+function buildExecution(
+  timestamp: number,
+  outcome: "UP" | "DOWN",
+  kind: LivePaperOrderExecution["kind"],
+  mode: LivePaperOrderExecution["mode"],
+  reason: string,
+  pairCostWithFees?: number,
+): LivePaperOrderExecution {
+  return {
+    timestamp,
+    kind,
+    status: "filled",
+    outcome,
+    tradeSide: "BUY",
+    requestedShares: 80,
+    filledShares: 80,
+    averagePrice: 0.48,
+    limitPrice: 0.48,
+    rawNotional: 38.4,
+    feeUsd: 1,
+    effectiveNotional: 39.4,
+    fullyFilled: true,
+    reason,
+    orderType: "FAK",
+    order: {
+      tokenId: outcome,
+      side: "BUY",
+      amount: 38.4,
+      shareTarget: 80,
+      price: 0.48,
+      orderType: "FAK",
+    },
+    consumedLevels: [{ price: 0.48, size: 80 }],
+    ...(mode !== undefined ? { mode } : {}),
+    ...(pairCostWithFees !== undefined ? { pairCostWithFees } : {}),
   };
 }
 
@@ -114,6 +154,22 @@ describe("live paper analytics", () => {
     expect(scored.blockers).toEqual(
       expect.arrayContaining(["missing_paired_continuation", "insufficient_independent_flow"]),
     );
+  });
+
+  it("counts delayed opposite releases as xuan staged continuation", () => {
+    const metrics = computeXuanLivePaperBehaviorMetrics([
+      buildExecution(100, "DOWN", "entry", "PAIRGROUP_COVERED_SEED", "balanced_pair_seed"),
+      buildExecution(125, "UP", "completion", "PARTIAL_SOFT_COMPLETION", "hard", 0.98),
+      buildExecution(150, "DOWN", "entry", "PARTIAL_SOFT_COMPLETION", "lagging_rebalance", 0.97),
+      buildExecution(151, "UP", "entry", "PARTIAL_FAST_COMPLETION", "lagging_rebalance", 0.96),
+    ]);
+
+    expect(metrics.stagedOppositeSeedCount).toBe(1);
+    expect(metrics.stagedOppositeReleaseCount).toBe(2);
+    expect(metrics.stagedOppositeReleaseRate).toBe(1);
+    expect(metrics.pairedContinuationCount).toBe(2);
+    expect(metrics.independentFlowCount).toBe(2);
+    expect(metrics.debtReducingContinuationCount).toBe(2);
   });
 
   it("builds a live paper sample with entry-buy-first decision when books are fresh", () => {

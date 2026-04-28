@@ -1,6 +1,16 @@
 
 ##############################################
 
+Version : V.0.0.41
+Date    : 28.04.2026
+Author  : Ali Hakan Çakır
+Changes : - Live paper XUAN staged opposite continuation metrik hesaplayicisi eklendi.
+          - Delayed opposite release ve debt-reducing continuation sayimlari testlendi.
+
+##############################################
+
+##############################################
+
 Version : V.0.0.40
 Date    : 27.04.2026
 Author  : Ali Hakan Çakır

@@ -1,6 +1,16 @@
 
 ##############################################
 
+Version : V.0.0.48
+Date    : 28.04.2026
+Author  : Ali Hakan Çakır
+Changes : - Post-cutover V2 production env varsayilanlari guncellendi.
+          - Live check canary onerileri ve README rollout notlari pUSD stack'e tasindi.
+
+##############################################
+
+##############################################
+
 Version : V.0.0.47
 Date    : 28.04.2026
 Author  : Ali Hakan Çakır

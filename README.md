@@ -60,7 +60,7 @@ Gerekli alanlar:
 Varsayilanlar guvenlik odaklidir:
 
 - `DRY_RUN=true`
-- `POLY_STACK_MODE=current-prod-v1`
+- `POLY_STACK_MODE=post-cutover-v2`
 - `CTF_MERGE_ENABLED=true`
 - `CTF_AUTO_REDEEM_ENABLED=true`
 - `ENTRY_TAKER_BUY_ENABLED=true`
@@ -108,9 +108,9 @@ Runtime xuan entry gate'leri varsayilan olarak fee dahil yeni cycle kalitesini `
 Polymarket dokumanina gore CLOB V2 go-live tarihi 28 Nisan 2026. Bu repo iki ayri runtime moda sahiptir:
 
 - `POLY_STACK_MODE=current-prod-v1`
-  Bugunku production stack. Varsayilan adapter V1, varsayilan CLOB base URL `https://clob.polymarket.com`, aktif collateral `POLY_USDC_TOKEN`.
+  Legacy pre-cutover stack. Varsayilan adapter V1, varsayilan CLOB base URL `https://clob.polymarket.com`, aktif collateral `POLY_USDC_TOKEN`.
 - `POLY_STACK_MODE=post-cutover-v2`
-  Migration sonrasi stack. Varsayilan adapter V2, aktif collateral `POLY_PUSD_TOKEN`.
+  Guncel production stack. Varsayilan adapter V2, production CLOB base URL `https://clob.polymarket.com`, aktif collateral `POLY_PUSD_TOKEN`.
 
 `USE_CLOB_V2` ve `POLY_CLOB_BASE_URL` alanlarini bos birakirsan mode'dan turetilir. Tutarsiz kombinasyonlar load sirasinda hata verir.
 
@@ -128,9 +128,9 @@ Paper mode:
 Onerilen rollout:
 
 1. `DRY_RUN=true` ile en az bir seans paper
-2. current production icin `POLY_STACK_MODE=current-prod-v1`
+2. current production icin `POLY_STACK_MODE=post-cutover-v2`
 3. ayrik cuzdan, dusuk bakiye, `LOT_LADDER=20,40`
-4. live'a cikmadan once `POLY_USDC_TOKEN`, `CTF_CONTRACT_ADDRESS` ve API key setini doldur
+4. live'a cikmadan once `POLY_PUSD_TOKEN`, `CTF_CONTRACT_ADDRESS` ve API key setini doldur
    API key setini manuel aramak yerine `npm run clob:derive -- --write-env` ile turet
 5. `npm run live:check` ile preflight raporunu temizle
 6. safe/proxy kullaniyorsan `POLY_RELAYER_*` setini doldur ve `CTF_MERGE_ENABLED=true` ile `npm run live:check` raporunda `merge.ready=true` gor

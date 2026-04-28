@@ -1,5 +1,9 @@
 import { z } from "zod";
 
+const POLYGON_USDCE_TOKEN = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+const POLYGON_PUSD_TOKEN = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB";
+const POLYGON_CTF_CONTRACT = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
+
 const booleanString = z
   .union([z.boolean(), z.string(), z.undefined()])
   .transform((value) => {
@@ -69,7 +73,7 @@ export const envSchema = z.object({
   MERGEABLE_INVENTORY_POLICY: z.enum(["MANUAL", "AUTO_MERGE"]).default("AUTO_MERGE"),
   STARTUP_RESIDUAL_POLICY: z.enum(["REPORT_ONLY", "AUTO_MANAGE"]).default("AUTO_MANAGE"),
   LOW_COLLATERAL_MODE: z.enum(["STOP", "NO_NEW_ENTRY_BUT_MANAGE"]).default("NO_NEW_ENTRY_BUT_MANAGE"),
-  POLY_STACK_MODE: z.enum(["current-prod-v1", "post-cutover-v2"]).default("current-prod-v1"),
+  POLY_STACK_MODE: z.enum(["current-prod-v1", "post-cutover-v2"]).default("post-cutover-v2"),
   USE_CLOB_V2: optionalBooleanString,
   LIVE_PAPER_START_AT_MARKET_OPEN: booleanString.default(true),
   LIVE_PAPER_MAX_CURRENT_MARKET_AGE_SEC: numberString.default(30),
@@ -106,10 +110,10 @@ export const envSchema = z.object({
   POLY_DATA_API_BASE_URL: z.string().url().default("https://data-api.polymarket.com"),
   POLY_MARKET_WS_URL: z.string().url().or(z.string().startsWith("wss://")).default("wss://ws-subscriptions-clob.polymarket.com/ws/market"),
   POLY_USER_WS_URL: z.string().url().or(z.string().startsWith("wss://")).default("wss://ws-subscriptions-clob.polymarket.com/ws/user"),
-  POLY_USDC_TOKEN: z.string().default("0x0000000000000000000000000000000000000000"),
-  POLY_PUSD_TOKEN: z.string().default("0x0000000000000000000000000000000000000000"),
+  POLY_USDC_TOKEN: z.string().default(POLYGON_USDCE_TOKEN),
+  POLY_PUSD_TOKEN: z.string().default(POLYGON_PUSD_TOKEN),
   POLY_COLLATERAL_TOKEN: optionalString,
-  CTF_CONTRACT_ADDRESS: z.string().default("0x0000000000000000000000000000000000000000"),
+  CTF_CONTRACT_ADDRESS: z.string().default(POLYGON_CTF_CONTRACT),
   CTF_MERGE_ENABLED: booleanString.default(true),
   CTF_AUTO_REDEEM_ENABLED: booleanString.default(true),
   MERGE_MIN_SHARES: numberString.default(1),

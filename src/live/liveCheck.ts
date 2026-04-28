@@ -259,6 +259,11 @@ function extractXuanAggressiveCloneReadiness(
 
 function recommendedCanaryEnv(): Record<string, string> {
   const report = {
+    POLY_STACK_MODE: "post-cutover-v2",
+    USE_CLOB_V2: "true",
+    POLY_CLOB_BASE_URL: "https://clob.polymarket.com",
+    POLY_PUSD_TOKEN: "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB",
+    POLY_COLLATERAL_TOKEN: "",
     DRY_RUN: "false",
     CTF_MERGE_ENABLED: "true",
     STATE_STORE: "SQLITE",

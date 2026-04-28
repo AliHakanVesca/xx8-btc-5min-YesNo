@@ -74,6 +74,17 @@ function oppositeSide(side: OutcomeSide): OutcomeSide {
   return side === "UP" ? "DOWN" : "UP";
 }
 
+function isPlannedOppositeCoverageMode(mode: StrategyExecutionMode | undefined): boolean {
+  return (
+    mode === "HIGH_LOW_COMPLETION_CHASE" ||
+    mode === "CHEAP_LATE_COMPLETION_CHASE" ||
+    mode === "PARTIAL_FAST_COMPLETION" ||
+    mode === "PARTIAL_SOFT_COMPLETION" ||
+    mode === "PARTIAL_EMERGENCY_COMPLETION" ||
+    mode === "POST_MERGE_RESIDUAL_COMPLETION"
+  );
+}
+
 export function plannedOppositeCompletionState(
   state: XuanMarketState,
   nowTs: number,
@@ -92,7 +103,7 @@ export function plannedOppositeCompletionState(
       const opposite = oppositeSide(side);
       const oppositeLots = opposite === "UP" ? state.upLots : state.downLots;
       const oppositeShares = oppositeLots
-        .filter((lot) => lot.timestamp >= openedAt && lot.executionMode === "HIGH_LOW_COMPLETION_CHASE")
+        .filter((lot) => lot.timestamp >= openedAt && isPlannedOppositeCoverageMode(lot.executionMode))
         .reduce((sum, lot) => sum + lot.size, 0);
       const sameShares = side === "UP" ? state.upShares : state.downShares;
       const existingOppositeCoverage = Math.min(oppositeShares, plannedQty);

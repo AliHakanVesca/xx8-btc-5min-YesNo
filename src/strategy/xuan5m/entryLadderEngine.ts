@@ -668,7 +668,8 @@ function aggressiveOppositeReleaseHold(args: {
     return undefined;
   }
   const ageSec = Math.max(0, args.nowTs - lastBuy.timestamp);
-  const waitSec = plannedOppositeMinWaitSec(args.config);
+  const secsFromOpen = Math.max(0, args.nowTs - args.state.market.startTs);
+  const waitSec = plannedOppositeMinWaitSec(args.config, secsFromOpen, args.secsToClose);
   if (ageSec >= waitSec - 1e-9) {
     return undefined;
   }
@@ -743,7 +744,7 @@ function xuanTemporalSeedRhythmSkipReason(args: {
   const sameSideSpam = rhythmReferenceFill.outcome === args.candidateSide;
   const strictOppositeStaging = isAggressivePublicFootprint(args.config) && !sameSideSpam;
   const waitSec = strictOppositeStaging
-    ? plannedOppositeMinWaitSec(args.config)
+    ? plannedOppositeMinWaitSec(args.config, args.ctx.secsFromOpen, args.ctx.secsToClose)
     : xuanRhythmWaitForCost(args.config, args.referencePairCost, debtPositive);
   const earlyRelease =
     !strictOppositeStaging &&
@@ -1703,8 +1704,16 @@ function balancedDebtContinuationQtyCap(
   }
 
   const qtyNeeded = basketState.basketDebtUSDC / edgePerPair;
+  const aggressivePublicFootprint = isAggressivePublicFootprint(config);
+  const xuanMinContinuationClip = aggressivePublicFootprint
+    ? Math.min(
+        maxCandidateSize,
+        Math.max(state.market.minOrderSize, config.liveSmallLotLadder[0] ?? config.defaultLot),
+      )
+    : 0;
+  const effectiveQtyNeeded = aggressivePublicFootprint ? Math.max(qtyNeeded, xuanMinContinuationClip) : qtyNeeded;
   return normalizeOrderSize(
-    Math.min(maxCandidateSize, config.marketBasketContinuationMaxQty, qtyNeeded),
+    Math.min(maxCandidateSize, config.marketBasketContinuationMaxQty, effectiveQtyNeeded),
     state.market.minOrderSize,
   );
 }
@@ -2296,6 +2305,15 @@ function freshCycleRequestedLotCapForBooks(
 ): { lot: number; recoveryPlan?: InitialBasketRecoveryPlan | undefined } {
   const requestedLot = ctx.lot;
   const baseCap = freshCycleRequestedLotCap(config, state, requestedLot, referencePriorActive);
+  const aggressivePostMergeRecycle =
+    isAggressivePublicFootprint(config) &&
+    state.mergeHistory.length > 0 &&
+    ctx.secsFromOpen >= 160 &&
+    ctx.secsToClose > config.finalWindowCompletionOnlySec &&
+    Math.abs(state.upShares - state.downShares) <= xuanFreshCycleFlatDustThreshold(config, state) + 1e-9;
+  if (aggressivePostMergeRecycle) {
+    return { lot: requestedLot };
+  }
   if (!config.marketBasketScoringEnabled || referencePriorActive || baseCap >= requestedLot - 1e-9) {
     return { lot: baseCap };
   }
@@ -3278,15 +3296,21 @@ export function evaluateEntryBuys(
   const partialAgeSec =
     residualTimestamp !== undefined ? Math.max(0, nowTs - residualTimestamp) : config.partialSoftWindowSec;
   const plannedOpposite = plannedOppositeCompletionState(state, nowTs, Math.max(config.postMergeFlatDustShares, 1e-6));
-  const plannedOppositeMaterialQty = Math.max(
-    config.controlledOverlapMinResidualShares,
-    config.microRepairMaxQty + state.market.minOrderSize,
-  );
+  const latePlannedOppositeDutyActive =
+    aggressivePublicFootprint &&
+    ctx.secsFromOpen >= 250 &&
+    ctx.secsToClose > config.finalWindowNoChaseSec;
+  const plannedOppositeMaterialQty = latePlannedOppositeDutyActive
+    ? state.market.minOrderSize
+    : Math.max(
+        config.controlledOverlapMinResidualShares,
+        config.microRepairMaxQty + state.market.minOrderSize,
+      );
   const plannedOppositeTimingReady =
     plannedOpposite === undefined ||
     !isAggressivePublicFootprint(config) ||
     exactCompletionQtyPrior !== undefined ||
-    plannedOpposite.plannedOppositeAgeSec >= plannedOppositeMinWaitSec(config) - 1e-9 ||
+    plannedOpposite.plannedOppositeAgeSec >= plannedOppositeMinWaitSec(config, ctx.secsFromOpen, ctx.secsToClose) - 1e-9 ||
     ctx.secsToClose <= config.finalWindowCompletionOnlySec;
   const plannedOppositeDutyActive =
     plannedOpposite !== undefined &&
@@ -6025,7 +6049,10 @@ function inspectBalancedPairCandidates(
     const xuanStrictSequenceClipMax = Math.max(
       state.market.minOrderSize,
       config.xuanMicroPairMaxQty,
-      Math.min(config.liveSmallLotLadder[0] ?? config.defaultLot, 30),
+      Math.min(
+        config.xuanBasketCampaignCompletionClipMaxQty,
+        Math.max(145, config.liveSmallLotLadder[0] ?? config.defaultLot),
+      ),
     );
     const balancedMicroPairReady =
       config.xuanMicroPairContinuationEnabled &&
@@ -7246,8 +7273,14 @@ function preferredStagedPairSeedSide(
   return candidate.upExecution.averagePrice <= candidate.downExecution.averagePrice ? "UP" : "DOWN";
 }
 
-function plannedOppositeMinWaitSec(config: XuanStrategyConfig): number {
+function plannedOppositeMinWaitSec(config: XuanStrategyConfig, secsFromOpen?: number, secsToClose?: number): number {
   if (!isAggressivePublicFootprint(config)) {
+    return 0;
+  }
+  if (
+    (secsFromOpen !== undefined && secsFromOpen >= 250) ||
+    (secsToClose !== undefined && secsToClose <= Math.max(50, config.finalWindowCompletionOnlySec))
+  ) {
     return 0;
   }
   return Math.min(
@@ -7275,7 +7308,6 @@ function buildAggressiveStagedPairSeed(args: {
 }): BalancedPairEntryPlan | undefined {
   if (
     !isAggressivePublicFootprint(args.config) ||
-    args.candidate.mode === "STRICT_PAIR_SWEEP" ||
     hasExactSameSecondDualSeedPrior(args.state.market.slug, args.secsFromOpen)
   ) {
     return undefined;
@@ -7300,10 +7332,21 @@ function buildAggressiveStagedPairSeed(args: {
     0,
     args.candidate.rawPairCost,
   );
-  const minWaitSec = plannedOppositeMinWaitSec(args.config);
+  const secsToClose = Math.max(0, args.state.market.endTs - (args.state.market.startTs + args.secsFromOpen));
+  const minWaitSec = plannedOppositeMinWaitSec(args.config, args.secsFromOpen, secsToClose);
+  const finalCompletionDeadlineSec = Math.min(
+    276,
+    args.state.market.endTs - args.state.market.startTs - args.config.finalWindowNoChaseSec,
+  );
+  if (args.secsFromOpen >= 276) {
+    return undefined;
+  }
+  if (args.secsFromOpen >= 250 && args.secsFromOpen + minWaitSec > finalCompletionDeadlineSec + 1e-9) {
+    return undefined;
+  }
   const deadlineSec = Math.min(
     Math.max(args.secsFromOpen + minWaitSec, args.secsFromOpen + args.config.completionTargetMaxDelaySec),
-    282,
+    args.secsFromOpen >= 250 ? finalCompletionDeadlineSec : 282,
   );
 
   return {

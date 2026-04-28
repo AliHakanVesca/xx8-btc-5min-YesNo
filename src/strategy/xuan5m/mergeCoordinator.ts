@@ -39,6 +39,7 @@ export interface MergeGateDecision extends MergeBatchMetrics {
     | "public_footprint_hold"
     | "basket_debt_hold"
     | "planned_opposite_hold"
+    | "negative_economics_hold"
     | "cycle_target"
     | "basket_target"
     | "age_target"
@@ -286,6 +287,7 @@ export function evaluateDelayedMergeGate(
     config.marketBasketScoringEnabled && metrics.pendingMatchedQty > 1e-6
       ? matchedEffectivePairCost(state, config.cryptoTakerFeeRate)
       : undefined;
+  const secsFromOpen = args.secsFromOpen ?? Number.POSITIVE_INFINITY;
   const plannedOpposite = plannedOppositeCompletionState(
     state,
     args.nowTs,
@@ -294,11 +296,52 @@ export function evaluateDelayedMergeGate(
   const materialPlannedOppositeThreshold = aggressivePublicFootprint
     ? Math.max(state.market.minOrderSize, config.marketBasketMinMergeShares * 0.5)
     : Math.max(state.market.minOrderSize, config.marketBasketMinMergeShares * 0.1);
+  const plannedOppositeDustTolerance = aggressivePublicFootprint
+    ? Math.max(state.market.minOrderSize, config.marketBasketMinMergeShares * 0.05)
+    : Math.max(state.market.minOrderSize, config.marketBasketMinMergeShares * 0.01);
+  const aggressiveFamilyMergeReleaseWindow =
+    aggressivePublicFootprint &&
+    !exactMergePriorActive &&
+    secsFromOpen >= 160 &&
+    secsFromOpen <= 282 &&
+    metrics.pendingMatchedQty >= state.market.minOrderSize - 1e-9;
+  const plannedOppositeCompleteEnoughForMerge =
+    plannedOpposite !== undefined &&
+    (
+      plannedOpposite.plannedOppositeMissingQty <= plannedOppositeDustTolerance + 1e-9 ||
+      plannedOpposite.plannedOppositeFilledQty >=
+        Math.min(plannedOpposite.plannedOppositeQty, metrics.pendingMatchedQty) - plannedOppositeDustTolerance - 1e-9
+    );
   const plannedOppositeHoldActive =
     config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
     plannedOpposite !== undefined &&
     plannedOpposite.plannedOppositeMissingQty >= materialPlannedOppositeThreshold - 1e-9 &&
-    args.secsToClose > config.finalWindowCompletionOnlySec;
+    args.secsToClose > config.finalWindowCompletionOnlySec &&
+    !(aggressiveFamilyMergeReleaseWindow && plannedOppositeCompleteEnoughForMerge);
+  const finalResidualMergeWindow =
+    args.secsToClose <= config.finalWindowCompletionOnlySec ||
+    (
+      aggressivePublicFootprint &&
+      !exactMergePriorActive &&
+      secsFromOpen >= 276 &&
+      secsFromOpen <= 282
+    );
+  const aggressiveNormalRecycleNegativeEconomicsHold =
+    aggressivePublicFootprint &&
+    !exactMergePriorActive &&
+    basketEffectivePair !== undefined &&
+    basketEffectivePair > config.marketBasketMergeEffectivePairCap + 1e-9 &&
+    args.secsToClose > config.finalWindowCompletionOnlySec &&
+    !finalResidualMergeWindow;
+  const negativeEconomicsHoldDecision = (): MergeGateDecision => ({
+    allow: false,
+    forced: false,
+    reason: "negative_economics_hold",
+    mergeVsCarryDecision: "CARRY_TO_SETTLEMENT",
+    mergeVsCarryReason: "cycle_merge_negative_economics_hold",
+    ...(basketEffectivePair !== undefined ? { basketEffectivePair: normalize(basketEffectivePair) } : {}),
+    ...metrics,
+  });
 
   if (plannedOppositeHoldActive) {
     return {
@@ -311,15 +354,18 @@ export function evaluateDelayedMergeGate(
     };
   }
 
-  const secsFromOpen = args.secsFromOpen ?? Number.POSITIVE_INFINITY;
   const familyFirstMergeWindowActive =
     aggressivePublicFootprint &&
     !exactMergePriorActive &&
+    state.mergeHistory.length === 0 &&
     secsFromOpen >= 160 &&
     secsFromOpen <= 210 &&
     metrics.completedCycles >= Math.max(1, Math.min(effectiveMinCompletedCyclesBeforeFirstMerge, 2)) &&
     metrics.pendingMatchedQty >= config.marketBasketMinMergeShares - 1e-9;
   if (familyFirstMergeWindowActive) {
+    if (aggressiveNormalRecycleNegativeEconomicsHold) {
+      return negativeEconomicsHoldDecision();
+    }
     return {
       allow: true,
       forced: false,
@@ -345,7 +391,7 @@ export function evaluateDelayedMergeGate(
     };
   }
 
-  const aggressivePostMergeCycleReleaseActive =
+  const aggressivePostMergeCycleReleaseCandidate =
     aggressivePublicFootprint &&
     !exactMergePriorActive &&
     state.mergeHistory.length > 0 &&
@@ -356,7 +402,13 @@ export function evaluateDelayedMergeGate(
     metrics.oldestMatchedAgeSec >= Math.max(2, config.xuanRhythmMaxWaitSec) &&
     metrics.pendingMatchedQty >= state.market.minOrderSize - 1e-9 &&
     Math.abs(state.upShares - state.downShares) <= Math.max(state.market.minOrderSize, config.completionMinQty) + 1e-9;
-  if (aggressivePostMergeCycleReleaseActive) {
+  const aggressivePostMergeCycleEconomicsSafe =
+    basketEffectivePair === undefined ||
+    basketEffectivePair <= config.marketBasketMergeEffectivePairCap + 1e-9;
+  if (aggressivePostMergeCycleReleaseCandidate && !aggressivePostMergeCycleEconomicsSafe) {
+    return negativeEconomicsHoldDecision();
+  }
+  if (aggressivePostMergeCycleReleaseCandidate) {
     return {
       allow: true,
       forced: false,
@@ -451,6 +503,9 @@ export function evaluateDelayedMergeGate(
         ...metrics,
       };
     }
+    if (aggressiveNormalRecycleNegativeEconomicsHold) {
+      return negativeEconomicsHoldDecision();
+    }
     return {
       allow: true,
       forced: true,
@@ -544,6 +599,9 @@ export function evaluateDelayedMergeGate(
         ...metrics,
       };
     }
+    if (aggressiveNormalRecycleNegativeEconomicsHold) {
+      return negativeEconomicsHoldDecision();
+    }
     return {
       allow: true,
       forced: true,
@@ -587,7 +645,6 @@ export function evaluateDelayedMergeGate(
     basketEffectivePair !== undefined &&
     !strongEarlyBasketMerge &&
     metrics.pendingMatchedQty < basketMergeTargetShares - 1e-9;
-
   if (
     metrics.completedCycles >= effectiveMinCompletedCyclesBeforeFirstMerge &&
     (!config.requireMinAgeForCycleTargetMerge ||
@@ -610,6 +667,9 @@ export function evaluateDelayedMergeGate(
         reason: "public_footprint_hold",
         ...metrics,
       };
+    }
+    if (aggressiveNormalRecycleNegativeEconomicsHold) {
+      return negativeEconomicsHoldDecision();
     }
     return {
       allow: true,
@@ -650,6 +710,9 @@ export function evaluateDelayedMergeGate(
         reason: "public_footprint_hold",
         ...metrics,
       };
+    }
+    if (aggressiveNormalRecycleNegativeEconomicsHold) {
+      return negativeEconomicsHoldDecision();
     }
     return {
       allow: true,

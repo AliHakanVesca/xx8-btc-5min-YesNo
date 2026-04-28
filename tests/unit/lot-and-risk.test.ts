@@ -204,4 +204,50 @@ describe("lot ladder and risk windows", () => {
     expect(risk.reasons).not.toContain("rebalance_imbalance");
     expect(risk.allowNewEntries).toBe(true);
   });
+
+  it("does not force completion-only for managed xuan high-low recycle imbalance", () => {
+    const xuanConfig = buildStrategyConfig(
+      parseEnv({
+        DRY_RUN: "true",
+        POLY_STACK_MODE: "current-prod-v1",
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+        LIVE_SMALL_LOT_LADDER: "80,100,125,145",
+      }),
+    );
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 125,
+      price: 0.38,
+      timestamp: market.startTs + 80,
+      makerTaker: "taker",
+      executionMode: "PARTIAL_SOFT_COMPLETION",
+    });
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      size: 95,
+      price: 0.58,
+      timestamp: market.startTs + 81,
+      makerTaker: "taker",
+      executionMode: "HIGH_LOW_COMPLETION_CHASE",
+    });
+
+    const risk = evaluateRisk(xuanConfig, state, {
+      secsToClose: 24,
+      staleBookMs: 100,
+      balanceStaleMs: 100,
+      bookIsCrossed: false,
+      dailyLossUsdc: 0,
+      marketLossUsdc: 0,
+      usdcBalance: 100,
+    });
+
+    expect(risk.reasons).not.toContain("rebalance_imbalance");
+    expect(risk.completionOnly).toBe(false);
+  });
 });

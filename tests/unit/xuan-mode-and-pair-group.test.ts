@@ -544,6 +544,53 @@ describe("xuan mode and pair order groups", () => {
     expect(adjustment).toBeNull();
   });
 
+  it("strict aggressive clone releases late micro planned opposite instead of carrying final residual", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      size: 20,
+      price: 0.03,
+      timestamp: market.startTs + 264,
+      makerTaker: "taker",
+      executionMode: "PAIRGROUP_COVERED_SEED",
+    });
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.94, size: 200 }], [{ price: 0.95, size: 200 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.02, size: 200 }], [{ price: 0.03, size: 200 }]),
+    );
+
+    const adjustment = chooseInventoryAdjustment(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+      }),
+      state,
+      books,
+      {
+        secsToClose: 35,
+        nowTs: market.startTs + 265,
+        fairValueSnapshot: {
+          status: "live_missing",
+          estimatedThreshold: false,
+          note: "late-planned-opposite",
+        },
+      },
+    );
+
+    expect(adjustment?.completion).toMatchObject({
+      sideToBuy: "UP",
+      missingShares: 20,
+      plannedOppositeSide: "UP",
+      plannedOppositeQty: 20,
+      plannedOppositeMissingQty: 20,
+      plannedOppositeCompletionOpenedCount: 1,
+    });
+  });
+
   it("holds small merge while a material planned opposite pairgroup is still open", () => {
     const market = buildOfflineMarket(1713696000);
     let state = createMarketState(market);
@@ -7096,6 +7143,68 @@ describe("xuan mode and pair order groups", () => {
     expect(evaluation.trace.stagedEntry).toBe(true);
     expect(evaluation.trace.plannedOppositeSide).toBe("UP");
     expect(evaluation.trace.skipReason).not.toBe("pair_daily_budget+single_leg_seed");
+  });
+
+  it("strict aggressive clone scales late post-merge re-entry to xuan-sized staged clips", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 90,
+      price: 0.5,
+      timestamp: market.startTs,
+      makerTaker: "taker",
+      executionMode: "XUAN_HARD_PAIR_SWEEP",
+    });
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      size: 90,
+      price: 0.48,
+      timestamp: market.startTs + 1,
+      makerTaker: "taker",
+      executionMode: "XUAN_HARD_PAIR_SWEEP",
+    });
+    state = applyMerge(state, {
+      amount: 89.99,
+      timestamp: market.startTs + 160,
+      simulated: true,
+    });
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.92, size: 200 }], [{ price: 0.93, size: 200 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.05, size: 200 }], [{ price: 0.06, size: 200 }]),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+        MARKET_BASKET_BOOTSTRAP_ENABLED: "false",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 264,
+        secsToClose: 36,
+        lot: 90,
+        fairValueSnapshot: {
+          status: "valid",
+          estimatedThreshold: false,
+          fairUp: 0.93,
+          fairDown: 0.06,
+        },
+      },
+    );
+
+    expect(evaluation.decisions).toHaveLength(1);
+    expect(evaluation.decisions[0]).toMatchObject({ side: "DOWN", mode: "PAIRGROUP_COVERED_SEED" });
+    expect(evaluation.decisions[0]?.size).toBeGreaterThanOrEqual(80);
+    expect(evaluation.trace.plannedOppositeSide).toBe("UP");
+    expect(evaluation.trace.plannedOppositeMinWaitSec).toBe(0);
+    expect(evaluation.trace.plannedOppositeDeadlineSec).toBeLessThanOrEqual(276);
   });
 
   it("strict aggressive clone releases campaign residual completion instead of repair_qty_cap", () => {

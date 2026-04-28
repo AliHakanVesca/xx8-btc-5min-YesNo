@@ -107,8 +107,14 @@ function isAggressivePublicFootprint(config: Pick<XuanStrategyConfig, "botMode" 
   return config.botMode === "XUAN" && config.xuanCloneMode === "PUBLIC_FOOTPRINT" && config.xuanCloneIntensity === "AGGRESSIVE";
 }
 
-function plannedOppositeMinWaitSec(config: XuanStrategyConfig): number {
+function plannedOppositeMinWaitSec(config: XuanStrategyConfig, secsFromOpen?: number, secsToClose?: number): number {
   if (!isAggressivePublicFootprint(config)) {
+    return 0;
+  }
+  if (
+    (secsFromOpen !== undefined && secsFromOpen >= 250) ||
+    (secsToClose !== undefined && secsToClose <= Math.max(50, config.finalWindowCompletionOnlySec))
+  ) {
     return 0;
   }
   return Math.min(
@@ -137,7 +143,8 @@ function aggressiveOppositeReleaseHold(args: {
     return false;
   }
   const ageSec = Math.max(0, args.nowTs - lastBuy.timestamp);
-  if (ageSec >= plannedOppositeMinWaitSec(args.config) - 1e-9) {
+  const secsFromOpen = Math.max(0, args.nowTs - args.state.market.startTs);
+  if (ageSec >= plannedOppositeMinWaitSec(args.config, secsFromOpen, args.secsToClose) - 1e-9) {
     return false;
   }
   return true;
@@ -243,15 +250,21 @@ function chooseCompletion(
     nowTs,
     Math.max(config.postMergeFlatDustShares, 1e-6),
   );
-  const plannedOppositeMaterialQty = Math.max(
-    config.controlledOverlapMinResidualShares,
-    config.microRepairMaxQty + state.market.minOrderSize,
-  );
+  const latePlannedOppositeDutyActive =
+    aggressivePublicFootprint &&
+    secsFromOpen >= 250 &&
+    ctx.secsToClose > config.finalWindowNoChaseSec;
+  const plannedOppositeMaterialQty = latePlannedOppositeDutyActive
+    ? state.market.minOrderSize
+    : Math.max(
+        config.controlledOverlapMinResidualShares,
+        config.microRepairMaxQty + state.market.minOrderSize,
+      );
   const plannedOppositeTimingReady =
     plannedOpposite === undefined ||
     !isAggressivePublicFootprint(config) ||
     exactCompletionQtyPrior !== undefined ||
-    plannedOpposite.plannedOppositeAgeSec >= plannedOppositeMinWaitSec(config) - 1e-9 ||
+    plannedOpposite.plannedOppositeAgeSec >= plannedOppositeMinWaitSec(config, secsFromOpen, ctx.secsToClose) - 1e-9 ||
     ctx.secsToClose <= config.finalWindowCompletionOnlySec;
   const plannedOppositeDutyActive =
     plannedOpposite !== undefined &&
@@ -294,6 +307,7 @@ function chooseCompletion(
     config.borderlinePairStagedEntryEnabled &&
     stagedResidualAgeSec !== undefined &&
     stagedResidualAgeSec < config.borderlinePairReevaluateAfterSec &&
+    !latePlannedOppositeDutyActive &&
     ctx.secsToClose > config.finalWindowCompletionOnlySec
   ) {
     return null;

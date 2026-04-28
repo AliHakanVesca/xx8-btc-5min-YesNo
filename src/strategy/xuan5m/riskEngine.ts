@@ -61,7 +61,32 @@ export function evaluateRisk(
   if (ctx.bookIsCrossed) blockingReasons.push("crossed_book");
   if (ctx.dailyLossUsdc >= config.dailyMaxLossUsdc) blockingReasons.push("daily_loss_limit");
   if (ctx.marketLossUsdc >= config.marketMaxLossUsdc) blockingReasons.push("market_loss_limit");
-  if (currentImbalance > xuanRecycleImbalanceThreshold) advisoryReasons.push("rebalance_imbalance");
+  const matchedShares = mergeableShares(state);
+  const shareGap = Math.abs(state.upShares - state.downShares);
+  const xuanManagedRecycleResidual =
+    aggressivePublicFootprint &&
+    ctx.secsToClose > config.finalWindowNoChaseSec &&
+    matchedShares <= Math.max(config.postMergeFlatDustShares, 1e-6) + 1e-9 &&
+    Math.max(state.upShares, state.downShares) <=
+      Math.max(config.maxSingleOrphanQty, config.liveSmallLotLadder[0] ?? config.defaultLot, state.market.minOrderSize) + 1e-9;
+  const xuanManagedRecycleImbalance =
+    aggressivePublicFootprint &&
+    ctx.secsToClose > config.finalWindowNoChaseSec &&
+    (
+      xuanManagedRecycleResidual ||
+      (
+        matchedShares >= state.market.minOrderSize - 1e-9 &&
+        shareGap <=
+          Math.max(
+            config.liveSmallLotLadder[0] ?? config.defaultLot,
+            config.completionMinQty,
+            state.market.minOrderSize,
+          ) + 1e-9
+      )
+    );
+  if (currentImbalance > xuanRecycleImbalanceThreshold && !xuanManagedRecycleImbalance) {
+    advisoryReasons.push("rebalance_imbalance");
+  }
   if (lowBalanceForNewEntry) {
     advisoryReasons.push("low_usdc_no_new_entry");
   }
@@ -90,7 +115,11 @@ export function evaluateRisk(
     ctx.secsToClose <= config.completionOnlyCutoffSecToClose ||
     shouldCompletionOnlyForLowBalance ||
     (Boolean(ctx.forceNoNewEntries) && config.lowCollateralMode === "NO_NEW_ENTRY_BUT_MANAGE") ||
-    (currentImbalance > xuanRecycleImbalanceThreshold && ctx.secsToClose <= config.normalEntryCutoffSecToClose);
+    (
+      currentImbalance > xuanRecycleImbalanceThreshold &&
+      !xuanManagedRecycleImbalance &&
+      ctx.secsToClose <= config.normalEntryCutoffSecToClose
+    );
   const allowNewEntries =
     !hardCancel &&
     !ctx.forceNoNewEntries &&

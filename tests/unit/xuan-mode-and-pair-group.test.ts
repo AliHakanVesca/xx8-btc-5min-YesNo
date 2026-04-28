@@ -4368,6 +4368,35 @@ describe("xuan mode and pair order groups", () => {
     )).toBe(true);
   });
 
+  it("strict aggressive clone waits through xuan opening delay before the first flat-market seed", () => {
+    const market = buildOfflineMarket(1713696000);
+    const state = createMarketState(market);
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.47, size: 200 }], [{ price: 0.48, size: 200 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.47, size: 200 }], [{ price: 0.48, size: 200 }]),
+    );
+
+    const config = buildRuntimeConfig({
+      BOT_MODE: "XUAN",
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+    });
+    const blocked = evaluateEntryBuys(config, state, books, {
+      secsFromOpen: 0,
+      secsToClose: 300,
+      lot: 80,
+    });
+    const released = evaluateEntryBuys(config, state, books, {
+      secsFromOpen: 4,
+      secsToClose: 296,
+      lot: 80,
+    });
+
+    expect(blocked.decisions).toHaveLength(0);
+    expect(blocked.trace.skipReason).toBe("xuan_open_wait");
+    expect(released.trace.skipReason).not.toBe("xuan_open_wait");
+  });
+
   it("keeps same-pairgroup covered seed fail-closed when missing fair-value mode demands it", () => {
     const market = buildOfflineMarket(1713696000);
     const state = createMarketState(market);
@@ -6871,7 +6900,7 @@ describe("xuan mode and pair order groups", () => {
     expect(evaluation.trace.skipReason).not.toBe("bad_cycle_completion_only");
   });
 
-  it("strict aggressive clone releases family-prior residual completion before cost-basis cap stalls it", () => {
+  it("strict aggressive clone waits before releasing family-prior residual completion", () => {
     const market = buildOfflineMarket(1713696000);
     let state = createMarketState(market);
     state = applyFill(state, {
@@ -6907,8 +6936,50 @@ describe("xuan mode and pair order groups", () => {
       },
     );
 
+    expect(evaluation.decisions).toHaveLength(0);
+    expect(evaluation.trace.skipReason).toBe("xuan_planned_opposite_wait");
+    expect(evaluation.trace.skipReason).not.toBe("residual_completion_cost_basis_cap");
+  });
+
+  it("strict aggressive clone releases family-prior residual completion after planned opposite wait", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      size: 91.25,
+      price: 0.48,
+      timestamp: market.startTs,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.72, size: 200 }], [{ price: 0.74, size: 200 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.47, size: 200 }], [{ price: 0.49, size: 200 }]),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 26,
+        secsToClose: 274,
+        lot: 90,
+        allowControlledOverlap: true,
+        protectedResidualShares: 91.25,
+        protectedResidualSide: "DOWN",
+      },
+    );
+
     expect(evaluation.decisions).toHaveLength(1);
     expect(evaluation.decisions[0]?.side).toBe("UP");
+    expect(evaluation.trace.skipReason).not.toBe("xuan_planned_opposite_wait");
     expect(evaluation.trace.skipReason).not.toBe("residual_completion_cost_basis_cap");
   });
 
@@ -7072,8 +7143,8 @@ describe("xuan mode and pair order groups", () => {
       state,
       books,
       {
-        secsFromOpen: 108,
-        secsToClose: 192,
+        secsFromOpen: 132,
+        secsToClose: 168,
         lot: 90,
         allowControlledOverlap: true,
         protectedResidualShares: 85.76828,

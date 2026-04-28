@@ -672,14 +672,6 @@ function aggressiveOppositeReleaseHold(args: {
   if (ageSec >= waitSec - 1e-9) {
     return undefined;
   }
-  const immediateReleaseCap = Math.min(
-    args.config.strictPairEffectiveCap,
-    args.config.xuanTemporalCompletionEarlyMaxEffectivePair,
-    1.01,
-  );
-  if (args.effectiveCost <= immediateReleaseCap + 1e-9) {
-    return undefined;
-  }
   return {
     holdSec: normalizeTraceNumber(waitSec - ageSec),
     ageSec: normalizeTraceNumber(ageSec),
@@ -711,6 +703,10 @@ function lastTemporalSeedFill(state: XuanMarketState): FillRecord | undefined {
     );
 }
 
+function lastBuyFill(state: XuanMarketState): FillRecord | undefined {
+  return [...state.fillHistory].reverse().find((fill) => fill.side === "BUY");
+}
+
 function xuanTemporalSeedRhythmSkipReason(args: {
   config: XuanStrategyConfig;
   state: XuanMarketState;
@@ -731,13 +727,20 @@ function xuanTemporalSeedRhythmSkipReason(args: {
     return {};
   }
   const lastSeed = lastTemporalSeedFill(args.state);
-  if (!lastSeed) {
+  const lastBuy = lastBuyFill(args.state);
+  const rhythmReferenceFill =
+    isAggressivePublicFootprint(args.config) &&
+    lastBuy !== undefined &&
+    lastBuy.outcome !== args.candidateSide
+      ? lastBuy
+      : lastSeed;
+  if (!rhythmReferenceFill) {
     return {};
   }
   const nowTs = args.state.market.startTs + args.ctx.secsFromOpen;
-  const ageSec = Math.max(0, nowTs - lastSeed.timestamp);
+  const ageSec = Math.max(0, nowTs - rhythmReferenceFill.timestamp);
   const debtPositive = Number.isFinite(args.referencePairCost) && args.referencePairCost > 1 + 1e-9;
-  const sameSideSpam = lastSeed.outcome === args.candidateSide;
+  const sameSideSpam = rhythmReferenceFill.outcome === args.candidateSide;
   const strictOppositeStaging = isAggressivePublicFootprint(args.config) && !sameSideSpam;
   const waitSec = strictOppositeStaging
     ? plannedOppositeMinWaitSec(args.config)
@@ -2543,6 +2546,28 @@ export function evaluateEntryBuys(
     };
   }
 
+  if (
+    config.botMode === "XUAN" &&
+    config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
+    config.xuanCloneIntensity === "AGGRESSIVE" &&
+    totalShares <= Math.max(config.postMergeFlatDustShares, 1e-6) &&
+    ctx.secsFromOpen < Math.max(4, config.enterFromOpenSecMin) - 1e-9
+  ) {
+    return {
+      decisions: [],
+      trace: {
+        mode: "balanced_pair",
+        requestedLot: ctx.lot,
+        totalShares,
+        shareGap,
+        pairCap,
+        skipReason: "xuan_open_wait",
+        recentBadCycleCount: freshCycleStats.recentBadCycleCount,
+        candidates: [],
+      },
+    };
+  }
+
   if (useBalancedPairPath) {
     const cycleDensitySkipReason = newCyclePacingSkipReason(
       config,
@@ -3392,6 +3417,9 @@ export function evaluateEntryBuys(
     const oldGap = absoluteShareGap(state);
     const newGap = projectedShareGapAfterBuy(state, laggingSide, executableSize);
     const wouldIncreaseImbalance = newGap > oldGap + config.maxCompletionOvershootShares;
+    const finalResidualDutyActive =
+      ctx.secsFromOpen >= 250 &&
+      oldGap >= Math.max(state.market.minOrderSize, config.repairMinQty) - 1e-9;
     const xuanFamilyResidualDutyActive =
       aggressivePublicFootprint &&
       ctx.secsToClose > config.finalWindowNoChaseSec &&
@@ -3399,7 +3427,7 @@ export function evaluateEntryBuys(
         activeCompletionQtyPrior?.phase === "HIGH_LOW_COMPLETION" ||
         plannedOppositeDutyActive ||
         unbalancedCampaignResidual ||
-        (ctx.secsFromOpen >= 250 && oldGap >= config.completionMinQty - 1e-9)
+        finalResidualDutyActive
       );
     const xuanResidualDutyMaxQty = Math.max(
       oldGap + config.maxCompletionOvershootShares,
@@ -3467,7 +3495,7 @@ export function evaluateEntryBuys(
       nowTs,
       secsToClose: ctx.secsToClose,
       effectiveCost: repairCost,
-      exactPriorActive: Boolean(activeCompletionQtyPrior),
+      exactPriorActive: Boolean(exactCompletionQtyPrior),
     });
     if (aggressiveOppositeHold) {
       lastBlockedRepairEvaluation = {
@@ -3494,6 +3522,7 @@ export function evaluateEntryBuys(
     }
     const expensiveCampaignCompletionThreshold = Math.max(1.045, config.fullRebalanceOnlyIfEffectivePairBelow);
     const expensiveCampaignPartialHedgeMaxQty =
+      !xuanFamilyResidualDutyActive &&
       unbalancedCampaignResidual &&
       !plannedOppositeCompletionAllowed &&
       !activeCompletionQtyPrior &&

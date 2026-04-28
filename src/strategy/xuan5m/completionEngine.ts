@@ -140,12 +140,7 @@ function aggressiveOppositeReleaseHold(args: {
   if (ageSec >= plannedOppositeMinWaitSec(args.config) - 1e-9) {
     return false;
   }
-  const immediateReleaseCap = Math.min(
-    args.config.strictPairEffectiveCap,
-    args.config.xuanTemporalCompletionEarlyMaxEffectivePair,
-    1.01,
-  );
-  return args.effectiveCost > immediateReleaseCap + 1e-9;
+  return true;
 }
 
 export interface InventoryAdjustmentDecision {
@@ -432,6 +427,9 @@ function chooseCompletion(
     }
 
     const projectedGap = projectedShareGapAfterBuy(state, sideToBuy, candidateSize);
+    const finalResidualDutyActive =
+      secsFromOpen >= 250 &&
+      oldGap >= Math.max(state.market.minOrderSize, config.repairMinQty) - 1e-9;
     const xuanFamilyResidualDutyActive =
       aggressivePublicFootprint &&
       ctx.secsToClose > config.finalWindowNoChaseSec &&
@@ -439,7 +437,7 @@ function chooseCompletion(
         activeCompletionQtyPrior?.phase === "HIGH_LOW_COMPLETION" ||
         plannedOppositeDutyActive ||
         unbalancedCampaignResidual ||
-        (secsFromOpen >= 250 && oldGap >= config.completionMinQty - 1e-9)
+        finalResidualDutyActive
       );
     const xuanResidualDutyMaxQty = Math.max(
       oldGap + config.maxCompletionOvershootShares,
@@ -496,13 +494,14 @@ function chooseCompletion(
         nowTs,
         secsToClose: ctx.secsToClose,
         effectiveCost: costWithFees,
-        exactPriorActive: Boolean(activeCompletionQtyPrior),
+        exactPriorActive: Boolean(exactCompletionQtyPrior),
       })
     ) {
       continue;
     }
     const expensiveCampaignCompletionThreshold = Math.max(1.045, config.fullRebalanceOnlyIfEffectivePairBelow);
     const expensiveCampaignPartialHedgeMaxQty =
+      !xuanFamilyResidualDutyActive &&
       unbalancedCampaignResidual &&
       !plannedOppositeCompletionAllowed &&
       !activeCompletionQtyPrior &&

@@ -174,6 +174,7 @@ describe("paper session replay", () => {
       "DOWN",
       "DOWN",
       "UP",
+      "UP",
       "DOWN",
       "DOWN",
       "UP",
@@ -188,10 +189,11 @@ describe("paper session replay", () => {
       "OVERLAP",
       "COMPLETION",
       "OVERLAP",
-      "OVERLAP",
       "COMPLETION",
+      "OVERLAP",
+      "HIGH_LOW_COMPLETION",
     ]);
-    expect(candidateBuys.map((event) => event.tOffsetSec)).toEqual([4, 6, 10, 20, 26, 42, 44, 60, 70, 86, 88]);
+    expect(candidateBuys.map((event) => event.tOffsetSec)).toEqual([4, 6, 10, 20, 26, 42, 44, 60, 64, 70, 86, 88]);
     expect(candidateBuys.every((event) => event.qty >= 80)).toBe(true);
   });
 

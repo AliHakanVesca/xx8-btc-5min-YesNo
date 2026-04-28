@@ -1,6 +1,16 @@
 
 ##############################################
 
+Version : V.0.0.53
+Date    : 28.04.2026
+Author  : Ali Hakan Çakır
+Changes : - XUAN strict planned-opposite policy ortak modulu eklendi.
+          - Completion ve entry runtime closeable deadline kontrolleri ortak policy ile guncellendi.
+
+##############################################
+
+##############################################
+
 Version : V.0.0.52
 Date    : 28.04.2026
 Author  : Ali Hakan Çakır

@@ -6806,7 +6806,11 @@ describe("xuan mode and pair order groups", () => {
     );
 
     expect(evaluation.decisions).toHaveLength(0);
-    expect(["high_low_effective_not_debt_reducing", "pair_cap+single_leg_seed"]).toContain(evaluation.trace.skipReason);
+    expect([
+      "high_low_effective_not_debt_reducing",
+      "avg_improving_pair_too_expensive",
+      "pair_cap+single_leg_seed",
+    ]).toContain(evaluation.trace.skipReason);
   });
 
   it("keeps post-completion debt campaign active and opens avg-improving continuation under budget", () => {
@@ -7412,7 +7416,7 @@ describe("xuan mode and pair order groups", () => {
 
     expect(evaluation.decisions).toHaveLength(0);
     expect(evaluation.trace.skipReason).toBe("pair_cap+single_leg_seed");
-    expect(evaluation.trace.candidates?.[0]?.gateReason).toBe("xuan_late_seed_pair_cost_wait");
+    expect(evaluation.trace.candidates?.[0]?.gateReason).toBe("xuan_late_seed_deadline_after_final_merge");
   });
 
   it("blocks high-cost temporal residual completion before the final residual-duty window", () => {
@@ -7462,7 +7466,7 @@ describe("xuan mode and pair order groups", () => {
     );
 
     expect(evaluation.decisions).toHaveLength(0);
-    expect(evaluation.trace.skipReason).toBe("xuan_pair_cost_wait");
+    expect(evaluation.trace.skipReason).toBe("xuan_open_planned_opposite_no_closeable_path");
   });
 
 	  it("strict aggressive clone releases campaign residual completion instead of repair_qty_cap", () => {

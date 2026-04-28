@@ -20,6 +20,7 @@ import {
 import {
   countActiveIndependentFlowCount,
   createMarketState,
+  plannedOppositeCompletionState,
 } from "../../src/strategy/xuan5m/marketState.js";
 import {
   classifyFlowPressureBudget,
@@ -92,6 +93,69 @@ function buildBook(
 }
 
 describe("xuan mode and pair order groups", () => {
+  it("tracks temporal single-leg seeds as strict planned-opposite duty", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 110,
+      price: 0.49,
+      timestamp: market.startTs + 40,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+
+    const planned = plannedOppositeCompletionState(state, market.startTs + 76, 1e-6, true);
+
+    expect(planned?.plannedOppositeSide).toBe("DOWN");
+    expect(planned?.plannedOppositeQty).toBe(110);
+    expect(planned?.plannedOppositeMissingQty).toBe(110);
+    expect(planned?.plannedOppositeAgeSec).toBe(36);
+  });
+
+  it("releases closeable temporal planned-opposite completion after the strict deadline", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 110,
+      price: 0.49,
+      timestamp: market.startTs + 25,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.48, size: 300 }], [{ price: 0.49, size: 300 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.459, size: 300 }], [{ price: 0.469, size: 300 }]),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+        ALLOW_TEMPORAL_SINGLE_LEG_SEED: "true",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 61,
+        secsToClose: 239,
+        lot: 110,
+        allowControlledOverlap: true,
+      },
+    );
+
+    expect(evaluation.decisions.length).toBeGreaterThan(0);
+    expect(evaluation.decisions[0]?.side).toBe("DOWN");
+    expect(evaluation.trace.plannedOppositeDeadlineReached).toBe(true);
+    expect(evaluation.trace.plannedOppositeCloseableRelease).toBe(true);
+    expect(evaluation.trace.skipReason).not.toBe("xuan_pair_cost_wait");
+  });
+
   it("classifies flow-pressure budgets into shared strategy bands", () => {
     const supportive = classifyFlowPressureBudget({ budget: 0.45, matchedInventoryQuality: 0.9 });
     const confirmed = classifyFlowPressureBudget({ budget: 0.9, matchedInventoryQuality: 0.9 });
@@ -646,7 +710,7 @@ describe("xuan mode and pair order groups", () => {
     expect(adjustment).toBeNull();
   });
 
-  it("strict aggressive clone releases late micro planned opposite instead of carrying final residual", () => {
+  it("strict aggressive clone does not release late planned opposite before the 20s wait", () => {
     const market = buildOfflineMarket(1713696000);
     let state = createMarketState(market);
     state = applyFill(state, {
@@ -683,14 +747,7 @@ describe("xuan mode and pair order groups", () => {
       },
     );
 
-    expect(adjustment?.completion).toMatchObject({
-      sideToBuy: "UP",
-      missingShares: 20,
-      plannedOppositeSide: "UP",
-      plannedOppositeQty: 20,
-      plannedOppositeMissingQty: 20,
-      plannedOppositeCompletionOpenedCount: 1,
-    });
+    expect(adjustment).toBeNull();
   });
 
   it("holds small merge while a material planned opposite pairgroup is still open", () => {
@@ -5865,7 +5922,7 @@ describe("xuan mode and pair order groups", () => {
     expect(evaluation.decisions.every((decision) => decision.size > 0)).toBe(true);
   });
 
-  it("opens only a tiny paired xuan micro continuation when fill count is below PASS and projected basket stays capped", () => {
+  it("blocks normal 5 qty xuan micro continuation in strict aggressive mode", () => {
     const market = buildOfflineMarket(1713696000);
     let state = createMarketState(market);
     state = applyFill(state, {
@@ -5900,6 +5957,7 @@ describe("xuan mode and pair order groups", () => {
       buildRuntimeConfig({
         BOT_MODE: "XUAN",
         XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        XUAN_CLONE_INTENSITY: "AGGRESSIVE",
         ALLOW_TEMPORAL_SINGLE_LEG_SEED: "false",
         XUAN_MICRO_PAIR_PROJECTED_EFFECTIVE_CAP: "1.01",
         XUAN_MICRO_PAIR_MAX_QTY: "5",
@@ -5913,13 +5971,10 @@ describe("xuan mode and pair order groups", () => {
       },
     );
 
-    expect(evaluation.decisions).toHaveLength(2);
-    expect(evaluation.decisions.map((decision) => decision.side).sort()).toEqual(["DOWN", "UP"]);
-    expect(evaluation.decisions.every((decision) => decision.size <= 5)).toBe(true);
-    expect(evaluation.decisions.every((decision) => decision.reason === "balanced_pair_reentry")).toBe(true);
-    expect(evaluation.trace.fairValueFallbackReason).toBe("xuan_micro_pair_continuation");
-    expect(evaluation.trace.xuanMicroPairContinuation).toBe(true);
-    expect(evaluation.trace.marketBasketProjectedEffectivePair).toBeLessThanOrEqual(1.01);
+    expect(evaluation.decisions).toHaveLength(0);
+    expect(evaluation.trace.cycleSkippedReason).toBe("xuan_strict_micro_reentry_disabled");
+    expect(evaluation.trace.skipReason).toBe("xuan_strict_micro_reentry_disabled");
+    expect(evaluation.trace.xuanMicroPairContinuation).not.toBe(true);
   });
 
   it("waits on expensive opening completion according to xuan rhythm instead of completing in the first seconds", () => {
@@ -7522,7 +7577,7 @@ describe("xuan mode and pair order groups", () => {
 	    expect(evaluation.decisions[0]?.size).toBeCloseTo(57.16645, 6);
 	    expect(evaluation.trace.repairOldGap).toBeCloseTo(57.16645, 6);
 	    expect(evaluation.trace.repairNewGap).toBeLessThanOrEqual(0.01);
-	    expect(evaluation.trace.residualCompletionFallbackReason).toBe("residual_cost_basis_cap");
+	    expect(evaluation.trace.residualCompletionFallbackReason).toBe("planned_opposite_debt_reducing");
 	    expect(evaluation.trace.skipReason).not.toBe("xuan_pair_cost_wait");
 	  });
 

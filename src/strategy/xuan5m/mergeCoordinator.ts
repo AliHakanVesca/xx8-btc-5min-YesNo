@@ -292,13 +292,16 @@ export function evaluateDelayedMergeGate(
     state,
     args.nowTs,
     Math.max(config.marketBasketMinMergeShares * 0.01, 1e-6),
+    aggressivePublicFootprint,
   );
-  const materialPlannedOppositeThreshold = aggressivePublicFootprint
-    ? Math.max(state.market.minOrderSize, config.marketBasketMinMergeShares * 0.5)
-    : Math.max(state.market.minOrderSize, config.marketBasketMinMergeShares * 0.1);
-  const plannedOppositeDustTolerance = aggressivePublicFootprint
-    ? Math.max(state.market.minOrderSize, config.marketBasketMinMergeShares * 0.05)
-    : Math.max(state.market.minOrderSize, config.marketBasketMinMergeShares * 0.01);
+  const materialPlannedOppositeThreshold =
+    aggressivePublicFootprint && plannedOpposite !== undefined
+      ? Math.max(state.market.minOrderSize, plannedOpposite.plannedOppositeQty * 0.15)
+      : Math.max(state.market.minOrderSize, config.marketBasketMinMergeShares * 0.1);
+  const plannedOppositeDustTolerance =
+    aggressivePublicFootprint && plannedOpposite !== undefined
+      ? Math.max(state.market.minOrderSize, plannedOpposite.plannedOppositeQty * 0.02)
+      : Math.max(state.market.minOrderSize, config.marketBasketMinMergeShares * 0.01);
   const aggressiveFamilyMergeReleaseWindow =
     aggressivePublicFootprint &&
     !exactMergePriorActive &&
@@ -309,8 +312,10 @@ export function evaluateDelayedMergeGate(
     plannedOpposite !== undefined &&
     (
       plannedOpposite.plannedOppositeMissingQty <= plannedOppositeDustTolerance + 1e-9 ||
-      plannedOpposite.plannedOppositeFilledQty >=
+      (!aggressivePublicFootprint &&
+        plannedOpposite.plannedOppositeFilledQty >=
         Math.min(plannedOpposite.plannedOppositeQty, metrics.pendingMatchedQty) - plannedOppositeDustTolerance - 1e-9
+      )
     );
   const plannedOppositeHoldActive =
     config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&

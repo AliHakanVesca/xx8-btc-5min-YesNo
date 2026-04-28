@@ -85,15 +85,22 @@ function isPlannedOppositeCoverageMode(mode: StrategyExecutionMode | undefined):
   );
 }
 
+function isPlannedOppositeSeedMode(mode: StrategyExecutionMode | undefined, includeTemporalSingleLegSeeds: boolean): boolean {
+  return mode === "PAIRGROUP_COVERED_SEED" || (includeTemporalSingleLegSeeds && mode === "TEMPORAL_SINGLE_LEG_SEED");
+}
+
 export function plannedOppositeCompletionState(
   state: XuanMarketState,
   nowTs: number,
   dustShares = 1e-6,
+  includeTemporalSingleLegSeeds = false,
 ): PlannedOppositeCompletionState | undefined {
   const candidates = (["UP", "DOWN"] as OutcomeSide[])
     .map((side) => {
       const lots = side === "UP" ? state.upLots : state.downLots;
-      const stagedLots = lots.filter((lot) => lot.executionMode === "PAIRGROUP_COVERED_SEED");
+      const stagedLots = lots.filter((lot) =>
+        isPlannedOppositeSeedMode(lot.executionMode, includeTemporalSingleLegSeeds),
+      );
       const plannedQty = stagedLots.reduce((sum, lot) => sum + lot.size, 0);
       if (plannedQty <= dustShares || stagedLots.length === 0) {
         return undefined;

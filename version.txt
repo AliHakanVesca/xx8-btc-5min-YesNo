@@ -1,6 +1,16 @@
 
 ##############################################
 
+Version : V.0.0.51
+Date    : 28.04.2026
+Author  : Ali Hakan Çakır
+Changes : - Planned-opposite completion deadline ve closeable release runtime alanlari eklendi.
+          - Material open opposite merge hold ve strict seed abort davranislari testlerle genisletildi.
+
+##############################################
+
+##############################################
+
 Version : V.0.0.50
 Date    : 28.04.2026
 Author  : Ali Hakan Çakır

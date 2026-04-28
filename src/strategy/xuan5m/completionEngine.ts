@@ -87,8 +87,13 @@ export interface CompletionDecision {
   plannedOppositeMissingQty?: number;
   plannedOppositeAgeSec?: number;
   plannedOppositeMaxPrice?: number;
+  plannedOppositeDeadlineReached?: boolean;
+  plannedOppositeTargetRelease?: boolean;
+  plannedOppositeCloseableRelease?: boolean;
+  mustCloseBeforeMerge?: boolean;
   plannedOppositeCompletionAttemptCount?: number;
   plannedOppositeCompletionOpenedCount?: number;
+  deadlineForcedCompletionCount?: number;
   overlapRepairArbitration?: "no_overlap_lock" | "standard_pair_reentry" | "favor_independent_overlap" | "favor_residual_repair";
   arbitrationOutcome?: "completion" | "hold";
 }
@@ -147,17 +152,60 @@ function xuanPairCostImprovesOrMeetsTarget(
   );
 }
 
-function plannedOppositeMinWaitSec(config: XuanStrategyConfig, secsFromOpen?: number, secsToClose?: number): number {
+function plannedOppositeMinWaitSec(config: XuanStrategyConfig, _secsFromOpen?: number, _secsToClose?: number): number {
   if (!isAggressivePublicFootprint(config)) {
     return 0;
   }
-  if (
-    (secsFromOpen !== undefined && secsFromOpen >= 250) ||
-    (secsToClose !== undefined && secsToClose <= Math.max(50, config.finalWindowCompletionOnlySec))
-  ) {
-    return 0;
+  return 20;
+}
+
+function plannedOppositeDeadlineAgeSec(config: XuanStrategyConfig): number {
+  return isAggressivePublicFootprint(config) ? 35 : config.completionTargetMaxDelaySec;
+}
+
+function plannedOppositeDeadlineReached(args: {
+  config: XuanStrategyConfig;
+  ageSec: number;
+  secsFromOpen: number;
+  secsToClose: number;
+}): boolean {
+  if (!isAggressivePublicFootprint(args.config)) {
+    return false;
   }
-  return Math.min(35, Math.max(20, config.xuanTemporalCompletionMinAgeSec));
+  return (
+    args.ageSec >= plannedOppositeDeadlineAgeSec(args.config) - 1e-9 ||
+    args.secsFromOpen >= 250 ||
+    args.secsToClose <= args.config.finalWindowCompletionOnlySec
+  );
+}
+
+function plannedOppositeAgeDeadlineReached(config: XuanStrategyConfig, ageSec: number): boolean {
+  return isAggressivePublicFootprint(config) && ageSec >= plannedOppositeDeadlineAgeSec(config) - 1e-9;
+}
+
+function plannedOppositeTargetReleaseReady(args: {
+  config: XuanStrategyConfig;
+  ageSec: number;
+  costWithFees: number;
+  currentMatchedEffectivePair: number;
+}): boolean {
+  return (
+    args.ageSec >= plannedOppositeMinWaitSec(args.config) - 1e-9 &&
+    xuanPairCostImprovesOrMeetsTarget(args.config, args.currentMatchedEffectivePair, args.costWithFees)
+  );
+}
+
+function plannedOppositeCloseableReleaseReady(args: {
+  config: XuanStrategyConfig;
+  ageSec: number;
+  secsFromOpen: number;
+  secsToClose: number;
+  costWithFees: number;
+}): boolean {
+  return (
+    plannedOppositeAgeDeadlineReached(args.config, args.ageSec) &&
+    args.costWithFees <= strictXuanCloseablePairCostCap(args.config) + 1e-9
+  );
 }
 
 function aggressiveOppositeReleaseHold(args: {
@@ -181,6 +229,9 @@ function aggressiveOppositeReleaseHold(args: {
   }
   const ageSec = Math.max(0, args.nowTs - lastBuy.timestamp);
   const secsFromOpen = Math.max(0, args.nowTs - args.state.market.startTs);
+  if (secsFromOpen >= 250) {
+    return false;
+  }
   if (ageSec >= plannedOppositeMinWaitSec(args.config, secsFromOpen, args.secsToClose) - 1e-9) {
     return false;
   }
@@ -286,28 +337,39 @@ function chooseCompletion(
     state,
     nowTs,
     Math.max(config.postMergeFlatDustShares, 1e-6),
+    aggressivePublicFootprint,
   );
   const latePlannedOppositeDutyActive =
     aggressivePublicFootprint &&
     secsFromOpen >= 250 &&
     ctx.secsToClose > config.finalWindowNoChaseSec;
-  const plannedOppositeMaterialQty = latePlannedOppositeDutyActive
-    ? state.market.minOrderSize
-    : Math.max(
-        config.controlledOverlapMinResidualShares,
-        config.microRepairMaxQty + state.market.minOrderSize,
-      );
+  const plannedOppositeMaterialQty =
+    plannedOpposite !== undefined && aggressivePublicFootprint
+      ? Math.max(state.market.minOrderSize, plannedOpposite.plannedOppositeQty * 0.15)
+      : latePlannedOppositeDutyActive
+        ? state.market.minOrderSize
+        : Math.max(
+            config.controlledOverlapMinResidualShares,
+            config.microRepairMaxQty + state.market.minOrderSize,
+          );
   const plannedOppositeTimingReady =
     plannedOpposite === undefined ||
     !isAggressivePublicFootprint(config) ||
     exactCompletionQtyPrior !== undefined ||
     plannedOpposite.plannedOppositeAgeSec >= plannedOppositeMinWaitSec(config, secsFromOpen, ctx.secsToClose) - 1e-9 ||
+    plannedOppositeDeadlineReached({
+      config,
+      ageSec: plannedOpposite.plannedOppositeAgeSec,
+      secsFromOpen,
+      secsToClose: ctx.secsToClose,
+    }) ||
     ctx.secsToClose <= config.finalWindowCompletionOnlySec;
   const plannedOppositeDutyActive =
     plannedOpposite !== undefined &&
     plannedOpposite.plannedOppositeSide === sideToBuy &&
     plannedOpposite.plannedOppositeMissingQty >= plannedOppositeMaterialQty - 1e-9 &&
-    (plannedOpposite.plannedLowSideAvg <= config.lowSideMaxForHighCompletion + 1e-9 ||
+    (aggressivePublicFootprint ||
+      plannedOpposite.plannedLowSideAvg <= config.lowSideMaxForHighCompletion + 1e-9 ||
       exactCompletionQtyPrior !== undefined) &&
     plannedOppositeTimingReady;
   const recentSeedFlowCount =
@@ -458,10 +520,22 @@ function chooseCompletion(
     flowPressureState,
     exactPriorActive: Boolean(activeCompletionQtyPrior),
   });
-  const orderedCandidateSizes =
-    prioritizedActiveQty !== undefined && candidateSizes.includes(prioritizedActiveQty)
-      ? [prioritizedActiveQty, ...candidateSizes.filter((size) => Math.abs(size - prioritizedActiveQty) > 1e-6)]
+  const xuanPlannedOppositeCandidateSizes =
+    plannedOppositeDutyActive && plannedOpposite
+      ? buildXuanPlannedOppositeCompletionCandidateSizes({
+          config,
+          plannedOppositeQty: plannedOpposite.plannedOppositeMissingQty,
+          missingShares,
+          candidateSizes,
+        })
       : candidateSizes;
+  const orderedCandidateSizes =
+    prioritizedActiveQty !== undefined && xuanPlannedOppositeCandidateSizes.includes(prioritizedActiveQty)
+      ? [
+          prioritizedActiveQty,
+          ...xuanPlannedOppositeCandidateSizes.filter((size) => Math.abs(size - prioritizedActiveQty) > 1e-6),
+        ]
+      : xuanPlannedOppositeCandidateSizes;
   let bestCompletion: CompletionDecision | undefined;
   let bestCompletionScore = Number.POSITIVE_INFINITY;
 
@@ -531,7 +605,7 @@ function chooseCompletion(
     const xuanPriorCompletionAllowed =
       activeCompletionQtyPrior !== undefined &&
       costWithFees <= Math.max(config.xuanBehaviorCap, phase.cap) + 1e-9;
-    const xuanResidualDutyCompletionAllowed =
+    let xuanResidualDutyCompletionAllowed =
       xuanFamilyResidualDutyActive &&
       candidateSize <= xuanResidualDutyMaxQty + 1e-9 &&
       xuanCostDisciplinedCompletion;
@@ -539,7 +613,15 @@ function chooseCompletion(
       plannedOppositeDutyActive &&
       plannedOpposite !== undefined &&
       candidateSize <= plannedOpposite.plannedOppositeMissingQty + config.maxCompletionOvershootShares + 1e-9;
-    const plannedOppositeMaxPrice =
+    const plannedOppositeTargetMaxPrice =
+      plannedOppositeCandidate && plannedOpposite !== undefined
+        ? maxCompletionAskForCostCap(
+            existingAverage,
+            strictXuanPairCostTargetCap(config),
+            config.cryptoTakerFeeRate,
+          )
+        : 0;
+    const plannedOppositeCloseableMaxPrice =
       plannedOppositeCandidate && plannedOpposite !== undefined
         ? maxCompletionAskForCostCap(
             existingAverage,
@@ -547,6 +629,42 @@ function chooseCompletion(
             config.cryptoTakerFeeRate,
           )
         : 0;
+    const plannedOppositeAgeSec = plannedOpposite?.plannedOppositeAgeSec ?? 0;
+    const plannedOppositeDeadlineActive =
+      plannedOppositeCandidate &&
+      plannedOppositeDeadlineReached({
+        config,
+        ageSec: plannedOppositeAgeSec,
+        secsFromOpen,
+        secsToClose: ctx.secsToClose,
+      });
+    const plannedOppositeTargetRelease =
+      plannedOppositeCandidate &&
+      plannedOppositeTargetReleaseReady({
+        config,
+        ageSec: plannedOppositeAgeSec,
+        costWithFees,
+        currentMatchedEffectivePair,
+      });
+    const plannedOppositeCloseableRelease =
+      plannedOppositeCandidate &&
+      plannedOppositeCloseableReleaseReady({
+        config,
+        ageSec: plannedOppositeAgeSec,
+        secsFromOpen,
+        secsToClose: ctx.secsToClose,
+        costWithFees,
+      });
+    if (
+      plannedOppositeCloseableRelease &&
+      xuanFamilyResidualDutyActive &&
+      candidateSize <= xuanResidualDutyMaxQty + 1e-9
+    ) {
+      xuanResidualDutyCompletionAllowed = true;
+    }
+    const plannedOppositeMaxPrice = plannedOppositeDeadlineActive
+      ? plannedOppositeCloseableMaxPrice
+      : plannedOppositeTargetMaxPrice;
     const xuanCloseablePlannedOppositeCompletion =
       plannedOppositeCandidate &&
       isAggressivePublicFootprint(config) &&
@@ -559,12 +677,15 @@ function chooseCompletion(
       !isAggressivePublicFootprint(config) ||
       xuanPriorCompletionAllowed ||
       ctx.secsToClose <= config.finalWindowCompletionOnlySec ||
-      (plannedOppositeMaxPrice > 0 && execution.averagePrice <= plannedOppositeMaxPrice + 1e-9);
+      (plannedOppositeTargetMaxPrice > 0 && execution.averagePrice <= plannedOppositeTargetMaxPrice + 1e-9);
     const plannedOppositeCompletionAllowed =
       plannedOppositeCandidate &&
       ctx.secsToClose > config.finalWindowNoChaseSec &&
       (isAggressivePublicFootprint(config)
-        ? plannedOppositePriceTargetMet && (xuanCostDisciplinedCompletion || xuanCloseablePlannedOppositeCompletion)
+        ? xuanPriorCompletionAllowed ||
+          plannedOppositeTargetRelease ||
+          plannedOppositeCloseableRelease ||
+          (plannedOppositePriceTargetMet && (xuanCostDisciplinedCompletion || xuanCloseablePlannedOppositeCompletion))
         : costWithFees <= 1.025 + 1e-9);
     const plannedOppositeDebtReducing =
       plannedOppositeCandidate &&
@@ -596,6 +717,7 @@ function chooseCompletion(
       plannedOppositeCandidate &&
       isAggressivePublicFootprint(config) &&
       (!plannedOppositePriceTargetMet || (!xuanCostDisciplinedCompletion && !xuanCloseablePlannedOppositeCompletion)) &&
+      !plannedOppositeCloseableRelease &&
       !xuanPriorCompletionAllowed &&
       ctx.secsToClose > config.finalWindowCompletionOnlySec
     ) {
@@ -794,6 +916,7 @@ function chooseCompletion(
         cheapLateCompletionChase ||
         campaignResidualFallback.allowed ||
         temporalOrphanFallback.allowed ||
+        plannedOppositeCompletionAllowed ||
         xuanResidualDutyCompletionAllowed,
       recentSeedFlowCount,
       activeIndependentFlowCount,
@@ -1016,8 +1139,15 @@ function chooseCompletion(
             plannedOppositeMissingQty: plannedOpposite.plannedOppositeMissingQty,
             plannedOppositeAgeSec: plannedOpposite.plannedOppositeAgeSec,
             plannedOppositeMaxPrice: normalizeSize(plannedOppositeMaxPrice),
+            plannedOppositeDeadlineReached: plannedOppositeDeadlineActive,
+            plannedOppositeTargetRelease,
+            plannedOppositeCloseableRelease,
+            mustCloseBeforeMerge: true,
             plannedOppositeCompletionAttemptCount: 1,
             plannedOppositeCompletionOpenedCount: 1,
+            ...(plannedOppositeCloseableRelease && !plannedOppositeTargetRelease
+              ? { deadlineForcedCompletionCount: 1 }
+              : {}),
           }
         : {}),
       overlapRepairArbitration,
@@ -1685,6 +1815,22 @@ function buildCandidateSizes(
   }
 
   return [...new Set(candidateSizes)].sort((left, right) => right - left);
+}
+
+function buildXuanPlannedOppositeCompletionCandidateSizes(args: {
+  config: XuanStrategyConfig;
+  plannedOppositeQty: number;
+  missingShares: number;
+  candidateSizes: number[];
+}): number[] {
+  if (!isAggressivePublicFootprint(args.config) || args.plannedOppositeQty <= 0) {
+    return args.candidateSizes;
+  }
+  const maxQty = Math.max(0, Math.min(args.plannedOppositeQty, args.missingShares));
+  const xuanLadder = [maxQty, 145, 125, 100, 80, 40, 20, args.config.completionMinQty]
+    .map((size) => normalizeSize(Math.min(size, maxQty)))
+    .filter((size) => size >= args.config.completionMinQty);
+  return [...new Set([...xuanLadder, ...args.candidateSizes])].sort((left, right) => right - left);
 }
 
 function buildHighLowOvershootCandidateSizes(args: {

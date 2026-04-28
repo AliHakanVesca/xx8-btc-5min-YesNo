@@ -23,6 +23,47 @@ function buildConfig(overrides: Record<string, string> = {}) {
 }
 
 describe("merge coordinator", () => {
+  it("holds age-target merge while a material temporal planned opposite remains open", () => {
+    const config = buildConfig({
+      BOT_MODE: "XUAN",
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+    });
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      price: 0.51,
+      size: 100,
+      timestamp: market.startTs + 20,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.47,
+      size: 80,
+      timestamp: market.startTs + 52,
+      makerTaker: "taker",
+      executionMode: "PARTIAL_SOFT_COMPLETION",
+    });
+    let tracker = createMergeBatchTracker();
+    tracker = syncMergeBatchTracker(tracker, 80, market.startTs + 52);
+
+    const gate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 181,
+      secsFromOpen: 181,
+      secsToClose: 119,
+      usdcBalance: 100,
+      tracker,
+    });
+
+    expect(gate.allow).toBe(false);
+    expect(gate.reason).toBe("planned_opposite_hold");
+  });
+
   it("allows merge after the first matched window ages past the soft timer", () => {
     const config = buildConfig();
     const market = buildOfflineMarket(1713696000);

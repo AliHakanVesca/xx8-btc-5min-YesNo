@@ -4,6 +4,8 @@ import type { StrategyExecutionMode } from "./executionModes.js";
 import { matchedEffectivePairCost, mergeableShares } from "./inventoryState.js";
 import { pairCostWithBothTaker } from "./sumAvgEngine.js";
 
+const XUAN_STRICT_PAIR_COST_TARGET_CAP = 0.982;
+
 export interface CompletionAllowance {
   allowed: boolean;
   capMode: "strict" | "soft" | "hard" | "emergency";
@@ -46,10 +48,15 @@ export type MarketBasketClipType =
   | "STRONG_HIGH_LOW_CONTINUATION";
 
 function strictXuanPairCostTargetCap(config: XuanStrategyConfig): number {
+  const aggressivePublicFootprint =
+    config.botMode === "XUAN" &&
+    config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
+    config.xuanCloneIntensity === "AGGRESSIVE";
   const caps = [
     config.marketBasketMergeEffectivePairCap,
     config.marketBasketGoodAvgCap,
     config.highLowDebtReducingEffectiveCap,
+    aggressivePublicFootprint ? XUAN_STRICT_PAIR_COST_TARGET_CAP : 1,
     1,
   ].filter((cap) => Number.isFinite(cap) && cap > 0);
   return Math.min(...caps);

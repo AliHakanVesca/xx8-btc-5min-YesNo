@@ -174,19 +174,21 @@ describe("paper session replay", () => {
       "DOWN",
       "DOWN",
       "UP",
+      "DOWN",
     ]);
     expect(candidateBuys.map((event) => event.phase)).toEqual([
       "ENTRY",
       "COMPLETION",
       "OVERLAP",
+      "COMPLETION",
       "OVERLAP",
       "COMPLETION",
       "OVERLAP",
-      "OVERLAP",
       "COMPLETION",
+      "OVERLAP",
     ]);
-    expect(candidateBuys.map((event) => event.tOffsetSec)).toEqual([4, 6, 10, 20, 42, 60, 86, 88]);
-    expect(candidateBuys[2]?.qty).toBe(20);
+    expect(candidateBuys.map((event) => event.tOffsetSec)).toEqual([4, 6, 10, 20, 26, 42, 60, 70, 88]);
+    expect(candidateBuys.every((event) => event.qty >= 80)).toBe(true);
   });
 
   it("runs the blocked-completion session and finishes with residual inventory", () => {

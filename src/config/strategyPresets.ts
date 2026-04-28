@@ -1000,7 +1000,14 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     softResidualCompletionCap: Math.max(config.softResidualCompletionCap, aggressive ? elevatedBehaviorCap : 1.13),
     completionQualityMaxEffectiveCost: Math.max(config.completionQualityMaxEffectiveCost, aggressive ? elevatedBehaviorCap : 1.13),
     completionQualityMaxNegativeEdgeUsdc: Math.max(config.completionQualityMaxNegativeEdgeUsdc, 2.25),
-    completionTargetMaxDelaySec: Math.min(config.completionTargetMaxDelaySec, 45),
+    campaignMinClipPct: aggressive ? Math.max(config.campaignMinClipPct, 0.75) : config.campaignMinClipPct,
+    campaignCompletionMinPct: aggressive
+      ? Math.max(config.campaignCompletionMinPct, 0.75)
+      : config.campaignCompletionMinPct,
+    campaignDefaultClipPct: aggressive ? Math.max(config.campaignDefaultClipPct, 1) : config.campaignDefaultClipPct,
+    completionTargetMaxDelaySec: aggressive
+      ? Math.min(config.completionTargetMaxDelaySec, 35)
+      : Math.min(config.completionTargetMaxDelaySec, 45),
     completionUrgencyPatientSec: Math.min(config.completionUrgencyPatientSec, 30),
     completionUrgencyForceSec: Math.min(config.completionUrgencyForceSec, 90),
     xuanTemporalCompletionMinAgeSec: Math.max(
@@ -1014,7 +1021,9 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     highSideCompletionRequiresFairValue: aggressive ? false : config.highSideCompletionRequiresFairValue,
     highSideCompletionRequiresHardImbalance: aggressive ? false : config.highSideCompletionRequiresHardImbalance,
     xuanBehaviorCap: elevatedBehaviorCap,
-    cloneChildPreferredShares: Math.min(config.cloneChildPreferredShares, 20),
+    cloneChildPreferredShares: aggressive
+      ? Math.max(config.cloneChildPreferredShares, ladder[0] ?? 80)
+      : Math.min(config.cloneChildPreferredShares, 20),
     cloneChildOrderDelayMs: Math.max(config.cloneChildOrderDelayMs, 120),
     cloneStaleCheapOppositeQuoteMinAgeSec: Math.min(config.cloneStaleCheapOppositeQuoteMinAgeSec, 75),
     mergeBatchMode: "HYBRID_DELAYED",

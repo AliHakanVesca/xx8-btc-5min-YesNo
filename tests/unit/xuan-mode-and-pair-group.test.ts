@@ -5275,7 +5275,7 @@ describe("xuan mode and pair order groups", () => {
     expect(evaluation.trace.effectivePair).toBeCloseTo(1.04582, 6);
   });
 
-  it("clips borderline-cost aggressive public-footprint probes to exploratory staged size", () => {
+  it("allows Xuan-strict staged low-side probes to use large clips when the opposite path reaches the pair-cost target", () => {
     const market = buildOfflineMarket(1713696000);
     const state = createMarketState(market);
     const books = new OrderBookState(
@@ -5312,13 +5312,15 @@ describe("xuan mode and pair order groups", () => {
     expect(evaluation.decisions).toHaveLength(1);
     expect(evaluation.decisions[0]).toMatchObject({
       side: "DOWN",
-      size: 20,
+      size: 95,
       mode: "PAIRGROUP_COVERED_SEED",
     });
     expect(evaluation.trace.stagedEntry).toBe(true);
     expect(evaluation.trace.plannedOppositeSide).toBe("UP");
-    expect(evaluation.trace.plannedOppositeQty).toBeCloseTo(20, 6);
-    expect(evaluation.trace.plannedOppositeMinWaitSec).toBeGreaterThanOrEqual(8);
+    expect(evaluation.trace.plannedOppositeQty).toBeCloseTo(95, 6);
+    expect(evaluation.trace.plannedOppositeMinWaitSec).toBeGreaterThanOrEqual(20);
+    expect(evaluation.trace.plannedOppositeMinWaitSec).toBeLessThanOrEqual(35);
+    expect(evaluation.trace.plannedOppositeMaxPrice).toBeLessThan(0.51);
     expect(evaluation.trace.campaignLaunchMode).toBe("XUAN_PROBE_LAUNCH");
     expect(evaluation.trace.initialBasketQtyCap).toBeCloseTo(95, 6);
     expect(evaluation.trace.executedProbeQty).toBeCloseTo(95, 6);
@@ -5352,6 +5354,11 @@ describe("xuan mode and pair order groups", () => {
     expect(config.allowOverlapOnlyAfterPartialClassified).toBe(false);
     expect(config.allowOverlapOnlyWhenCompletionEngineActive).toBe(false);
     expect(config.requireMatchedInventoryBeforeSecondGroup).toBe(false);
+    expect(config.campaignMinClipPct).toBeGreaterThanOrEqual(0.75);
+    expect(config.campaignCompletionMinPct).toBeGreaterThanOrEqual(0.75);
+    expect(config.campaignDefaultClipPct).toBeGreaterThanOrEqual(1);
+    expect(config.completionTargetMaxDelaySec).toBeLessThanOrEqual(35);
+    expect(config.cloneChildPreferredShares).toBeGreaterThanOrEqual(80);
   });
 
   it("turns a debt-positive probe into an average-improving basket campaign", () => {
@@ -7183,6 +7190,58 @@ describe("xuan mode and pair order groups", () => {
     expect(evaluation.decisions).toHaveLength(0);
     expect(evaluation.trace.skipReason).toBe("pair_cap+single_leg_seed");
     expect(evaluation.trace.candidates?.[0]?.gateReason).toBe("xuan_late_seed_pair_cost_wait");
+  });
+
+  it("blocks post-merge re-entry before t+200 when the current pair cost is not closeable", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 80,
+      price: 0.25,
+      timestamp: market.startTs + 70,
+      makerTaker: "taker",
+      executionMode: "PARTIAL_SOFT_COMPLETION",
+    });
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      size: 80,
+      price: 0.65,
+      timestamp: market.startTs + 120,
+      makerTaker: "taker",
+      executionMode: "PARTIAL_SOFT_COMPLETION",
+    });
+    state = applyMerge(state, {
+      amount: 79.99,
+      timestamp: market.startTs + 160,
+      simulated: true,
+    });
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.67, size: 200 }], [{ price: 0.68, size: 200 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.31, size: 200 }], [{ price: 0.32, size: 200 }]),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+        MARKET_BASKET_BOOTSTRAP_ENABLED: "false",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 161,
+        secsToClose: 139,
+        lot: 80,
+      },
+    );
+
+    expect(evaluation.decisions).toHaveLength(0);
+    expect(evaluation.trace.candidates?.[0]?.gateReason).toBe("xuan_post_merge_seed_pair_cost_wait");
   });
 
   it("keeps strict late pair-cost discipline even when the old blocker would have been daily budget", () => {

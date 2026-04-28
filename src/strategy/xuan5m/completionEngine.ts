@@ -41,6 +41,9 @@ import {
   type FairValueSnapshot,
 } from "./fairValueEngine.js";
 
+const XUAN_STRICT_PAIR_COST_TARGET_CAP = 0.982;
+const XUAN_STRICT_CLOSEABLE_PAIR_COST_CAP = 0.995;
+
 export interface CompletionDecision {
   sideToBuy: OutcomeSide;
   missingShares: number;
@@ -113,9 +116,16 @@ function strictXuanPairCostTargetCap(config: XuanStrategyConfig): number {
     config.marketBasketMergeEffectivePairCap,
     config.marketBasketGoodAvgCap,
     config.highLowDebtReducingEffectiveCap,
+    isAggressivePublicFootprint(config) ? XUAN_STRICT_PAIR_COST_TARGET_CAP : 1,
     1,
   ].filter((cap) => Number.isFinite(cap) && cap > 0);
   return Math.min(...caps);
+}
+
+function strictXuanCloseablePairCostCap(config: XuanStrategyConfig): number {
+  return isAggressivePublicFootprint(config)
+    ? Math.max(strictXuanPairCostTargetCap(config), XUAN_STRICT_CLOSEABLE_PAIR_COST_CAP)
+    : strictXuanPairCostTargetCap(config);
 }
 
 function xuanPairCostImprovesOrMeetsTarget(
@@ -147,10 +157,7 @@ function plannedOppositeMinWaitSec(config: XuanStrategyConfig, secsFromOpen?: nu
   ) {
     return 0;
   }
-  return Math.min(
-    25,
-    Math.max(config.xuanTemporalCompletionMinAgeSec, config.xuanRhythmMaxWaitSec * 2),
-  );
+  return Math.min(35, Math.max(20, config.xuanTemporalCompletionMinAgeSec));
 }
 
 function aggressiveOppositeReleaseHold(args: {
@@ -536,10 +543,18 @@ function chooseCompletion(
       plannedOppositeCandidate && plannedOpposite !== undefined
         ? maxCompletionAskForCostCap(
             existingAverage,
-            strictXuanPairCostTargetCap(config),
+            strictXuanCloseablePairCostCap(config),
             config.cryptoTakerFeeRate,
           )
         : 0;
+    const xuanCloseablePlannedOppositeCompletion =
+      plannedOppositeCandidate &&
+      isAggressivePublicFootprint(config) &&
+      costWithFees <= strictXuanCloseablePairCostCap(config) + 1e-9;
+    const xuanCloseableResidualDutyCompletion =
+      xuanFamilyResidualDutyActive &&
+      isAggressivePublicFootprint(config) &&
+      costWithFees <= strictXuanCloseablePairCostCap(config) + 1e-9;
     const plannedOppositePriceTargetMet =
       !isAggressivePublicFootprint(config) ||
       xuanPriorCompletionAllowed ||
@@ -549,7 +564,7 @@ function chooseCompletion(
       plannedOppositeCandidate &&
       ctx.secsToClose > config.finalWindowNoChaseSec &&
       (isAggressivePublicFootprint(config)
-        ? plannedOppositePriceTargetMet && xuanCostDisciplinedCompletion
+        ? plannedOppositePriceTargetMet && (xuanCostDisciplinedCompletion || xuanCloseablePlannedOppositeCompletion)
         : costWithFees <= 1.025 + 1e-9);
     const plannedOppositeDebtReducing =
       plannedOppositeCandidate &&
@@ -571,6 +586,7 @@ function chooseCompletion(
       isAggressivePublicFootprint(config) &&
       xuanFamilyResidualDutyActive &&
       !xuanCostDisciplinedCompletion &&
+      !xuanCloseableResidualDutyCompletion &&
       !xuanPriorCompletionAllowed &&
       ctx.secsToClose > config.finalWindowCompletionOnlySec
     ) {
@@ -579,7 +595,7 @@ function chooseCompletion(
     if (
       plannedOppositeCandidate &&
       isAggressivePublicFootprint(config) &&
-      (!plannedOppositePriceTargetMet || !xuanCostDisciplinedCompletion) &&
+      (!plannedOppositePriceTargetMet || (!xuanCostDisciplinedCompletion && !xuanCloseablePlannedOppositeCompletion)) &&
       !xuanPriorCompletionAllowed &&
       ctx.secsToClose > config.finalWindowCompletionOnlySec
     ) {

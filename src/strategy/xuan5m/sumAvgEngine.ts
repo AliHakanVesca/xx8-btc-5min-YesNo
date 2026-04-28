@@ -16,6 +16,33 @@ export function completionCost(existingAverage: number, completionAsk: number, f
   return existingAverage + completionAsk + takerFeePerShare(completionAsk, feeRate);
 }
 
+export function maxCompletionAskForCostCap(existingAverage: number, cap: number, feeRate = 0.072): number {
+  if (!Number.isFinite(existingAverage) || !Number.isFinite(cap) || cap <= 0) {
+    return 0;
+  }
+
+  const minPrice = 0.01;
+  const maxPrice = 0.99;
+  if (completionCost(existingAverage, minPrice, feeRate) > cap + 1e-9) {
+    return 0;
+  }
+  if (completionCost(existingAverage, maxPrice, feeRate) <= cap + 1e-9) {
+    return maxPrice;
+  }
+
+  let low = minPrice;
+  let high = maxPrice;
+  for (let i = 0; i < 48; i += 1) {
+    const mid = (low + high) / 2;
+    if (completionCost(existingAverage, mid, feeRate) <= cap + 1e-9) {
+      low = mid;
+    } else {
+      high = mid;
+    }
+  }
+  return low;
+}
+
 export function pairEdge(pairCost: number): number {
   return 1 - pairCost;
 }

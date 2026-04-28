@@ -32,6 +32,7 @@ import { pairCostWithBothTaker } from "./sumAvgEngine.js";
 import type { StrategyExecutionMode } from "./executionModes.js";
 import type { FairValueSnapshot } from "./fairValueEngine.js";
 import type { OutcomeSide } from "../../infra/clob/types.js";
+import { resolveBundledCompletionSequencePrior } from "../../analytics/xuanExactReference.js";
 
 export interface BotDecision {
   phase: ReturnType<typeof getStrategyPhase>;
@@ -326,13 +327,29 @@ export class Xuan5mBot {
       effectiveRisk.allowNewEntries || janitorEntryAllowed
         ? entryEvaluation.decisions
         : [];
-    const sameSideOverlapArbitration = arbitrateSameSideCompletionOverlap(
-      config,
-      state,
-      books,
-      rawEntryBuys,
-      inventoryAdjustmentProbe,
-    );
+	    const exactCompletionPrior =
+	      config.xuanCloneMode === "PUBLIC_FOOTPRINT" && inventoryAdjustmentProbe?.completion !== undefined
+	        ? resolveBundledCompletionSequencePrior(
+	            state.market.slug,
+	            secsFromOpen,
+	            inventoryAdjustmentProbe.completion.sideToBuy,
+	          )
+	        : undefined;
+    const exactCompletionPriority =
+      exactCompletionPrior?.scope === "exact" && Math.abs(exactCompletionPrior.anchorSec - secsFromOpen) <= 0.5;
+	    const sameSideOverlapArbitration = exactCompletionPriority
+	      ? {
+	          entryBuys: [] as EntryBuyDecision[],
+	          forceCompletion: true,
+	          prunedForCompletion: rawEntryBuys.length > 0,
+	        }
+	      : arbitrateSameSideCompletionOverlap(
+	          config,
+	          state,
+	          books,
+	          rawEntryBuys,
+	          inventoryAdjustmentProbe,
+	        );
     const entryBuys = sameSideOverlapArbitration.entryBuys;
     const sameWindowCompletionAndOverlap =
       effectiveRisk.allowNewEntries &&

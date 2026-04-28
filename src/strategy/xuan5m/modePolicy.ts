@@ -45,6 +45,35 @@ export type MarketBasketClipType =
   | "DEBT_REDUCING_CONTINUATION"
   | "STRONG_HIGH_LOW_CONTINUATION";
 
+function strictXuanPairCostTargetCap(config: XuanStrategyConfig): number {
+  const caps = [
+    config.marketBasketMergeEffectivePairCap,
+    config.marketBasketGoodAvgCap,
+    config.highLowDebtReducingEffectiveCap,
+    1,
+  ].filter((cap) => Number.isFinite(cap) && cap > 0);
+  return Math.min(...caps);
+}
+
+function xuanPairCostImprovesOrMeetsTarget(
+  config: XuanStrategyConfig,
+  currentEffectivePair: number,
+  candidateEffectivePair: number,
+): boolean {
+  if (!Number.isFinite(candidateEffectivePair)) {
+    return false;
+  }
+  const targetCap = strictXuanPairCostTargetCap(config);
+  if (candidateEffectivePair <= targetCap + 1e-9) {
+    return true;
+  }
+  return (
+    Number.isFinite(currentEffectivePair) &&
+    currentEffectivePair > targetCap + 1e-9 &&
+    candidateEffectivePair < currentEffectivePair - config.marketBasketMinAvgImprovement + 1e-9
+  );
+}
+
 export interface CampaignCompletionSizing {
   campaignBaseLot: number;
   minCampaignClipQty: number;
@@ -1142,11 +1171,22 @@ export function pairSweepAllowance(args: {
     args.config.liveSmallLotLadder[0] ?? args.config.defaultLot,
     args.state.market.minOrderSize,
   );
+  const currentMatchedQty = mergeableShares(args.state);
+  const currentEffectivePair =
+    currentMatchedQty > 1e-6
+      ? matchedEffectivePairCost(args.state, args.config.cryptoTakerFeeRate)
+      : Number.POSITIVE_INFINITY;
+  const aggressiveContinuationCostDisciplined = xuanPairCostImprovesOrMeetsTarget(
+    args.config,
+    currentEffectivePair,
+    args.costWithFees,
+  );
   const aggressiveSmallContinuationBudgetBypass =
     aggressivePublicFootprint &&
     args.secsToClose > args.config.finalWindowNoChaseSec &&
     args.candidateSize <= aggressiveSmallContinuationClip + 1e-9 &&
     args.costWithFees <= args.config.xuanBehaviorCap + 1e-9 &&
+    aggressiveContinuationCostDisciplined &&
     (
       args.state.mergeHistory.length > 0 ||
       args.state.fillHistory.some((fill) => fill.side === "BUY") ||
@@ -1171,9 +1211,14 @@ export function pairSweepAllowance(args: {
     };
   }
 
-  if (basketContinuation?.allowed) {
-    return {
-      allowed: true,
+	  const aggressiveAvgImprovingShouldStage =
+	    aggressivePublicFootprint &&
+	    basketContinuation?.continuationClass === "AVG_IMPROVING" &&
+	    args.costWithFees > strictXuanPairCostTargetCap(args.config) + 1e-9;
+
+	  if (basketContinuation?.allowed && !aggressiveAvgImprovingShouldStage) {
+	    return {
+	      allowed: true,
       mode: "XUAN_HARD_PAIR_SWEEP",
       negativeEdgeUsdc: 0,
       projectedMarketBudget: args.state.negativePairEdgeConsumedUsdc,
@@ -1193,9 +1238,9 @@ export function pairSweepAllowance(args: {
     };
   }
 
-  if (basketContinuation) {
-    return {
-      allowed: false,
+	  if (basketContinuation) {
+	    return {
+	      allowed: false,
       negativeEdgeUsdc,
       projectedMarketBudget,
       projectedDailyBudget,
@@ -1211,11 +1256,15 @@ export function pairSweepAllowance(args: {
       campaignFlowCount: basketContinuation.campaignFlowCount,
       campaignFlowTarget: basketContinuation.campaignFlowTarget,
       postCompletionDebtRepairActive: basketContinuation.postCompletionDebtRepairActive,
-      ...(basketContinuation.rejectedReason
-        ? { continuationRejectedReason: basketContinuation.rejectedReason }
-        : {}),
-    };
-  }
+	      ...(aggressiveAvgImprovingShouldStage || basketContinuation.rejectedReason
+	        ? {
+	            continuationRejectedReason: aggressiveAvgImprovingShouldStage
+	              ? "xuan_pair_cost_wait"
+	              : basketContinuation.rejectedReason,
+	          }
+	        : {}),
+	    };
+	  }
 
   if (args.secsToClose <= args.config.finalWindowSoftStartSec && !args.config.allowNewPairInLast60S) {
     return {

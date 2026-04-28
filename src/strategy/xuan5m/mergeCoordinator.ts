@@ -382,11 +382,18 @@ export function evaluateDelayedMergeGate(
     secsFromOpen <= 282 &&
     metrics.pendingMatchedQty >= state.market.minOrderSize - 1e-9;
   if (familyFinalMergeWindowActive) {
+    const debtPositiveFinalWindow =
+      basketEffectivePair !== undefined &&
+      basketEffectivePair > config.marketBasketMergeEffectivePairCap + 1e-9;
     return {
       allow: true,
       forced: true,
       reason: "final_window",
       ...(basketEffectivePair !== undefined ? { basketEffectivePair: normalize(basketEffectivePair) } : {}),
+      mergeVsCarryDecision: debtPositiveFinalWindow ? "MERGE_NOW" : "NOT_APPLICABLE",
+      ...(debtPositiveFinalWindow
+        ? { mergeVsCarryReason: "debt_positive_final_window_forced_merge" }
+        : {}),
       ...metrics,
     };
   }

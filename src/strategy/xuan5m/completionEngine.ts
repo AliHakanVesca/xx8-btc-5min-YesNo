@@ -32,7 +32,7 @@ import {
   resolveCampaignCompletionSizing,
   resolveResidualCompletionDelayProfile,
 } from "./modePolicy.js";
-import { completionCost } from "./sumAvgEngine.js";
+import { completionCost, maxCompletionAskForCostCap } from "./sumAvgEngine.js";
 import type { StrategyExecutionMode } from "./executionModes.js";
 import { buildTakerBuyOrder, buildTakerSellOrder } from "./marketOrderBuilder.js";
 import {
@@ -83,6 +83,7 @@ export interface CompletionDecision {
   plannedOppositeFilledQty?: number;
   plannedOppositeMissingQty?: number;
   plannedOppositeAgeSec?: number;
+  plannedOppositeMaxPrice?: number;
   plannedOppositeCompletionAttemptCount?: number;
   plannedOppositeCompletionOpenedCount?: number;
   overlapRepairArbitration?: "no_overlap_lock" | "standard_pair_reentry" | "favor_independent_overlap" | "favor_residual_repair";
@@ -105,6 +106,35 @@ export interface UnwindDecision {
 
 function isAggressivePublicFootprint(config: Pick<XuanStrategyConfig, "botMode" | "xuanCloneMode" | "xuanCloneIntensity">): boolean {
   return config.botMode === "XUAN" && config.xuanCloneMode === "PUBLIC_FOOTPRINT" && config.xuanCloneIntensity === "AGGRESSIVE";
+}
+
+function strictXuanPairCostTargetCap(config: XuanStrategyConfig): number {
+  const caps = [
+    config.marketBasketMergeEffectivePairCap,
+    config.marketBasketGoodAvgCap,
+    config.highLowDebtReducingEffectiveCap,
+    1,
+  ].filter((cap) => Number.isFinite(cap) && cap > 0);
+  return Math.min(...caps);
+}
+
+function xuanPairCostImprovesOrMeetsTarget(
+  config: XuanStrategyConfig,
+  currentEffectivePair: number,
+  candidateEffectivePair: number,
+): boolean {
+  if (!Number.isFinite(candidateEffectivePair)) {
+    return false;
+  }
+  const targetCap = strictXuanPairCostTargetCap(config);
+  if (candidateEffectivePair <= targetCap + 1e-9) {
+    return true;
+  }
+  return (
+    Number.isFinite(currentEffectivePair) &&
+    currentEffectivePair > targetCap + 1e-9 &&
+    candidateEffectivePair < currentEffectivePair - config.marketBasketMinAvgImprovement + 1e-9
+  );
 }
 
 function plannedOppositeMinWaitSec(config: XuanStrategyConfig, secsFromOpen?: number, secsToClose?: number): number {
@@ -307,6 +337,7 @@ function chooseCompletion(
     config.borderlinePairStagedEntryEnabled &&
     stagedResidualAgeSec !== undefined &&
     stagedResidualAgeSec < config.borderlinePairReevaluateAfterSec &&
+    exactCompletionQtyPrior === undefined &&
     !latePlannedOppositeDutyActive &&
     ctx.secsToClose > config.finalWindowCompletionOnlySec
   ) {
@@ -459,47 +490,70 @@ function chooseCompletion(
       plannedOppositeDutyActive && plannedOpposite ? plannedOpposite.plannedOppositeMissingQty : 0,
       xuanFamilyResidualDutyActive ? Math.min(config.xuanBasketCampaignCompletionClipMaxQty, oldGap * 1.15) : 0,
     );
-    const xuanRoleSequenceOvershootAllowed =
-      xuanFamilyResidualDutyActive &&
-      candidateSize <= xuanResidualDutyMaxQty + 1e-9 &&
-      projectedGap <= config.maxOneSidedExposureShares + 1e-9;
-    if (
-      (config.forbidBuyThatIncreasesImbalance || config.partialCompletionRequiresImbalanceReduction) &&
-      projectedGap > oldGap + config.maxCompletionOvershootShares &&
+	    const xuanRoleSequenceOvershootAllowed =
+	      xuanFamilyResidualDutyActive &&
+	      candidateSize <= xuanResidualDutyMaxQty + 1e-9 &&
+	      projectedGap <= config.maxOneSidedExposureShares + 1e-9;
+	    const nonExactFamilyResidualOvershootBlocked =
+	      isAggressivePublicFootprint(config) &&
+	      xuanFamilyResidualDutyActive &&
+	      exactCompletionQtyPrior === undefined &&
+	      candidateSize > oldGap + config.maxCompletionOvershootShares + 1e-9 &&
+	      projectedGap > Math.max(config.postMergeFlatDustShares, config.maxCompletionOvershootShares) + 1e-9;
+	    if (nonExactFamilyResidualOvershootBlocked) {
+	      continue;
+	    }
+	    if (
+	      (config.forbidBuyThatIncreasesImbalance || config.partialCompletionRequiresImbalanceReduction) &&
+	      projectedGap > oldGap + config.maxCompletionOvershootShares &&
       !xuanRoleSequenceOvershootAllowed
     ) {
       continue;
     }
 
     const costWithFees = completionCost(existingAverage, execution.averagePrice, config.cryptoTakerFeeRate);
+    const currentMatchedEffectivePair =
+      mergeableShares(state) > 1e-6
+        ? matchedEffectivePairCost(state, config.cryptoTakerFeeRate)
+        : Number.POSITIVE_INFINITY;
+    const xuanCostDisciplinedCompletion = xuanPairCostImprovesOrMeetsTarget(
+      config,
+      currentMatchedEffectivePair,
+      costWithFees,
+    );
     const xuanPriorCompletionAllowed =
       activeCompletionQtyPrior !== undefined &&
       costWithFees <= Math.max(config.xuanBehaviorCap, phase.cap) + 1e-9;
     const xuanResidualDutyCompletionAllowed =
       xuanFamilyResidualDutyActive &&
       candidateSize <= xuanResidualDutyMaxQty + 1e-9 &&
-      costWithFees <= config.xuanBehaviorCap + 1e-9;
+      xuanCostDisciplinedCompletion;
     const plannedOppositeCandidate =
       plannedOppositeDutyActive &&
       plannedOpposite !== undefined &&
       candidateSize <= plannedOpposite.plannedOppositeMissingQty + config.maxCompletionOvershootShares + 1e-9;
-    const plannedOppositeCompletionCap =
-      config.xuanCloneMode === "PUBLIC_FOOTPRINT" && config.xuanCloneIntensity === "AGGRESSIVE"
-        ? Math.max(
-            1.025,
-            Math.min(
-              config.xuanBehaviorCap,
-              Math.max(config.marketBasketGoodAvgCap, config.temporalRepairPatientCap, config.highSideEmergencyCap),
-            ),
+    const plannedOppositeMaxPrice =
+      plannedOppositeCandidate && plannedOpposite !== undefined
+        ? maxCompletionAskForCostCap(
+            existingAverage,
+            strictXuanPairCostTargetCap(config),
+            config.cryptoTakerFeeRate,
           )
-        : 1.025;
+        : 0;
+    const plannedOppositePriceTargetMet =
+      !isAggressivePublicFootprint(config) ||
+      xuanPriorCompletionAllowed ||
+      ctx.secsToClose <= config.finalWindowCompletionOnlySec ||
+      (plannedOppositeMaxPrice > 0 && execution.averagePrice <= plannedOppositeMaxPrice + 1e-9);
     const plannedOppositeCompletionAllowed =
       plannedOppositeCandidate &&
       ctx.secsToClose > config.finalWindowNoChaseSec &&
-      costWithFees <= plannedOppositeCompletionCap + 1e-9;
+      (isAggressivePublicFootprint(config)
+        ? plannedOppositePriceTargetMet && xuanCostDisciplinedCompletion
+        : costWithFees <= 1.025 + 1e-9);
     const plannedOppositeDebtReducing =
       plannedOppositeCandidate &&
-      costWithFees <= config.marketBasketGoodAvgCap + 1e-9;
+      costWithFees <= strictXuanPairCostTargetCap(config) + 1e-9;
     if (
       aggressiveOppositeReleaseHold({
         config,
@@ -510,6 +564,24 @@ function chooseCompletion(
         effectiveCost: costWithFees,
         exactPriorActive: Boolean(exactCompletionQtyPrior),
       })
+    ) {
+      continue;
+    }
+    if (
+      isAggressivePublicFootprint(config) &&
+      xuanFamilyResidualDutyActive &&
+      !xuanCostDisciplinedCompletion &&
+      !xuanPriorCompletionAllowed &&
+      ctx.secsToClose > config.finalWindowCompletionOnlySec
+    ) {
+      continue;
+    }
+    if (
+      plannedOppositeCandidate &&
+      isAggressivePublicFootprint(config) &&
+      (!plannedOppositePriceTargetMet || !xuanCostDisciplinedCompletion) &&
+      !xuanPriorCompletionAllowed &&
+      ctx.secsToClose > config.finalWindowCompletionOnlySec
     ) {
       continue;
     }
@@ -567,10 +639,6 @@ function chooseCompletion(
     }
     const highLowPhaseCapOverride = Boolean(allowance.highLowMismatch && allowance.allowed);
     const marketBasketPhaseCapOverride = Boolean(marketBasketProjection?.phaseMaxOverrideAllowed);
-    const currentMatchedEffectivePair =
-      mergeableShares(state) > 1e-6
-        ? matchedEffectivePairCost(state, config.cryptoTakerFeeRate)
-        : Number.POSITIVE_INFINITY;
     const campaignResidualFallback = residualCompletionFairValueFallback({
       config,
       state,
@@ -931,6 +999,7 @@ function chooseCompletion(
             plannedOppositeFilledQty: plannedOpposite.plannedOppositeFilledQty,
             plannedOppositeMissingQty: plannedOpposite.plannedOppositeMissingQty,
             plannedOppositeAgeSec: plannedOpposite.plannedOppositeAgeSec,
+            plannedOppositeMaxPrice: normalizeSize(plannedOppositeMaxPrice),
             plannedOppositeCompletionAttemptCount: 1,
             plannedOppositeCompletionOpenedCount: 1,
           }
@@ -1313,6 +1382,17 @@ function residualCompletionFairValueFallback(args: {
     args.executableSize > args.oldGap + 1e-9 ||
     args.newGap >= args.oldGap - 1e-9
   ) {
+    return { allowed: false };
+  }
+  const aggressivePublicFootprint = isAggressivePublicFootprint(args.config);
+  const costDisciplined =
+    !aggressivePublicFootprint ||
+    xuanPairCostImprovesOrMeetsTarget(
+      args.config,
+      args.currentMatchedEffectivePair,
+      args.repairCost,
+    );
+  if (!costDisciplined) {
     return { allowed: false };
   }
   if (args.repairCost <= args.config.residualCompletionCostBasisCap + 1e-9) {

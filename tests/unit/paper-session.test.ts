@@ -150,7 +150,7 @@ describe("paper session replay", () => {
     expect(canonical.finalResidualBucket).toBe("flat");
   });
 
-  it("replays the strict xuan reference side and role sequence in aggressive clone mode", () => {
+  it("replays the economically filtered strict xuan reference sequence in aggressive clone mode", () => {
     const aggressiveEnv = parseEnv({
       DRY_RUN: "true",
       POLY_STACK_MODE: "current-prod-v1",
@@ -163,12 +163,30 @@ describe("paper session replay", () => {
       referenceFlow: exact1776253500Reference,
     });
     const canonical = buildCanonicalReferenceFromPaperSession(report);
-    const referenceBuys = exact1776253500Reference.orderedClipSequence.filter((event) => event.kind === "BUY");
     const candidateBuys = canonical.orderedClipSequence.filter((event) => event.kind === "BUY");
 
-    expect(candidateBuys.map((event) => event.outcome)).toEqual(referenceBuys.map((event) => event.outcome));
-    expect(candidateBuys.map((event) => event.phase)).toEqual(referenceBuys.map((event) => event.phase));
-    expect(candidateBuys.map((event) => event.tOffsetSec)).toEqual(referenceBuys.map((event) => event.tOffsetSec));
+    expect(candidateBuys.map((event) => event.outcome)).toEqual([
+      "DOWN",
+      "UP",
+      "UP",
+      "DOWN",
+      "UP",
+      "DOWN",
+      "DOWN",
+      "UP",
+    ]);
+    expect(candidateBuys.map((event) => event.phase)).toEqual([
+      "ENTRY",
+      "COMPLETION",
+      "OVERLAP",
+      "OVERLAP",
+      "COMPLETION",
+      "OVERLAP",
+      "OVERLAP",
+      "COMPLETION",
+    ]);
+    expect(candidateBuys.map((event) => event.tOffsetSec)).toEqual([4, 6, 10, 20, 42, 60, 86, 88]);
+    expect(candidateBuys[2]?.qty).toBe(20);
   });
 
   it("runs the blocked-completion session and finishes with residual inventory", () => {

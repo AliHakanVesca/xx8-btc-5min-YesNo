@@ -128,7 +128,7 @@ describe("live paper analytics", () => {
     });
 
     expect(scored.score).toBe(74);
-    expect(scored.status).toBe("WARN");
+    expect(scored.status).toBe("FAIL");
     expect(scored.blockers).toContain("negative_merge_pnl");
     expect(scored.economicsWarnings).toContain("negative_merge_pnl");
   });
@@ -153,8 +153,70 @@ describe("live paper analytics", () => {
     });
 
     expect(scored.score).toBe(74);
-    expect(scored.status).toBe("WARN");
+    expect(scored.status).toBe("FAIL");
     expect(scored.blockers).toEqual(expect.arrayContaining(["high_cost_seed", "late_seed_unclosed"]));
+  });
+
+  it("blocks xuan-strict PASS when staged opposite release timing misses the 20-35s band", () => {
+    const scored = scoreXuanConformance({
+      rawScore: 90,
+      fillCount: 5,
+      minFillCountForPass: 3,
+      mergedQty: 80,
+      mergeRealizedPnl: 0.2,
+      requireProfit: true,
+      pairedContinuationCount: 1,
+      independentFlowCount: 1,
+      requirePairedContinuation: true,
+      firstFillSec: 4,
+      completionSec: 50,
+      imbalanceShares: 0,
+      residualShares: 0.02,
+      stagedOppositeReleaseRate: 0.5,
+      plannedOppositeMissedDeadlineCount: 1,
+      oppositeLegGapMedianSec: 61,
+      firstCycleOppositeGapSec: 61,
+    });
+
+    expect(scored.score).toBe(74);
+    expect(scored.status).toBe("FAIL");
+    expect(scored.blockers).toEqual(
+      expect.arrayContaining([
+        "opposite_leg_gap_too_long",
+        "first_cycle_opposite_gap_too_long",
+        "staged_opposite_release_low",
+        "planned_opposite_deadline_missed",
+      ]),
+    );
+  });
+
+  it("fails xuan-strict conformance for open planned opposite and normal 5 qty micro re-entry", () => {
+    const scored = scoreXuanConformance({
+      rawScore: 90,
+      fillCount: 5,
+      minFillCountForPass: 3,
+      mergedQty: 80,
+      mergeRealizedPnl: 0.2,
+      requireProfit: true,
+      pairedContinuationCount: 1,
+      independentFlowCount: 1,
+      requirePairedContinuation: true,
+      firstFillSec: 4,
+      completionSec: 30,
+      imbalanceShares: 0,
+      residualShares: 0.02,
+      stagedOppositeReleaseRate: 1,
+      plannedOppositeMissedDeadlineCount: 0,
+      materialOpenOppositeCount: 1,
+      materialOpenPlannedOppositeQty: 80,
+      normalMicroReentryCount: 1,
+    });
+
+    expect(scored.score).toBe(74);
+    expect(scored.status).toBe("FAIL");
+    expect(scored.blockers).toEqual(
+      expect.arrayContaining(["material_open_planned_opposite", "normal_micro_reentry"]),
+    );
   });
 
   it("does not count split completions as real xuan continuation for PASS", () => {
@@ -192,9 +254,11 @@ describe("live paper analytics", () => {
     expect(metrics.stagedOppositeSeedCount).toBe(1);
     expect(metrics.stagedOppositeReleaseCount).toBe(2);
     expect(metrics.stagedOppositeReleaseRate).toBe(1);
+    expect(metrics.firstCycleOppositeGapSec).toBe(25);
     expect(metrics.pairedContinuationCount).toBe(2);
     expect(metrics.independentFlowCount).toBe(2);
     expect(metrics.debtReducingContinuationCount).toBe(2);
+    expect(metrics.normalMicroReentryCount).toBe(0);
   });
 
   it("builds a live paper sample with entry-buy-first decision when books are fresh", () => {

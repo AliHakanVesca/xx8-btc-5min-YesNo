@@ -120,6 +120,7 @@ export interface LivePaperSummary {
   xuanFirstFillSec?: number;
   xuanCompletionSec?: number;
   xuanLastFillSec?: number;
+  xuanFirstCycleOppositeGapSec?: number;
   xuanFillCount?: number;
   xuanImbalanceShares?: number;
   xuanResidualShares?: number;
@@ -155,6 +156,14 @@ export interface LivePaperSummary {
   xuanLateSeedUnclosedCount?: number;
   xuanNegativeMergePnlCount?: number;
   xuanResidualDutyBlockedTop?: string;
+  plannedOppositeMissedDeadlineCount?: number;
+  deadlineForcedCompletionCount?: number;
+  pairCapCheapContinuationBypassCount?: number;
+  materialOpenOppositeCount?: number;
+  xuanMaterialOpenPlannedOppositeQty?: number;
+  xuanDeadlineCloseableButBlockedCount?: number;
+  xuanStrictSeedAbortedCount?: number;
+  xuanNormalMicroReentryCount?: number;
   xuanNoTradeReason?: string;
   xuanEarlyNoTradeReason?: string;
   xuanPassBlockers?: string[];
@@ -288,14 +297,29 @@ function medianNumber(values: number[]): number | undefined {
 
 const XUAN_STAGED_OPPOSITE_MIN_GAP_SEC = 8;
 const XUAN_STAGED_OPPOSITE_MAX_GAP_SEC = 180;
+const XUAN_STRICT_OPPOSITE_TARGET_GAP_MIN_SEC = 20;
+const XUAN_STRICT_OPPOSITE_TARGET_GAP_MAX_SEC = 35;
+const XUAN_STRICT_PAIR_COST_TARGET_CAP = 0.982;
 
 export interface XuanLivePaperBehaviorMetrics {
   stagedOppositeSeedCount: number;
   stagedOppositeReleaseCount: number;
   stagedOppositeReleaseRate: number;
+  firstCycleOppositeGapSec?: number;
   pairedContinuationCount: number;
   independentFlowCount: number;
   debtReducingContinuationCount: number;
+  normalMicroReentryCount: number;
+}
+
+interface XuanStrictPlannedOppositeMetrics {
+  plannedOppositeMissedDeadlineCount: number;
+  deadlineForcedCompletionCount: number;
+  materialOpenOppositeCount: number;
+  materialOpenPlannedOppositeQty: number;
+  deadlineCloseableButBlockedCount: number;
+  strictSeedAbortedCount: number;
+  pairCapCheapContinuationBypassCount: number;
 }
 
 function isXuanStagedSeed(execution: LivePaperOrderExecution): boolean {
@@ -341,6 +365,7 @@ export function computeXuanLivePaperBehaviorMetrics(
     (sides) => sides.has("UP") && sides.has("DOWN"),
   ).length;
   let stagedOppositeReleaseCount = 0;
+  let firstCycleOppositeGapSec: number | undefined;
   for (let index = 1; index < buyFills.length; index += 1) {
     const execution = buyFills[index]!;
     if (!isXuanStagedRelease(execution)) {
@@ -357,6 +382,9 @@ export function computeXuanLivePaperBehaviorMetrics(
     if (gapSec < XUAN_STAGED_OPPOSITE_MIN_GAP_SEC || gapSec > XUAN_STAGED_OPPOSITE_MAX_GAP_SEC) {
       continue;
     }
+    if (firstCycleOppositeGapSec === undefined) {
+      firstCycleOppositeGapSec = gapSec;
+    }
     stagedOppositeReleaseCount += 1;
     const effectivePair = execution.projectedBasketEffectivePair ?? execution.pairCostWithFees;
     if (effectivePair !== undefined && effectivePair <= 1 + 1e-9) {
@@ -368,13 +396,98 @@ export function computeXuanLivePaperBehaviorMetrics(
     1,
     stagedOppositeReleaseCount / Math.max(stagedOppositeSeedCount, 1),
   );
+  const normalMicroReentryCount = buyFills.filter(
+    (execution) =>
+      execution.kind === "entry" &&
+      execution.filledShares <= 5 + 1e-9 &&
+      (execution.reason === "balanced_pair_reentry" || isXuanStagedSeed(execution)),
+  ).length;
   return {
     stagedOppositeSeedCount,
     stagedOppositeReleaseCount,
     stagedOppositeReleaseRate: normalize(stagedOppositeReleaseRate),
+    ...(firstCycleOppositeGapSec !== undefined
+      ? { firstCycleOppositeGapSec: normalize(firstCycleOppositeGapSec) }
+      : {}),
     pairedContinuationCount: sameTickPairedContinuationCount + stagedOppositeReleaseCount,
     independentFlowCount: stagedOppositeReleaseCount,
     debtReducingContinuationCount,
+    normalMicroReentryCount,
+  };
+}
+
+function computeXuanStrictPlannedOppositeMetrics(
+  executions: LivePaperOrderExecution[],
+  noTradeReasons: Map<string, number> = new Map(),
+): XuanStrictPlannedOppositeMetrics {
+  const buyFills = executions
+    .filter((execution) => execution.tradeSide === "BUY" && execution.filledShares > 1e-9)
+    .sort((left, right) => left.timestamp - right.timestamp);
+  const stagedSeeds = buyFills.filter(isXuanStagedSeed);
+  let plannedOppositeMissedDeadlineCount = 0;
+  let deadlineForcedCompletionCount = 0;
+  let materialOpenOppositeCount = 0;
+  let materialOpenPlannedOppositeQty = 0;
+  let pairCapCheapContinuationBypassCount = 0;
+
+  for (const seed of stagedSeeds) {
+    const releases = buyFills.filter(
+      (candidate) =>
+        candidate.timestamp > seed.timestamp &&
+        candidate.outcome !== seed.outcome &&
+        isXuanStagedRelease(candidate),
+    );
+    const strictRelease = releases.find(
+      (candidate) => {
+        const gapSec = candidate.timestamp - seed.timestamp;
+        return (
+          gapSec >= XUAN_STRICT_OPPOSITE_TARGET_GAP_MIN_SEC - 1e-9 &&
+          gapSec <= XUAN_STRICT_OPPOSITE_TARGET_GAP_MAX_SEC + 1e-9
+        );
+      },
+    );
+    const eventualRelease = releases[0];
+    if (!strictRelease) {
+      plannedOppositeMissedDeadlineCount += 1;
+    }
+    if (eventualRelease === undefined) {
+      materialOpenOppositeCount += 1;
+      materialOpenPlannedOppositeQty += seed.filledShares;
+    } else {
+      const gapSec = eventualRelease.timestamp - seed.timestamp;
+      if (gapSec >= XUAN_STRICT_OPPOSITE_TARGET_GAP_MAX_SEC - 1e-9) {
+        deadlineForcedCompletionCount += 1;
+      }
+    }
+    const seedPairCost = seed.projectedBasketEffectivePair ?? seed.pairCostWithFees;
+    if (seedPairCost !== undefined && seedPairCost <= XUAN_STRICT_PAIR_COST_TARGET_CAP + 1e-9) {
+      pairCapCheapContinuationBypassCount += 1;
+    }
+  }
+  const strictSeedAbortedCount = [...noTradeReasons.entries()]
+    .filter(([reason]) => reason.startsWith("xuan_strict_seed_abort"))
+    .reduce((acc, [, count]) => acc + count, 0);
+  const closeableBlockerReasons = new Set([
+    "xuan_pair_cost_wait",
+    "residual_completion_cost_basis_cap",
+    "repair_phase_cap",
+    "lagging_depth",
+  ]);
+  const deadlineCloseableButBlockedCount =
+    plannedOppositeMissedDeadlineCount > 0
+      ? [...noTradeReasons.entries()]
+          .filter(([reason]) => closeableBlockerReasons.has(reason))
+          .reduce((acc, [, count]) => acc + count, 0)
+      : 0;
+
+  return {
+    plannedOppositeMissedDeadlineCount,
+    deadlineForcedCompletionCount,
+    materialOpenOppositeCount,
+    materialOpenPlannedOppositeQty: normalize(materialOpenPlannedOppositeQty),
+    deadlineCloseableButBlockedCount,
+    strictSeedAbortedCount,
+    pairCapCheapContinuationBypassCount,
   };
 }
 
@@ -399,6 +512,12 @@ export function scoreXuanConformance(args: {
   highCostSeedCount?: number | undefined;
   lateSeedUnclosedCount?: number | undefined;
   negativeMergePnlCount?: number | undefined;
+  stagedOppositeReleaseRate?: number | undefined;
+  plannedOppositeMissedDeadlineCount?: number | undefined;
+  firstCycleOppositeGapSec?: number | undefined;
+  materialOpenOppositeCount?: number | undefined;
+  materialOpenPlannedOppositeQty?: number | undefined;
+  normalMicroReentryCount?: number | undefined;
 }): { score: number; status: "PASS" | "WARN" | "FAIL"; blockers: string[]; economicsWarnings: string[] } {
   const negativeMergePnlActive =
     args.requireProfit === true &&
@@ -422,16 +541,42 @@ export function scoreXuanConformance(args: {
     ...(args.firstFillSec !== undefined && args.firstFillSec <= 15 ? [] : ["late_or_missing_first_fill"]),
     ...(args.completionSec !== undefined && args.completionSec <= 120 ? [] : ["late_or_missing_completion"]),
     ...(args.imbalanceShares <= 0.02 && args.residualShares <= 0.02 ? [] : ["residual_not_flat"]),
-    ...((args.sameSecondDualBuyRate ?? 0) <= 0.12 ? [] : ["same_second_dual_buy_rate_high"]),
+    ...((args.sameSecondDualBuyRate ?? 0) <= 0.08 ? [] : ["same_second_dual_buy_rate_high"]),
     ...(args.oppositeLegGapMedianSec === undefined || args.oppositeLegGapMedianSec >= 8
       ? []
       : ["opposite_leg_gap_too_short"]),
+    ...(args.oppositeLegGapMedianSec === undefined || args.oppositeLegGapMedianSec <= 35
+      ? []
+      : ["opposite_leg_gap_too_long"]),
+    ...(args.firstCycleOppositeGapSec === undefined || args.firstCycleOppositeGapSec <= 35
+      ? []
+      : ["first_cycle_opposite_gap_too_long"]),
+    ...(args.fillCount < 3 || (args.stagedOppositeReleaseRate ?? 1) >= 0.9
+      ? []
+      : ["staged_opposite_release_low"]),
+    ...((args.plannedOppositeMissedDeadlineCount ?? 0) === 0 ? [] : ["planned_opposite_deadline_missed"]),
+    ...((args.materialOpenOppositeCount ?? 0) === 0 && (args.materialOpenPlannedOppositeQty ?? 0) <= 0.02
+      ? []
+      : ["material_open_planned_opposite"]),
+    ...((args.normalMicroReentryCount ?? 0) === 0 ? [] : ["normal_micro_reentry"]),
     ...((args.buyRowsPerMarket ?? 0) <= 35 ? [] : ["buy_density_too_high"]),
   ];
   const score = blockers.length === 0 ? args.rawScore : Math.min(args.rawScore, 74);
+  const failBlockers = new Set([
+    "negative_merge_pnl",
+    "high_cost_seed",
+    "late_seed_unclosed",
+    "residual_not_flat",
+    "first_cycle_opposite_gap_too_long",
+    "staged_opposite_release_low",
+    "planned_opposite_deadline_missed",
+    "material_open_planned_opposite",
+    "normal_micro_reentry",
+  ]);
+  const hasFailBlocker = blockers.some((blocker) => failBlockers.has(blocker));
   return {
     score,
-    status: blockers.length === 0 && score >= 75 ? "PASS" : score >= 45 ? "WARN" : "FAIL",
+    status: blockers.length === 0 && score >= 75 ? "PASS" : hasFailBlocker ? "FAIL" : score >= 45 ? "WARN" : "FAIL",
     blockers,
     economicsWarnings,
   };
@@ -1113,6 +1258,10 @@ function enrichSummaryWithExecution(args: {
   const oppositeLegGapMedianSec = medianNumber(oppositeLegGaps);
   const medianTradeSize = medianNumber(buyFills.map((execution) => execution.filledShares));
   const behaviorMetrics = computeXuanLivePaperBehaviorMetrics(filledExecutions);
+  const strictPlannedOppositeMetrics = computeXuanStrictPlannedOppositeMetrics(
+    filledExecutions,
+    args.noTradeReasons,
+  );
   const pairedContinuationCount = behaviorMetrics.pairedContinuationCount;
   const independentFlowCount = behaviorMetrics.independentFlowCount;
   const completionOnlyFillCount = completionFills.length;
@@ -1223,6 +1372,14 @@ function enrichSummaryWithExecution(args: {
     highCostSeedCount: highCostSeedPairs.length,
     lateSeedUnclosedCount,
     negativeMergePnlCount,
+    stagedOppositeReleaseRate: behaviorMetrics.stagedOppositeReleaseRate,
+    plannedOppositeMissedDeadlineCount: strictPlannedOppositeMetrics.plannedOppositeMissedDeadlineCount,
+    ...(behaviorMetrics.firstCycleOppositeGapSec !== undefined
+      ? { firstCycleOppositeGapSec: behaviorMetrics.firstCycleOppositeGapSec }
+      : {}),
+    materialOpenOppositeCount: strictPlannedOppositeMetrics.materialOpenOppositeCount,
+    materialOpenPlannedOppositeQty: strictPlannedOppositeMetrics.materialOpenPlannedOppositeQty,
+    normalMicroReentryCount: behaviorMetrics.normalMicroReentryCount,
   });
   const xuanNoTradeReason = [...args.noTradeReasons.entries()].sort((left, right) => right[1] - left[1])[0]?.[0];
   const xuanFinalMergeForced = args.merges.some((merge) => merge.status === "merged" && merge.forced);
@@ -1256,6 +1413,9 @@ function enrichSummaryWithExecution(args: {
     ...(firstFillTs !== undefined ? { xuanFirstFillSec: normalize(firstFillTs - args.marketStartTs) } : {}),
     ...(completionTs !== undefined ? { xuanCompletionSec: normalize(completionTs - args.marketStartTs) } : {}),
     ...(lastFillTs !== undefined ? { xuanLastFillSec: normalize(lastFillTs - args.marketStartTs) } : {}),
+    ...(behaviorMetrics.firstCycleOppositeGapSec !== undefined
+      ? { xuanFirstCycleOppositeGapSec: behaviorMetrics.firstCycleOppositeGapSec }
+      : {}),
     xuanFillCount: buyFills.length,
     xuanImbalanceShares: imbalanceShares,
     xuanResidualShares: residualShares,
@@ -1291,6 +1451,14 @@ function enrichSummaryWithExecution(args: {
     xuanLateSeedUnclosedCount: lateSeedUnclosedCount,
     xuanNegativeMergePnlCount: negativeMergePnlCount,
     ...(residualDutyBlockedTop ? { xuanResidualDutyBlockedTop: residualDutyBlockedTop } : {}),
+    plannedOppositeMissedDeadlineCount: strictPlannedOppositeMetrics.plannedOppositeMissedDeadlineCount,
+    deadlineForcedCompletionCount: strictPlannedOppositeMetrics.deadlineForcedCompletionCount,
+    pairCapCheapContinuationBypassCount: strictPlannedOppositeMetrics.pairCapCheapContinuationBypassCount,
+    materialOpenOppositeCount: strictPlannedOppositeMetrics.materialOpenOppositeCount,
+    xuanMaterialOpenPlannedOppositeQty: strictPlannedOppositeMetrics.materialOpenPlannedOppositeQty,
+    xuanDeadlineCloseableButBlockedCount: strictPlannedOppositeMetrics.deadlineCloseableButBlockedCount,
+    xuanStrictSeedAbortedCount: strictPlannedOppositeMetrics.strictSeedAbortedCount,
+    xuanNormalMicroReentryCount: behaviorMetrics.normalMicroReentryCount,
     ...(xuanNoTradeReason ? { xuanNoTradeReason } : {}),
     xuanPassBlockers: xuanScore.blockers,
     xuanEconomicsWarnings: xuanScore.economicsWarnings,

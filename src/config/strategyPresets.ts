@@ -840,11 +840,45 @@ export function buildStrategyConfig(env: AppEnv): XuanStrategyConfig {
   return baseConfig.xuanCloneMode === "PUBLIC_FOOTPRINT" ? applyPublicFootprintClone(baseConfig) : baseConfig;
 }
 
+const DEFAULT_XUAN_BASE_LOT_LADDER = [30, 60, 90, 120];
+const DEFAULT_LIVE_SMALL_LOT_LADDER = [5, 10, 15];
+
+function sameNumberList(a: readonly number[], b: readonly number[]): boolean {
+  return a.length === b.length && a.every((value, index) => Math.abs(value - (b[index] ?? Number.NaN)) <= 1e-9);
+}
+
+function normalizePublicFootprintLadder(ladder: readonly number[], fallback: number): number[] {
+  const cleaned = [...new Set(ladder.filter((value) => Number.isFinite(value) && value > 0).map((value) => Number(value.toFixed(6))))].sort(
+    (a, b) => a - b,
+  );
+  if (cleaned.length > 0) {
+    return cleaned;
+  }
+  return [fallback].filter((value) => Number.isFinite(value) && value > 0);
+}
+
+function hasExplicitPublicFootprintLadder(config: XuanStrategyConfig): boolean {
+  return (
+    !sameNumberList(config.xuanBaseLotLadder, DEFAULT_XUAN_BASE_LOT_LADDER) ||
+    !sameNumberList(config.liveSmallLotLadder, DEFAULT_LIVE_SMALL_LOT_LADDER)
+  );
+}
+
+function aggressiveFloor(configured: number, defaultFloor: number, customFloor: number, customProfile: boolean): number {
+  return Math.max(configured, customProfile ? customFloor : defaultFloor);
+}
+
 function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConfig {
   const aggressive = config.xuanCloneIntensity === "AGGRESSIVE";
-  const ladder = aggressive ? [60, 80, 145, 214, 265] : [30, 60, 90, 120, 145];
+  const customAggressiveLadder = aggressive && hasExplicitPublicFootprintLadder(config);
+  const configuredLadder = config.xuanBaseLotLadder.length > 0 ? config.xuanBaseLotLadder : config.liveSmallLotLadder;
+  const ladder = aggressive
+    ? customAggressiveLadder
+      ? normalizePublicFootprintLadder(configuredLadder, config.defaultLot)
+      : [60, 80, 145, 214, 265]
+    : [30, 60, 90, 120, 145];
   const elevatedBehaviorCap = Math.max(config.xuanBehaviorCap, aggressive ? 1.3 : 1.25);
-  const maxLadderLot = Math.max(ladder[ladder.length - 1] ?? 145, 145);
+  const maxLadderLot = Math.max(ladder[ladder.length - 1] ?? 145, customAggressiveLadder ? 1 : 145);
   const controlledRhythmMin = Math.max(1, Math.min(config.xuanRhythmMinWaitSec, config.xuanRhythmBaseWaitSec));
   const controlledRhythmBase = Math.max(config.xuanRhythmBaseWaitSec, controlledRhythmMin);
   const controlledRhythmMax = Math.max(config.xuanRhythmMaxWaitSec, controlledRhythmBase);
@@ -889,12 +923,42 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     singleLegSeedMaxQty: Math.max(config.singleLegSeedMaxQty, maxLadderLot),
     maxSingleOrphanQty: Math.max(config.maxSingleOrphanQty, maxLadderLot),
     singleLegOrphanCap: Math.max(config.singleLegOrphanCap, aggressive ? 0.97 : 0.78),
-    orphanLegMaxNotionalUsdc: Math.max(config.orphanLegMaxNotionalUsdc, aggressive ? 320 : 80),
-    maxMarketOrphanUsdc: Math.max(config.maxMarketOrphanUsdc, aggressive ? 650 : 160),
-    maxNegativePairEdgePerCycleUsdc: Math.max(config.maxNegativePairEdgePerCycleUsdc, aggressive ? 60 : 20),
-    maxNegativePairEdgePerMarketUsdc: Math.max(config.maxNegativePairEdgePerMarketUsdc, aggressive ? 140 : 20),
-    maxNegativeDailyBudgetUsdc: Math.max(config.maxNegativeDailyBudgetUsdc, aggressive ? 180 : 25),
-    maxNegativeEdgePerMarketUsdc: Math.max(config.maxNegativeEdgePerMarketUsdc, aggressive ? 140 : 25),
+    orphanLegMaxNotionalUsdc: aggressiveFloor(
+      config.orphanLegMaxNotionalUsdc,
+      320,
+      Math.max(20, maxLadderLot * 0.98),
+      customAggressiveLadder,
+    ),
+    maxMarketOrphanUsdc: aggressiveFloor(
+      config.maxMarketOrphanUsdc,
+      650,
+      Math.max(20, maxLadderLot * 1.1),
+      customAggressiveLadder,
+    ),
+    maxNegativePairEdgePerCycleUsdc: aggressiveFloor(
+      config.maxNegativePairEdgePerCycleUsdc,
+      60,
+      Math.max(4, maxLadderLot * 0.08),
+      customAggressiveLadder,
+    ),
+    maxNegativePairEdgePerMarketUsdc: aggressiveFloor(
+      config.maxNegativePairEdgePerMarketUsdc,
+      140,
+      Math.max(8, maxLadderLot * 0.14),
+      customAggressiveLadder,
+    ),
+    maxNegativeDailyBudgetUsdc: aggressiveFloor(
+      config.maxNegativeDailyBudgetUsdc,
+      180,
+      Math.max(12, maxLadderLot * 0.2),
+      customAggressiveLadder,
+    ),
+    maxNegativeEdgePerMarketUsdc: aggressiveFloor(
+      config.maxNegativeEdgePerMarketUsdc,
+      140,
+      Math.max(8, maxLadderLot * 0.14),
+      customAggressiveLadder,
+    ),
     marketBasketBootstrapMaxQty: Math.max(config.marketBasketBootstrapMaxQty, maxLadderLot),
     marketBasketBootstrapMaxEffectivePair: Math.max(config.marketBasketBootstrapMaxEffectivePair, 1.055),
     freshSeedHardCutoffSec: aggressive ? Math.max(config.freshSeedHardCutoffSec, 290) : config.freshSeedHardCutoffSec,
@@ -924,11 +988,26 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     xuanPairSweepHardCap: Math.max(config.xuanPairSweepHardCap, aggressive ? 1.12 : config.xuanPairSweepHardCap),
     xuanMinTimeLeftForSoftSweep: aggressive ? Math.min(config.xuanMinTimeLeftForSoftSweep, 5) : config.xuanMinTimeLeftForSoftSweep,
     xuanMinTimeLeftForHardSweep: aggressive ? Math.min(config.xuanMinTimeLeftForHardSweep, 5) : config.xuanMinTimeLeftForHardSweep,
-    maxMarketExposureShares: Math.max(config.maxMarketExposureShares, aggressive ? 4200 : 500),
-    maxMarketSharesPerSide: Math.max(config.maxMarketSharesPerSide, aggressive ? 4200 : 500),
-    maxOneSidedExposureShares: Math.max(config.maxOneSidedExposureShares, aggressive ? 1800 : 180),
-    maxCyclesPerMarket: Math.max(config.maxCyclesPerMarket, aggressive ? 45 : 12),
-    maxBuysPerSide: Math.max(config.maxBuysPerSide, aggressive ? 45 : 14),
+    maxMarketExposureShares: aggressiveFloor(
+      config.maxMarketExposureShares,
+      4200,
+      Math.max(maxLadderLot * 2, config.maxMarketExposureShares),
+      customAggressiveLadder,
+    ),
+    maxMarketSharesPerSide: aggressiveFloor(
+      config.maxMarketSharesPerSide,
+      4200,
+      Math.max(maxLadderLot * 2, config.maxMarketSharesPerSide),
+      customAggressiveLadder,
+    ),
+    maxOneSidedExposureShares: aggressiveFloor(
+      config.maxOneSidedExposureShares,
+      1800,
+      Math.max(maxLadderLot, config.maxOneSidedExposureShares),
+      customAggressiveLadder,
+    ),
+    maxCyclesPerMarket: aggressiveFloor(config.maxCyclesPerMarket, 45, config.maxCyclesPerMarket, customAggressiveLadder),
+    maxBuysPerSide: aggressiveFloor(config.maxBuysPerSide, 45, config.maxBuysPerSide, customAggressiveLadder),
     maxConsecutiveSingleLegSeedsPerSide: Math.max(
       config.maxConsecutiveSingleLegSeedsPerSide,
       aggressive ? 3 : config.maxConsecutiveSingleLegSeedsPerSide,
@@ -1022,7 +1101,7 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     highSideCompletionRequiresHardImbalance: aggressive ? false : config.highSideCompletionRequiresHardImbalance,
     xuanBehaviorCap: elevatedBehaviorCap,
     cloneChildPreferredShares: aggressive
-      ? Math.max(config.cloneChildPreferredShares, ladder[0] ?? 80, 80)
+      ? Math.max(config.cloneChildPreferredShares, ladder[0] ?? 80, customAggressiveLadder ? 1 : 80)
       : Math.min(config.cloneChildPreferredShares, 20),
     cloneChildOrderDelayMs: Math.max(config.cloneChildOrderDelayMs, 120),
     cloneStaleCheapOppositeQuoteMinAgeSec: Math.min(config.cloneStaleCheapOppositeQuoteMinAgeSec, 75),

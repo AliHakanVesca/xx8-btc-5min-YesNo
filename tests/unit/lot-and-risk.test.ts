@@ -160,6 +160,49 @@ describe("lot ladder and risk windows", () => {
     expect(xuanConfig.campaignLaunchXuanProbeMaxAgeSec).toBeGreaterThanOrEqual(285);
   });
 
+  it("respects an explicit aggressive public-footprint bankroll ladder", () => {
+    const xuanConfig = buildStrategyConfig(
+      parseEnv({
+        DRY_RUN: "true",
+        POLY_STACK_MODE: "current-prod-v1",
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+        XUAN_BASE_LOT_LADDER: "60,75,83,90",
+        LIVE_SMALL_LOT_LADDER: "60,75,83,90",
+        MAX_MARKET_EXPOSURE_SHARES: "190",
+        MAX_MARKET_SHARES_PER_SIDE: "190",
+        MAX_ONE_SIDED_EXPOSURE_SHARES: "95",
+        MAX_CYCLES_PER_MARKET: "4",
+        MAX_BUYS_PER_SIDE: "5",
+        MAX_NEGATIVE_PAIR_EDGE_PER_MARKET_USDC: "12",
+        MAX_NEGATIVE_EDGE_PER_MARKET_USDC: "12",
+        ORPHAN_LEG_MAX_NOTIONAL_USDC: "88",
+        MAX_MARKET_ORPHAN_USDC: "99",
+        MAX_SINGLE_ORPHAN_QTY: "90",
+      }),
+    );
+
+    expect(xuanConfig.xuanBaseLotLadder).toEqual([60, 75, 83, 90]);
+    expect(xuanConfig.liveSmallLotLadder).toEqual([60, 75, 83, 90]);
+    expect(xuanConfig.defaultLot).toBe(60);
+    expect(xuanConfig.cloneChildPreferredShares).toBe(60);
+    expect(xuanConfig.maxMarketExposureShares).toBe(190);
+    expect(xuanConfig.maxMarketSharesPerSide).toBe(190);
+    expect(xuanConfig.maxOneSidedExposureShares).toBe(95);
+    expect(xuanConfig.maxCyclesPerMarket).toBe(4);
+    expect(xuanConfig.maxBuysPerSide).toBe(5);
+    expect(xuanConfig.maxNegativePairEdgePerMarketUsdc).toBeGreaterThanOrEqual(12);
+    expect(xuanConfig.maxNegativePairEdgePerMarketUsdc).toBeLessThan(140);
+    expect(xuanConfig.maxNegativeEdgePerMarketUsdc).toBeGreaterThanOrEqual(12);
+    expect(xuanConfig.maxNegativeEdgePerMarketUsdc).toBeLessThan(140);
+    expect(xuanConfig.orphanLegMaxNotionalUsdc).toBeGreaterThanOrEqual(88);
+    expect(xuanConfig.orphanLegMaxNotionalUsdc).toBeLessThan(320);
+    expect(xuanConfig.maxMarketOrphanUsdc).toBeGreaterThanOrEqual(99);
+    expect(xuanConfig.maxMarketOrphanUsdc).toBeLessThan(650);
+    expect(xuanConfig.maxSingleOrphanQty).toBe(90);
+  });
+
   it("does not flag moderate recycle imbalance as a risk reason in aggressive public-footprint mode", () => {
     const xuanConfig = buildStrategyConfig(
       parseEnv({

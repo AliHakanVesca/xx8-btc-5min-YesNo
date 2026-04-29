@@ -6,6 +6,7 @@ import {
   SignatureTypeV2,
   type ApiKeyCreds as V2ApiKeyCreds,
 } from "@polymarket/clob-client-v2";
+import { createHash } from "node:crypto";
 import { createWalletClient, http, type Hex, type WalletClient } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { polygon, polygonAmoy } from "viem/chains";
@@ -21,6 +22,9 @@ import type {
   OrderResult,
 } from "./types.js";
 import { deriveOrderResultSuccess } from "./orderResult.js";
+
+const BYTES32_ZERO = `0x${"0".repeat(64)}`;
+const BYTES32_HEX = /^0x[0-9a-fA-F]{64}$/;
 
 function toV2Chain(chainId: number): V2Chain {
   return chainId === 80002 ? V2Chain.AMOY : V2Chain.POLYGON;
@@ -48,6 +52,34 @@ function createCreds(env: AppEnv): V2ApiKeyCreds | undefined {
     secret: env.POLY_API_SECRET,
     passphrase: env.POLY_API_PASSPHRASE,
   };
+}
+
+export function normalizeV2MetadataBytes32(metadata: string | undefined): string | undefined {
+  if (metadata === undefined) {
+    return undefined;
+  }
+  const value = metadata.trim();
+  if (value.length === 0) {
+    return BYTES32_ZERO;
+  }
+  if (BYTES32_HEX.test(value)) {
+    return value;
+  }
+  return `0x${createHash("sha256").update(value).digest("hex")}`;
+}
+
+export function normalizeV2BuilderCodeBytes32(builderCode: string | undefined): string | undefined {
+  if (builderCode === undefined) {
+    return undefined;
+  }
+  const value = builderCode.trim();
+  if (value.length === 0) {
+    return BYTES32_ZERO;
+  }
+  if (!BYTES32_HEX.test(value)) {
+    throw new Error("CLOB V2 builderCode bytes32 hex olmali.");
+  }
+  return value;
 }
 
 function mapOrderBook(summary: {
@@ -165,14 +197,16 @@ export class V2Adapter implements ClobAdapter {
 
     const tickSize = await this.client.getTickSize(args.tokenId);
     const negRisk = await this.client.getNegRisk(args.tokenId);
+    const metadata = normalizeV2MetadataBytes32(args.metadata);
+    const builderCode = normalizeV2BuilderCodeBytes32(args.builderCode);
     const orderPayload = {
       tokenID: args.tokenId,
       price: args.price,
       size: args.size,
       side: args.side === "SELL" ? V2Side.SELL : V2Side.BUY,
       ...(args.expiration !== undefined ? { expiration: args.expiration } : {}),
-      ...(args.metadata !== undefined ? { metadata: args.metadata } : {}),
-      ...(args.builderCode !== undefined ? { builderCode: args.builderCode } : {}),
+      ...(metadata !== undefined ? { metadata } : {}),
+      ...(builderCode !== undefined ? { builderCode } : {}),
     };
     const signedOrder = await this.client.createOrder(
       orderPayload,
@@ -192,6 +226,8 @@ export class V2Adapter implements ClobAdapter {
 
     const tickSize = await this.client.getTickSize(args.tokenId);
     const negRisk = await this.client.getNegRisk(args.tokenId);
+    const metadata = normalizeV2MetadataBytes32(args.metadata);
+    const builderCode = normalizeV2BuilderCodeBytes32(args.builderCode);
     const orderPayload = {
       tokenID: args.tokenId,
       amount: args.amount,
@@ -199,8 +235,8 @@ export class V2Adapter implements ClobAdapter {
       orderType: args.orderType as V2OrderType.FAK | V2OrderType.FOK,
       ...(args.price !== undefined ? { price: args.price } : {}),
       ...(args.userUsdcBalance !== undefined ? { userUSDCBalance: args.userUsdcBalance } : {}),
-      ...(args.metadata !== undefined ? { metadata: args.metadata } : {}),
-      ...(args.builderCode !== undefined ? { builderCode: args.builderCode } : {}),
+      ...(metadata !== undefined ? { metadata } : {}),
+      ...(builderCode !== undefined ? { builderCode } : {}),
     };
     const signedOrder = await this.client.createMarketOrder(
       orderPayload,

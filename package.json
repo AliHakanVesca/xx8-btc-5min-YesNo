@@ -37,6 +37,7 @@
     "xuan:watch-loop": "tsx src/cli.ts xuan:watch-loop",
     "bot:dry": "tsx src/cli.ts bot:dry",
     "bot:live": "tsx src/cli.ts bot:live",
+    "bot:live:canary": "DRY_RUN=false tsx src/cli.ts bot:live --max-markets 1 --duration-sec 600 --post-close-reconcile-sec 90 --market-selection next --initial-book-wait-ms 12000 --balance-sync-ms 3000",
     "bot:resume": "tsx src/cli.ts bot:resume",
     "audit:repo": "bash scripts/audit-third-party.sh .",
     "audit:deps": "npm audit --omit=dev"

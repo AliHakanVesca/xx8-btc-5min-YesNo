@@ -1,6 +1,17 @@
 
 ##############################################
 
+Version : V.0.0.64
+Date    : 30.04.2026
+Author  : Ali Hakan Çakır
+Changes : - Tek market canary scripti ve operator dokumantasyonu guncellendi.
+          - Continuous daemon session crash ve shutdown sonuc kaydi eklendi.
+          - Daemon bitis raporuna failure sayimi eklendi.
+
+##############################################
+
+##############################################
+
 Version : V.0.0.63
 Date    : 30.04.2026
 Author  : Ali Hakan Çakır

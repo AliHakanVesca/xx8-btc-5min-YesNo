@@ -240,7 +240,7 @@ npm run capture -- --duration-sec 75
 10. Ilk canli deneme:
 
 ```bash
-npm run bot:live -- --max-markets 1 --duration-sec 600 --market-selection next
+npm run bot:live:canary
 ```
 
 ## Canli moda gecmeden once zorunlu kontroller

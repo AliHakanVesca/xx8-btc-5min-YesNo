@@ -36,6 +36,11 @@ export interface ContinuousBotDaemonReport {
     summary: BotSessionReport["summary"];
     finalState: BotSessionReport["finalState"];
   }>;
+  failures: Array<{
+    startedAt: number;
+    endedAt: number;
+    message: string;
+  }>;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -64,6 +69,7 @@ export async function runContinuousBotDaemon(
 
   const startedAt = Math.floor(Date.now() / 1000);
   const sessions: ContinuousBotDaemonReport["sessions"] = [];
+  const failures: ContinuousBotDaemonReport["failures"] = [];
   const config = buildStrategyConfig(env);
   const stateStore = new PersistentStateStore(config.stateStorePath);
   const wallet = resolveConfiguredFunderAddress(env);
@@ -102,15 +108,42 @@ export async function runContinuousBotDaemon(
   });
 
   while (resolvedOptions.maxMarkets === 0 || sessions.length < resolvedOptions.maxMarkets) {
-    const report = await runStatefulBotSession(env, {
-      durationSec: resolvedOptions.durationSec,
-      postCloseReconcileSec: resolvedOptions.postCloseReconcileSec,
-      tickMs: resolvedOptions.tickMs,
-      initialBookWaitMs: resolvedOptions.initialBookWaitMs,
-      balanceSyncMs: resolvedOptions.balanceSyncMs,
-      marketSelection: resolvedOptions.marketSelection,
-      initialDailyNegativeEdgeSpentUsdc: dailyNegativeEdgeSpentUsdc,
-    });
+    const sessionStartedAt = Math.floor(Date.now() / 1000);
+    let report: BotSessionReport;
+    try {
+      report = await runStatefulBotSession(env, {
+        durationSec: resolvedOptions.durationSec,
+        postCloseReconcileSec: resolvedOptions.postCloseReconcileSec,
+        tickMs: resolvedOptions.tickMs,
+        initialBookWaitMs: resolvedOptions.initialBookWaitMs,
+        balanceSyncMs: resolvedOptions.balanceSyncMs,
+        marketSelection: resolvedOptions.marketSelection,
+        initialDailyNegativeEdgeSpentUsdc: dailyNegativeEdgeSpentUsdc,
+      });
+    } catch (error) {
+      const endedAt = Math.floor(Date.now() / 1000);
+      const message = error instanceof Error ? error.message : String(error);
+      failures.push({
+        startedAt: sessionStartedAt,
+        endedAt,
+        message,
+      });
+      await traceLogger.write("market_rollover", {
+        status: "session_crashed",
+        startedAt: sessionStartedAt,
+        endedAt,
+        message,
+      });
+      stateStore.recordMarketRollover({
+        status: "session_crashed",
+        timestamp: endedAt,
+        payload: {
+          startedAt: sessionStartedAt,
+          message,
+        },
+      });
+      break;
+    }
 
     sessions.push({
       market: report.market,
@@ -143,6 +176,28 @@ export async function runContinuousBotDaemon(
       },
     });
 
+    if (report.summary.endReason === "shutdown_requested") {
+      await traceLogger.write("market_rollover", {
+        status: "daemon_shutdown_requested",
+        marketSlug: report.market.slug,
+        conditionId: report.market.conditionId,
+        signal: report.summary.shutdownSignal ?? null,
+        endedAt: report.summary.endedAt,
+        finalDailyNegativeEdgeSpentUsdc: report.finalState.finalDailyNegativeEdgeSpentUsdc,
+      });
+      stateStore.recordMarketRollover({
+        status: "daemon_shutdown_requested",
+        timestamp: report.summary.endedAt,
+        marketSlug: report.market.slug,
+        conditionId: report.market.conditionId,
+        payload: {
+          shutdownSignal: report.summary.shutdownSignal ?? null,
+          finalDailyNegativeEdgeSpentUsdc: report.finalState.finalDailyNegativeEdgeSpentUsdc,
+        },
+      });
+      break;
+    }
+
     if (resolvedOptions.maxMarkets !== 0 && sessions.length >= resolvedOptions.maxMarkets) {
       break;
     }
@@ -171,21 +226,24 @@ export async function runContinuousBotDaemon(
       finalDailyNegativeEdgeSpentUsdc: dailyNegativeEdgeSpentUsdc,
     },
     sessions,
+    failures,
   };
 
   await traceLogger.write("market_rollover", {
     status: "daemon_end",
     endedAt: payload.summary.endedAt,
     marketsCompleted: sessions.length,
+    failures: failures.length,
     finalDailyNegativeEdgeSpentUsdc: dailyNegativeEdgeSpentUsdc,
   });
   stateStore.recordMarketRollover({
     status: "daemon_end",
     timestamp: payload.summary.endedAt,
-    payload: {
-      marketsCompleted: sessions.length,
-      finalDailyNegativeEdgeSpentUsdc: dailyNegativeEdgeSpentUsdc,
-    },
+      payload: {
+        marketsCompleted: sessions.length,
+        failures: failures.length,
+        finalDailyNegativeEdgeSpentUsdc: dailyNegativeEdgeSpentUsdc,
+      },
   });
   await traceLogger.flush();
   stateStore.close();

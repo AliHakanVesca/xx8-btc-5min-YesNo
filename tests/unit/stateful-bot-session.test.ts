@@ -13,12 +13,16 @@ import {
   deriveArbitrationCarryExpiry,
   deriveCarryFlowConfidence,
   deriveConfirmedCarryAlignmentStreak,
+  applyImmediateOrderResultFill,
+  createPendingCompletionSubmission,
   restorePersistedArbitrationCarry,
   refreshRuntimeProtectedResidualLock,
   inferImmediateOrderResultFill,
   inferUserTradeFill,
   reconcileStateWithBalances,
+  resolveSessionTradingDeadline,
   runtimeFlowBudgetReleaseQuantityForResidualChange,
+  shouldBlockCompletionForPendingSubmission,
   shouldPreserveCarryDrivenOverlap,
 } from "../../src/live/statefulBotSession.js";
 
@@ -35,6 +39,28 @@ function buildConfig(overrides: Record<string, string> = {}) {
 }
 
 describe("stateful bot session helpers", () => {
+  it("counts duration from market open when the selected market has not started yet", () => {
+    expect(
+      resolveSessionTradingDeadline({
+        startedAt: 900,
+        marketStartTs: 1000,
+        marketEndTs: 1300,
+        durationSec: 305,
+      }),
+    ).toBe(1300);
+  });
+
+  it("keeps duration anchored to session start for already-open markets", () => {
+    expect(
+      resolveSessionTradingDeadline({
+        startedAt: 1100,
+        marketStartTs: 1000,
+        marketEndTs: 1300,
+        durationSec: 60,
+      }),
+    ).toBe(1160);
+  });
+
   it("derives a shared runtime flow-budget state from carry, quality, density, and pressure", () => {
     const state = deriveRuntimeFlowBudgetState({
       matchedInventoryQuality: 0.82,
@@ -421,6 +447,105 @@ describe("stateful bot session helpers", () => {
       makerTaker: "taker",
       executionMode: "XUAN_HARD_PAIR_SWEEP",
     });
+  });
+
+  it("applies matched completion order results to state immediately", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      price: 0.47,
+      size: 40,
+      timestamp: 1713696004,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+
+    const applied = applyImmediateOrderResultFill({
+      state,
+      outcome: "DOWN",
+      nowTs: 1713696034,
+      mode: "PARTIAL_SOFT_COMPLETION",
+      order: {
+        tokenId: market.tokens.DOWN.tokenId,
+        side: "BUY",
+        price: 0.48,
+        amount: 19.2,
+        shareTarget: 40,
+        orderType: "FAK",
+      },
+      result: {
+        success: true,
+        simulated: false,
+        orderId: "completion-1",
+        status: "matched",
+        requestedAt: 1713696034,
+        raw: {
+          takingAmount: "40",
+          makingAmount: "19.2",
+        },
+      },
+      flowLineage: "completion-flow",
+    });
+
+    expect(applied.fill).toMatchObject({
+      outcome: "DOWN",
+      side: "BUY",
+      size: 40,
+      price: 0.48,
+      executionMode: "PARTIAL_SOFT_COMPLETION",
+      flowLineage: "completion-flow",
+    });
+    expect(applied.state.upShares).toBe(40);
+    expect(applied.state.downShares).toBe(40);
+    expect(Math.abs(applied.state.upShares - applied.state.downShares)).toBe(0);
+  });
+
+  it("blocks duplicate completion submissions while an accepted result has no immediate fill quantity", () => {
+    const pending = createPendingCompletionSubmission({
+      side: "DOWN",
+      requestedShares: 40,
+      nowTs: 1713696034,
+      maxAgeSec: 17,
+      result: {
+        success: true,
+        simulated: false,
+        orderId: "completion-pending",
+        status: "accepted",
+        requestedAt: 1713696034,
+        raw: {},
+      },
+    });
+
+    expect(pending).toMatchObject({
+      side: "DOWN",
+      orderId: "completion-pending",
+      requestedShares: 40,
+      submittedAt: 1713696034,
+      expiresAt: 1713696051,
+    });
+    expect(
+      shouldBlockCompletionForPendingSubmission({
+        pending,
+        side: "DOWN",
+        nowTs: 1713696035,
+      }),
+    ).toBe(true);
+    expect(
+      shouldBlockCompletionForPendingSubmission({
+        pending,
+        side: "DOWN",
+        nowTs: 1713696052,
+      }),
+    ).toBe(false);
+    expect(
+      shouldBlockCompletionForPendingSubmission({
+        pending,
+        side: "UP",
+        nowTs: 1713696035,
+      }),
+    ).toBe(false);
   });
 
   it("reconciles state from observed balances by inferring missing buys and scaling down reductions", () => {

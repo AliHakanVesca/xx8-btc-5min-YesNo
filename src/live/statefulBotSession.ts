@@ -80,6 +80,12 @@ import {
 import { MarketFairValueRuntime } from "./fairValueRuntime.js";
 import type { FairValueSnapshot } from "../strategy/xuan5m/fairValueEngine.js";
 import { planCloneChildBuyOrders } from "./childOrderPlanner.js";
+import {
+  assignAffordableSequentialUsdcBalances,
+  debitBuyOrderFromUsdcBalance,
+  extractInsufficientBalanceUsdc,
+  fitBuyOrderToUsdcBalance,
+} from "./orderSizing.js";
 
 export interface BotSessionOptions {
   durationSec?: number;
@@ -204,6 +210,14 @@ interface PendingPairExecution {
   status: PairOrderGroupStatus;
   submittedAt: number;
   reconciledAfterSubmit: boolean;
+}
+
+export interface PendingCompletionSubmission {
+  side: OutcomeSide;
+  orderId?: string | undefined;
+  requestedShares: number;
+  submittedAt: number;
+  expiresAt: number;
 }
 
 interface PartialOpenGroupLock {
@@ -1910,6 +1924,57 @@ export function inferImmediateOrderResultFill(args: {
   };
 }
 
+export function applyImmediateOrderResultFill(args: {
+  state: XuanMarketState;
+  result: OrderResult | undefined;
+  order: MarketOrderArgs;
+  outcome: OutcomeSide;
+  nowTs: number;
+  mode?: StrategyExecutionMode | undefined;
+  flowLineage?: string | undefined;
+}): { state: XuanMarketState; fill?: FillRecord | undefined } {
+  const fill = inferImmediateOrderResultFill(args);
+  if (!fill) {
+    return { state: args.state };
+  }
+
+  const normalizedFill: FillRecord = {
+    ...fill,
+    flowLineage: fill.flowLineage ?? args.flowLineage,
+  };
+  return {
+    state: applyFill(args.state, normalizedFill),
+    fill: normalizedFill,
+  };
+}
+
+export function createPendingCompletionSubmission(args: {
+  result: OrderResult;
+  side: OutcomeSide;
+  requestedShares: number;
+  nowTs: number;
+  maxAgeSec: number;
+}): PendingCompletionSubmission | undefined {
+  if (!isOrderResultAccepted(args.result) || extractMatchedShares(args.result) > 1e-6) {
+    return undefined;
+  }
+  return {
+    side: args.side,
+    orderId: args.result.orderId,
+    requestedShares: normalizeShares(args.requestedShares),
+    submittedAt: args.nowTs,
+    expiresAt: args.nowTs + args.maxAgeSec,
+  };
+}
+
+export function shouldBlockCompletionForPendingSubmission(args: {
+  pending: PendingCompletionSubmission | undefined;
+  side: OutcomeSide;
+  nowTs: number;
+}): boolean {
+  return Boolean(args.pending && args.pending.side === args.side && args.nowTs <= args.pending.expiresAt);
+}
+
 function rememberSubmittedPrices(
   submittedPrices: SubmittedIntentBook,
   market: MarketInfo,
@@ -1988,33 +2053,60 @@ function consumedPairNegativeEdgeUsdc(args: {
   return normalizeShares(args.estimatedNegativeEdgeUsdc * fillRatio);
 }
 
-function withAvailableUsdcBalance(order: MarketOrderArgs, usdcBalance: number | undefined): MarketOrderArgs {
-  if (order.side !== "BUY" || usdcBalance === undefined || !Number.isFinite(usdcBalance) || usdcBalance <= 0) {
-    return order;
-  }
-
+function skippedOrderResult(status: string, reason: string): OrderResult {
   return {
-    ...order,
-    userUsdcBalance: Number(usdcBalance.toFixed(6)),
+    success: false,
+    simulated: false,
+    orderId: "skipped-order",
+    status,
+    raw: { error: reason },
+    requestedAt: Date.now(),
   };
+}
+
+function liveOrderSizeLadder(config: XuanStrategyConfig, minOrderSize: number): number[] {
+  return [
+    ...config.liveSmallLotLadder,
+    ...config.lotLadder,
+    config.defaultLot,
+    minOrderSize,
+  ];
+}
+
+function withAvailableUsdcBalance(
+  order: MarketOrderArgs,
+  usdcBalance: number | undefined,
+  config: XuanStrategyConfig,
+  minOrderSize: number,
+): MarketOrderArgs | undefined {
+  return fitBuyOrderToUsdcBalance(order, {
+    usdcBalance,
+    minOrderSize,
+    sizeLadder: liveOrderSizeLadder(config, minOrderSize),
+  }).order;
 }
 
 function assignSequentialUsdcBalances(
   orders: MarketOrderArgs[],
   usdcBalance: number | undefined,
+  config: XuanStrategyConfig,
+  minOrderSize: number,
 ): MarketOrderArgs[] {
-  if (usdcBalance === undefined || !Number.isFinite(usdcBalance) || usdcBalance <= 0) {
-    return orders;
-  }
-
-  let remainingBalance = usdcBalance;
-  return orders.map((order) => {
-    const balancedOrder = withAvailableUsdcBalance(order, remainingBalance);
-    if (order.side === "BUY") {
-      remainingBalance = normalizeShares(Math.max(0, remainingBalance - order.amount));
-    }
-    return balancedOrder;
+  return assignAffordableSequentialUsdcBalances(orders, {
+    usdcBalance,
+    minOrderSize,
+    sizeLadder: liveOrderSizeLadder(config, minOrderSize),
   });
+}
+
+export function resolveSessionTradingDeadline(args: {
+  startedAt: number;
+  marketStartTs: number;
+  marketEndTs: number;
+  durationSec: number;
+}): number {
+  const durationAnchor = Math.max(args.startedAt, args.marketStartTs);
+  return Math.min(durationAnchor + args.durationSec, args.marketEndTs);
 }
 
 async function executeMarketOrdersInSequence(
@@ -2076,7 +2168,7 @@ function buildPairOrderPlan(args: {
             preferredChildShares: args.config.cloneChildPreferredShares,
           })
         : [baseOrder];
-    return assignSequentialUsdcBalances(plannedOrders, args.cachedUsdcBalance);
+    return assignSequentialUsdcBalances(plannedOrders, args.cachedUsdcBalance, args.config, args.minOrderSize);
   };
 
   return {
@@ -2355,6 +2447,22 @@ export async function runStatefulBotSession(
   });
   let state = createMarketState(market);
   let cachedUsdcBalance = (await readCollateralBalanceUsdc(env)) ?? Math.max(config.minUsdcBalance, 100);
+  const updateCachedUsdcBalanceAfterOrderResult = (order: MarketOrderArgs, result: OrderResult): void => {
+    const rejectedBalance = extractInsufficientBalanceUsdc(result);
+    if (rejectedBalance !== undefined) {
+      cachedUsdcBalance = Math.min(cachedUsdcBalance, rejectedBalance);
+      return;
+    }
+    if (isOrderResultAccepted(result)) {
+      cachedUsdcBalance =
+        debitBuyOrderFromUsdcBalance(cachedUsdcBalance, order) ?? cachedUsdcBalance;
+    }
+  };
+  const updateCachedUsdcBalanceAfterExecutions = (executions: ExecutedMarketOrder[]): void => {
+    for (const execution of executions) {
+      updateCachedUsdcBalanceAfterOrderResult(execution.order, execution.result);
+    }
+  };
   let startupBlockNewEntries = false;
   let startupCompletionOnly = false;
   let startupSafeHalt = false;
@@ -2396,6 +2504,7 @@ export async function runStatefulBotSession(
   const recentBotOwnedBuyFills: RecentBotOwnedBuyFill[] = [];
   const events: Array<Record<string, unknown>> = [];
   let pendingPairExecution: PendingPairExecution | undefined;
+  let pendingCompletionSubmission: PendingCompletionSubmission | undefined;
   let partialOpenGroupLock: PartialOpenGroupLock | undefined;
   let runtimeProtectedResidualLock: RuntimeProtectedResidualLock | undefined;
   let arbitrationCarry: ArbitrationCarry | undefined;
@@ -3389,6 +3498,9 @@ export async function runStatefulBotSession(
         reconciledAfterSubmit: true,
       };
     }
+    if (pendingCompletionSubmission && args.nowTs >= pendingCompletionSubmission.submittedAt) {
+      pendingCompletionSubmission = undefined;
+    }
   };
 
   const finalizePendingPairExecutionIfReady = async (
@@ -3483,7 +3595,12 @@ export async function runStatefulBotSession(
       }
     }
 
-    const sessionDeadline = Math.min(startedAt + resolvedOptions.durationSec, market.endTs);
+    const sessionDeadline = resolveSessionTradingDeadline({
+      startedAt,
+      marketStartTs: market.startTs,
+      marketEndTs: market.endTs,
+      durationSec: resolvedOptions.durationSec,
+    });
     while (clock.now() < sessionDeadline && clock.now() < market.endTs) {
       const nowTs = clock.now();
       ticks += 1;
@@ -4267,34 +4384,131 @@ export async function runStatefulBotSession(
         if (!decision.completion || completionSubmittedThisTick) {
           return false;
         }
+        if (pendingCompletionSubmission && nowTs > pendingCompletionSubmission.expiresAt) {
+          pendingCompletionSubmission = undefined;
+        }
+        if (
+          shouldBlockCompletionForPendingSubmission({
+            pending: pendingCompletionSubmission,
+            side: decision.completion.sideToBuy,
+            nowTs,
+          })
+        ) {
+          await traceLogger.write("orders", {
+            eventType: "completion_submit_blocked",
+            normalizedMode: `COMPLETION_${decision.completion.sideToBuy}`,
+            outcome: decision.completion.sideToBuy,
+            requestedSize: decision.completion.missingShares,
+            reason: "pending_completion_order_result",
+            pendingOrderId: pendingCompletionSubmission?.orderId ?? null,
+            pendingRequestedShares: pendingCompletionSubmission?.requestedShares ?? null,
+            pendingSubmittedAt: pendingCompletionSubmission?.submittedAt ?? null,
+            pendingExpiresAt: pendingCompletionSubmission?.expiresAt ?? null,
+          });
+          return false;
+        }
         completionSubmittedThisTick = true;
         assertClassifiedBuyMode(decision.completion.mode, config);
-        const liveOrder = withAvailableUsdcBalance(decision.completion.order, cachedUsdcBalance);
-        const result = await completionManager.complete(liveOrder);
-        rememberSubmittedPrices(
-          submittedPrices,
-          market,
-          [
-            {
-              ...decision.completion.order,
-              side: decision.completion.order.side,
-              mode: decision.completion.mode,
-              orderId: result.orderId,
-              expectedShares: expectedSharesForSubmission(liveOrder.shareTarget, result),
-            },
-          ],
-          nowTs,
+        const liveOrder = withAvailableUsdcBalance(
+          decision.completion.order,
+          cachedUsdcBalance,
+          config,
+          state.market.minOrderSize,
         );
+        const submittedCompletionOrder = liveOrder ?? decision.completion.order;
+        const result = liveOrder
+          ? await completionManager.complete(liveOrder)
+          : skippedOrderResult("skipped_insufficient_balance", "completion_order_not_affordable");
+        if (liveOrder) {
+          updateCachedUsdcBalanceAfterOrderResult(liveOrder, result);
+          rememberSubmittedPrices(
+            submittedPrices,
+            market,
+            [
+              {
+                ...decision.completion.order,
+                side: decision.completion.order.side,
+                mode: decision.completion.mode,
+                orderId: result.orderId,
+                expectedShares: expectedSharesForSubmission(liveOrder.shareTarget, result),
+              },
+            ],
+            nowTs,
+          );
+        }
         const accepted = isOrderResultAccepted(result);
+        const submittedCompletionShares =
+          submittedCompletionOrder.shareTarget ?? decision.completion.missingShares;
         if (accepted) {
           applyRuntimeFlowBudgetAction("completion_submit", {
             quantityShares: runtimeFlowBudgetReleaseQuantityForResidualChange({
-              requestedShares: decision.completion.missingShares,
+              requestedShares: submittedCompletionShares,
               oldGap: decision.completion.oldGap,
               newGap: decision.completion.newGap,
             }),
             lineage: currentRuntimeFlowLineage(decision.completion.sideToBuy),
           });
+          const immediateCompletion = applyImmediateOrderResultFill({
+            state,
+            result,
+            order: submittedCompletionOrder,
+            outcome: decision.completion.sideToBuy,
+            nowTs,
+            mode: decision.completion.mode,
+            flowLineage: currentRuntimeFlowLineage(decision.completion.sideToBuy),
+          });
+          state = immediateCompletion.state;
+          if (immediateCompletion.fill) {
+            pendingCompletionSubmission = undefined;
+            stateStore.recordFill(state, immediateCompletion.fill, {
+              orderId: result.orderId,
+              executionMode: decision.completion.mode,
+              source: "ORDER_RESULT",
+            });
+            rememberBotOwnedBuyFill(immediateCompletion.fill, {
+              orderId: result.orderId,
+            });
+            runtimeProtectedResidualLock =
+              partialOpenGroupLock !== undefined
+                ? undefined
+                : refreshRuntimeProtectedResidualLock({
+                    lock: runtimeProtectedResidualLock,
+                    state,
+                    nowTs,
+                    mode: decision.completion.mode,
+                  });
+            consumeSubmittedIntent(submittedPrices, immediateCompletion.fill.outcome, immediateCompletion.fill.size);
+            rememberOrderResultFillSuppression(immediateCompletion.fill);
+            pushEvent(events, {
+              timestamp: nowTs,
+              type: "order_result_fill",
+              phase: "completion",
+              outcome: immediateCompletion.fill.outcome,
+              size: immediateCompletion.fill.size,
+              price: immediateCompletion.fill.price,
+              orderId: result.orderId ?? null,
+            });
+            await traceLogger.write("user_fills", {
+              eventType: "order_result_fill",
+              phase: "completion",
+              outcome: immediateCompletion.fill.outcome,
+              side: immediateCompletion.fill.side,
+              size: immediateCompletion.fill.size,
+              price: immediateCompletion.fill.price,
+              executionMode: decision.completion.mode,
+              orderId: result.orderId ?? null,
+              source: "ORDER_RESULT",
+              correlationId: result.orderId,
+            });
+          } else {
+            pendingCompletionSubmission = createPendingCompletionSubmission({
+              result,
+              side: decision.completion.sideToBuy,
+              requestedShares: submittedCompletionShares,
+              nowTs,
+              maxAgeSec: submittedIntentMaxAgeSec,
+            });
+          }
           state = reserveNegativeEdgeBudget(state, decision.completion.negativeEdgeUsdc, "completion");
           persistDailyBudget(state);
           state = updateSeedSubmissionState(state, decision.completion.mode, decision.completion.sideToBuy);
@@ -4307,7 +4521,7 @@ export async function runStatefulBotSession(
             side: decision.completion.sideToBuy,
             size: decision.completion.missingShares,
             result,
-            order: liveOrder,
+            order: submittedCompletionOrder,
             negativeEdgeUsdc: decision.completion.negativeEdgeUsdc,
           });
         }
@@ -4318,10 +4532,11 @@ export async function runStatefulBotSession(
           type: "completion_submit",
           outcome: decision.completion.sideToBuy,
           mode: decision.completion.mode,
-          size: decision.completion.missingShares,
-          price: liveOrder.price,
-          shareTarget: liveOrder.shareTarget ?? null,
-          spendAmount: liveOrder.amount,
+          size: submittedCompletionShares,
+          requestedSize: decision.completion.missingShares,
+          price: submittedCompletionOrder.price,
+          shareTarget: submittedCompletionOrder.shareTarget ?? null,
+          spendAmount: submittedCompletionOrder.amount,
           costWithFees: decision.completion.costWithFees,
           capMode: decision.completion.capMode,
           negativeEdgeUsdc: decision.completion.negativeEdgeUsdc,
@@ -4332,10 +4547,11 @@ export async function runStatefulBotSession(
           eventType: "completion_submit",
           normalizedMode: `COMPLETION_${decision.completion.sideToBuy}`,
           outcome: decision.completion.sideToBuy,
-          size: decision.completion.missingShares,
-          price: liveOrder.price ?? null,
-          shareTarget: liveOrder.shareTarget ?? null,
-          spendAmount: liveOrder.amount,
+          size: submittedCompletionShares,
+          requestedSize: decision.completion.missingShares,
+          price: submittedCompletionOrder.price ?? null,
+          shareTarget: submittedCompletionOrder.shareTarget ?? null,
+          spendAmount: submittedCompletionOrder.amount,
           capMode: decision.completion.capMode,
           negativeEdgeUsdc: decision.completion.negativeEdgeUsdc,
           orderId: result.orderId,
@@ -4347,7 +4563,7 @@ export async function runStatefulBotSession(
           wouldIncreaseImbalance:
             decision.completion.newGap > decision.completion.oldGap + config.maxCompletionOvershootShares,
           requestedQty: decision.completion.missingShares,
-          finalQty: decision.completion.missingShares,
+          finalQty: submittedCompletionShares,
           missingQty: Math.abs(state.upShares - state.downShares),
           residualOppositeAveragePrice: decision.completion.oppositeAveragePrice,
           missingSideAveragePrice: decision.completion.missingSideAveragePrice,
@@ -4362,10 +4578,11 @@ export async function runStatefulBotSession(
           marketSlug: market.slug,
           normalizedMode: `COMPLETION_${decision.completion.sideToBuy}`,
           outcome: decision.completion.sideToBuy,
-          size: decision.completion.missingShares,
-          price: liveOrder.price ?? null,
-          shareTarget: liveOrder.shareTarget ?? null,
-          spendAmount: liveOrder.amount,
+          size: submittedCompletionShares,
+          requestedSize: decision.completion.missingShares,
+          price: submittedCompletionOrder.price ?? null,
+          shareTarget: submittedCompletionOrder.shareTarget ?? null,
+          spendAmount: submittedCompletionOrder.amount,
           capMode: decision.completion.capMode,
           negativeEdgeUsdc: decision.completion.negativeEdgeUsdc,
           orderId: result.orderId ?? null,
@@ -4465,33 +4682,34 @@ export async function runStatefulBotSession(
               mode: entryBuy.mode,
             })),
           };
-          const executedBySide = await executePairOrderPlan({
-            completionManager,
-            orderPlanBySide,
-            orderedEntries,
-            sequentialPairExecutionActive,
-            interChildDelayMs: pairChildOrderDelayMs,
-          });
-          const upResult = selectRepresentativeResult(executedBySide.UP);
-          const downResult = selectRepresentativeResult(executedBySide.DOWN);
-          const allExecutions = [...executedBySide.UP, ...executedBySide.DOWN];
+	          const executedBySide = await executePairOrderPlan({
+	            completionManager,
+	            orderPlanBySide,
+	            orderedEntries,
+	            sequentialPairExecutionActive,
+	            interChildDelayMs: pairChildOrderDelayMs,
+	          });
+	          const upResult = selectRepresentativeResult(executedBySide.UP);
+	          const downResult = selectRepresentativeResult(executedBySide.DOWN);
+	          const allExecutions = [...executedBySide.UP, ...executedBySide.DOWN];
+	          updateCachedUsdcBalanceAfterExecutions(allExecutions);
 
-          rememberSubmittedPrices(
-            submittedPrices,
-            market,
-            allExecutions.map(({ order, result }) => ({
-              ...order,
-              side: order.side,
-              mode:
-                order.tokenId === market.tokens.UP.tokenId
-                  ? groupedEntryBySide.UP.mode
-                  : groupedEntryBySide.DOWN.mode,
-              groupId: group.groupId,
-              orderId: result.orderId,
-              expectedShares: expectedSharesForSubmission(order.shareTarget, result),
-            })),
-            submittedAtTs,
-          );
+	          rememberSubmittedPrices(
+	            submittedPrices,
+	            market,
+	            allExecutions.map(({ order, result }) => ({
+	              ...order,
+	              side: order.side,
+	              mode:
+	                order.tokenId === market.tokens.UP.tokenId
+	                  ? groupedEntryBySide.UP.mode
+	                  : groupedEntryBySide.DOWN.mode,
+	              groupId: group.groupId,
+	              orderId: result.orderId,
+	              expectedShares: expectedSharesForSubmission(order.shareTarget, result),
+	            })),
+	            submittedAtTs,
+	          );
           const negativeEdgeUsdc = estimateNegativeEdgeUsdc(upEntry.pairCostWithFees ?? 1, group.intendedQty);
           pairGroupCount += 1;
           entrySubmitCount += allExecutions.length;
@@ -4735,7 +4953,12 @@ export async function runStatefulBotSession(
                   preferredChildShares: config.cloneChildPreferredShares,
                 })
               : [groupedSingleOrder];
-          const liveOrders = assignSequentialUsdcBalances(plannedOrders, cachedUsdcBalance);
+            const liveOrders = assignSequentialUsdcBalances(
+              plannedOrders,
+              cachedUsdcBalance,
+              config,
+              state.market.minOrderSize,
+            );
           if (temporalSeedGroup) {
             stateStore.upsertPairGroup(temporalSeedGroup);
             activePairSubmission = {
@@ -4745,33 +4968,45 @@ export async function runStatefulBotSession(
                 {
                   outcome: entryBuy.side,
                   price: liveOrders[0]?.price,
-                  expectedShares: entryBuy.size,
+                    expectedShares: sumOrderShareTargets(liveOrders) ?? 0,
                   mode: entryBuy.mode,
                 },
               ],
             };
           }
-          const executions = await executeMarketOrdersInSequence(
-            completionManager,
-            liveOrders,
-            config.cloneChildOrderDelayMs,
-          );
-          const representativeExecution = selectRepresentativeExecution(executions);
-          const result = representativeExecution.result;
-          const accepted = executions.some((execution) => isOrderResultAccepted(execution.result));
-          rememberSubmittedPrices(
-            submittedPrices,
-            market,
-            executions.map(({ order, result: executionResult }) => ({
-              ...order,
-              side: order.side,
-              mode: entryBuy.mode,
-              groupId: temporalSeedGroup?.groupId,
-              orderId: executionResult.orderId,
-              expectedShares: expectedSharesForSubmission(order.shareTarget, executionResult),
-            })),
-            submittedAtTs,
-          );
+            const executions =
+              liveOrders.length > 0
+                ? await executeMarketOrdersInSequence(
+                    completionManager,
+                    liveOrders,
+                    config.cloneChildOrderDelayMs,
+                  )
+                : [
+                    {
+                      order: { ...entryBuy.order, amount: 0, shareTarget: 0 },
+                      result: skippedOrderResult("skipped_insufficient_balance", "entry_order_not_affordable"),
+                    },
+                  ];
+            updateCachedUsdcBalanceAfterExecutions(executions);
+            const representativeExecution = selectRepresentativeExecution(executions);
+            const result = representativeExecution.result;
+            const accepted = executions.some((execution) => isOrderResultAccepted(execution.result));
+            const submittedEntryShares = sumOrderShareTargets(liveOrders) ?? 0;
+	          if (liveOrders.length > 0) {
+	            rememberSubmittedPrices(
+	              submittedPrices,
+	              market,
+	              executions.map(({ order, result: executionResult }) => ({
+	                ...order,
+	                side: order.side,
+	                mode: entryBuy.mode,
+	                groupId: temporalSeedGroup?.groupId,
+	                orderId: executionResult.orderId,
+	                expectedShares: expectedSharesForSubmission(order.shareTarget, executionResult),
+	              })),
+	              submittedAtTs,
+	            );
+	          }
           if (temporalSeedGroup) {
             pendingPairExecution = {
               group: temporalSeedGroup,
@@ -4784,11 +5019,11 @@ export async function runStatefulBotSession(
               reconciledAfterSubmit: false,
             };
           }
-          if (accepted && !temporalSeedGroup) {
-            applyRuntimeFlowBudgetAction("seed_submit", {
-              quantityShares: entryBuy.size,
-              lineage: currentRuntimeFlowLineage(entryBuy.side),
-            });
+            if (accepted && !temporalSeedGroup) {
+              applyRuntimeFlowBudgetAction("seed_submit", {
+                quantityShares: submittedEntryShares,
+                lineage: currentRuntimeFlowLineage(entryBuy.side),
+              });
             state = reserveNegativeEdgeBudget(state, entryBuy.negativeEdgeUsdc ?? 0, "pair");
             persistDailyBudget(state);
             state = updateSeedSubmissionState(state, entryBuy.mode, entryBuy.side);
@@ -4806,11 +5041,11 @@ export async function runStatefulBotSession(
             });
           }
           if (temporalSeedGroup && pendingPairExecution) {
-            if (accepted) {
-              applyRuntimeFlowBudgetAction("seed_submit", {
-                quantityShares: entryBuy.size,
-                lineage: currentRuntimeFlowLineage(entryBuy.side),
-              });
+              if (accepted) {
+                applyRuntimeFlowBudgetAction("seed_submit", {
+                  quantityShares: submittedEntryShares,
+                  lineage: currentRuntimeFlowLineage(entryBuy.side),
+                });
               persistMarketState("pair_group_pending");
             }
             let sawImmediateFill = false;
@@ -4902,15 +5137,15 @@ export async function runStatefulBotSession(
           }
           entrySubmitCount += 1;
           actionCooldownUntil = Date.now() + config.reentryDelayMs;
-          pushEvent(events, {
-            timestamp: nowTs,
-            type: "entry_submit",
-            orders: executions.map(({ order, result: executionResult }) => ({
-              side: entryBuy.side,
-              size: order.shareTarget ?? entryBuy.size,
-              price: order.price,
-              reason: entryBuy.reason,
-              mode: entryBuy.mode,
+            pushEvent(events, {
+              timestamp: nowTs,
+              type: "entry_submit",
+              orders: executions.map(({ order, result: executionResult }) => ({
+                side: entryBuy.side,
+                size: order.shareTarget ?? submittedEntryShares,
+                price: order.price,
+                reason: entryBuy.reason,
+                mode: entryBuy.mode,
               rawPair: entryBuy.rawPairCost ?? null,
               effectivePair: entryBuy.pairCostWithFees ?? null,
               negativeEdgeUsdc: entryBuy.negativeEdgeUsdc ?? 0,
@@ -4919,42 +5154,44 @@ export async function runStatefulBotSession(
               result: summarizeOrderResult(executionResult),
             })),
           });
-          await traceLogger.write("orders", {
-            eventType: "entry_submit",
-            selectedMode: entryBuy.mode,
-            side: entryBuy.side,
-            size: entryBuy.size,
-            childOrderCount: executions.length,
-            price: representativeExecution.order.price ?? null,
-            shareTarget: entryBuy.size,
-            spendAmount: Number(executions.reduce((total, execution) => total + execution.order.amount, 0).toFixed(6)),
-            negativeEdgeUsdc: entryBuy.negativeEdgeUsdc ?? 0,
-            orderId: result.orderId,
-            orderStatus: result.status,
-            orderAccepted: accepted,
-            orderResult: summarizeOrderResult(result),
-            oldGap: decision.trace.entry.repairOldGap ?? decision.trace.shareGap,
-            newGapEstimate: decision.trace.entry.repairNewGap ?? null,
-            wouldIncreaseImbalance: decision.trace.entry.repairWouldIncreaseImbalance ?? null,
-            requestedQty: decision.trace.entry.repairRequestedQty ?? entryBuy.size,
-            finalQty: decision.trace.entry.repairFinalQty ?? entryBuy.size,
-            missingQty: decision.trace.entry.repairMissingQty ?? null,
-            residualOppositeAveragePrice: decision.trace.entry.repairOppositeAveragePrice ?? null,
-            effectiveCompletionCost: decision.trace.entry.repairCost ?? entryBuy.pairCostWithFees ?? null,
-            capUsed: decision.trace.entry.repairCapMode ?? null,
-            rejectReason: accepted ? null : decision.trace.entry.skipReason ?? null,
-            correlationId: result.orderId,
-          });
-          emitLiveMirror("entry_submit", {
-            marketSlug: market.slug,
-            selectedMode: entryBuy.mode,
-            outcome: entryBuy.side,
-            reason: entryBuy.reason,
-            size: entryBuy.size,
-            childOrderCount: executions.length,
-            price: representativeExecution.order.price ?? null,
-            shareTarget: entryBuy.size,
-            spendAmount: Number(executions.reduce((total, execution) => total + execution.order.amount, 0).toFixed(6)),
+            await traceLogger.write("orders", {
+              eventType: "entry_submit",
+              selectedMode: entryBuy.mode,
+              side: entryBuy.side,
+              size: submittedEntryShares,
+              requestedSize: entryBuy.size,
+              childOrderCount: executions.length,
+              price: representativeExecution.order.price ?? null,
+              shareTarget: submittedEntryShares,
+              spendAmount: Number(executions.reduce((total, execution) => total + execution.order.amount, 0).toFixed(6)),
+              negativeEdgeUsdc: entryBuy.negativeEdgeUsdc ?? 0,
+              orderId: result.orderId,
+              orderStatus: result.status,
+              orderAccepted: accepted,
+              orderResult: summarizeOrderResult(result),
+              oldGap: decision.trace.entry.repairOldGap ?? decision.trace.shareGap,
+              newGapEstimate: decision.trace.entry.repairNewGap ?? null,
+              wouldIncreaseImbalance: decision.trace.entry.repairWouldIncreaseImbalance ?? null,
+              requestedQty: decision.trace.entry.repairRequestedQty ?? entryBuy.size,
+              finalQty: decision.trace.entry.repairFinalQty ?? submittedEntryShares,
+              missingQty: decision.trace.entry.repairMissingQty ?? null,
+              residualOppositeAveragePrice: decision.trace.entry.repairOppositeAveragePrice ?? null,
+              effectiveCompletionCost: decision.trace.entry.repairCost ?? entryBuy.pairCostWithFees ?? null,
+              capUsed: decision.trace.entry.repairCapMode ?? null,
+              rejectReason: accepted ? null : decision.trace.entry.skipReason ?? null,
+              correlationId: result.orderId,
+            });
+            emitLiveMirror("entry_submit", {
+              marketSlug: market.slug,
+              selectedMode: entryBuy.mode,
+              outcome: entryBuy.side,
+              reason: entryBuy.reason,
+              size: submittedEntryShares,
+              requestedSize: entryBuy.size,
+              childOrderCount: executions.length,
+              price: representativeExecution.order.price ?? null,
+              shareTarget: submittedEntryShares,
+              spendAmount: Number(executions.reduce((total, execution) => total + execution.order.amount, 0).toFixed(6)),
             rawPair: entryBuy.rawPairCost ?? null,
             effectivePair: entryBuy.pairCostWithFees ?? null,
             negativeEdgeUsdc: entryBuy.negativeEdgeUsdc ?? 0,
@@ -4976,26 +5213,37 @@ export async function runStatefulBotSession(
         await submitDecisionCompletion("completion_only");
         await waitForDecisionPulse();
         continue;
-      }
+        }
 
-      if (decision.unwind) {
-        const liveOrder = withAvailableUsdcBalance(decision.unwind.order, cachedUsdcBalance);
-        const result = await completionManager.complete(liveOrder);
-        rememberSubmittedPrices(
-          submittedPrices,
-          market,
-          [
-            {
-              ...decision.unwind.order,
-              side: decision.unwind.order.side,
-              mode: decision.unwind.mode,
-              orderId: result.orderId,
-              expectedShares: expectedSharesForSubmission(liveOrder.shareTarget, result),
-            },
-          ],
-          nowTs,
-        );
-        const accepted = isOrderResultAccepted(result);
+        if (decision.unwind) {
+          const liveOrder = withAvailableUsdcBalance(
+            decision.unwind.order,
+            cachedUsdcBalance,
+            config,
+            state.market.minOrderSize,
+          );
+          const submittedUnwindOrder = liveOrder ?? decision.unwind.order;
+          const result = liveOrder
+            ? await completionManager.complete(liveOrder)
+            : skippedOrderResult("skipped_insufficient_balance", "unwind_order_not_affordable");
+          if (liveOrder) {
+            updateCachedUsdcBalanceAfterOrderResult(liveOrder, result);
+            rememberSubmittedPrices(
+              submittedPrices,
+              market,
+              [
+                {
+                  ...decision.unwind.order,
+                  side: decision.unwind.order.side,
+                  mode: decision.unwind.mode,
+                  orderId: result.orderId,
+                  expectedShares: expectedSharesForSubmission(liveOrder.shareTarget, result),
+                },
+              ],
+              nowTs,
+            );
+          }
+          const accepted = isOrderResultAccepted(result);
         if (accepted) {
           applyRuntimeFlowBudgetAction("unwind_submit", {
             quantityShares: runtimeFlowBudgetReleaseQuantityForResidualChange({
@@ -5008,37 +5256,37 @@ export async function runStatefulBotSession(
           state = updateSeedSubmissionState(state, decision.unwind.mode, decision.unwind.sideToSell);
           persistMarketState();
         } else {
-          await logRejectedOrder({
-            traceLogger,
-            phase: "unwind",
-            mode: decision.unwind.mode,
-            side: decision.unwind.sideToSell,
-            size: decision.unwind.unwindShares,
-            result,
-            order: liveOrder,
-          });
+            await logRejectedOrder({
+              traceLogger,
+              phase: "unwind",
+              mode: decision.unwind.mode,
+              side: decision.unwind.sideToSell,
+              size: decision.unwind.unwindShares,
+              result,
+              order: submittedUnwindOrder,
+            });
         }
         unwindSubmitCount += 1;
         actionCooldownUntil = Date.now() + config.reentryDelayMs;
         pushEvent(events, {
-          timestamp: nowTs,
-          type: "unwind_submit",
-          outcome: decision.unwind.sideToSell,
-          mode: decision.unwind.mode,
-          size: decision.unwind.unwindShares,
-          price: liveOrder.price,
-          shareTarget: liveOrder.shareTarget ?? null,
-          amount: liveOrder.amount,
-          result: summarizeOrderResult(result),
-        });
-        await traceLogger.write("orders", {
-          eventType: "unwind_submit",
-          outcome: decision.unwind.sideToSell,
-          size: decision.unwind.unwindShares,
-          price: liveOrder.price ?? null,
-          shareTarget: liveOrder.shareTarget ?? null,
-          amount: liveOrder.amount,
-          orderId: result.orderId,
+            timestamp: nowTs,
+            type: "unwind_submit",
+            outcome: decision.unwind.sideToSell,
+            mode: decision.unwind.mode,
+            size: decision.unwind.unwindShares,
+            price: submittedUnwindOrder.price,
+            shareTarget: submittedUnwindOrder.shareTarget ?? null,
+            amount: submittedUnwindOrder.amount,
+            result: summarizeOrderResult(result),
+          });
+          await traceLogger.write("orders", {
+            eventType: "unwind_submit",
+            outcome: decision.unwind.sideToSell,
+            size: decision.unwind.unwindShares,
+            price: submittedUnwindOrder.price ?? null,
+            shareTarget: submittedUnwindOrder.shareTarget ?? null,
+            amount: submittedUnwindOrder.amount,
+            orderId: result.orderId,
           orderStatus: result.status,
           orderAccepted: accepted,
           orderResult: summarizeOrderResult(result),

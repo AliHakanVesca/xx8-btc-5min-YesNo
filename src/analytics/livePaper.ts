@@ -33,6 +33,17 @@ export interface LivePaperOptions {
   initialBookWaitMs?: number;
   auditFile?: string;
   bookDepthLevels?: number;
+  marketOverride?: LivePaperMarketSelection | undefined;
+}
+
+export interface LivePaperMarketSelection {
+  selection: "current" | "next";
+  market: MarketInfo;
+  discoveryNowTs: number;
+  secsToCurrentClose: number;
+  secsFromCurrentOpen: number;
+  currentMarketAlreadyStarted: boolean;
+  currentMarketTooOldForEarlyPaper: boolean;
 }
 
 export interface ResolvedLivePaperOptions {
@@ -211,6 +222,40 @@ export interface LivePaperInventorySnapshot {
   negativeEdgeConsumedUsdc: number;
   negativePairEdgeConsumedUsdc: number;
   negativeCompletionEdgeConsumedUsdc: number;
+}
+
+export async function resolveLivePaperMarketSelection(env: AppEnv): Promise<LivePaperMarketSelection> {
+  const clob = createClobAdapter(env);
+  const gamma = new GammaClient(env);
+  const clock = new SystemClock();
+  const config = buildStrategyConfig(env);
+  const discovery = await discoverCurrentAndNextMarkets({ env, gammaClient: gamma, clob, clock });
+  const discoveryNowTs = clock.now();
+  const secsToCurrentClose = discovery.current.endTs - discoveryNowTs;
+  const secsFromCurrentOpen = discoveryNowTs - discovery.current.startTs;
+  const currentMarketAlreadyStarted =
+    env.LIVE_PAPER_START_AT_MARKET_OPEN &&
+    secsFromCurrentOpen > 0 &&
+    discovery.next.startTs > discoveryNowTs;
+  const currentMarketTooOldForEarlyPaper =
+    env.LIVE_PAPER_MAX_CURRENT_MARKET_AGE_SEC > 0 &&
+    secsFromCurrentOpen > env.LIVE_PAPER_MAX_CURRENT_MARKET_AGE_SEC &&
+    discovery.next.startTs > discoveryNowTs;
+  const selection: "current" | "next" =
+    secsToCurrentClose <= config.normalEntryCutoffSecToClose ||
+    currentMarketAlreadyStarted ||
+    currentMarketTooOldForEarlyPaper
+      ? "next"
+      : "current";
+  return {
+    selection,
+    market: selection === "next" ? discovery.next : discovery.current,
+    discoveryNowTs,
+    secsToCurrentClose,
+    secsFromCurrentOpen,
+    currentMarketAlreadyStarted,
+    currentMarketTooOldForEarlyPaper,
+  };
 }
 
 export interface LivePaperBookSideSnapshot {
@@ -655,15 +700,21 @@ function trimLevels(levels: OrderLevel[], depth: number, direction: "bid" | "ask
     }));
 }
 
-function buildBookSideSnapshot(tokenId: string, book: OrderBook | undefined, depth: number): LivePaperBookSideSnapshot | null {
+function buildBookSideSnapshot(
+  tokenId: string,
+  book: OrderBook | undefined,
+  depth: number,
+  bestBid: number,
+  bestAsk: number,
+): LivePaperBookSideSnapshot | null {
   if (!book) {
     return null;
   }
   const snapshot: LivePaperBookSideSnapshot = {
     tokenId,
     timestamp: normalizeBookTimestampSec(book),
-    bestBid: normalize(book.bids[0]?.price ?? 0, 4),
-    bestAsk: normalize(book.asks[0]?.price ?? 1, 4),
+    bestBid: normalize(bestBid, 4),
+    bestAsk: normalize(bestAsk, 4),
     bids: trimLevels(book.bids, depth, "bid"),
     asks: trimLevels(book.asks, depth, "ask"),
   };
@@ -679,9 +730,16 @@ function buildBookSnapshot(args: {
   downBook: OrderBook | undefined;
   depth: number;
 }): LivePaperBookSnapshot {
+  const books = new OrderBookState(args.upBook, args.downBook);
   return {
-    up: buildBookSideSnapshot(args.market.tokens.UP.tokenId, args.upBook, args.depth),
-    down: buildBookSideSnapshot(args.market.tokens.DOWN.tokenId, args.downBook, args.depth),
+    up: buildBookSideSnapshot(args.market.tokens.UP.tokenId, args.upBook, args.depth, books.bestBid("UP"), books.bestAsk("UP")),
+    down: buildBookSideSnapshot(
+      args.market.tokens.DOWN.tokenId,
+      args.downBook,
+      args.depth,
+      books.bestBid("DOWN"),
+      books.bestAsk("DOWN"),
+    ),
   };
 }
 
@@ -1517,29 +1575,17 @@ export async function runLivePaperSession(
     bookDepthLevels: Math.max(1, Math.floor(options.bookDepthLevels ?? 10)),
   };
 
-  const clob = createClobAdapter(env);
-  const gamma = new GammaClient(env);
   const clock = new SystemClock();
   const config = buildStrategyConfig(env);
-  const discovery = await discoverCurrentAndNextMarkets({ env, gammaClient: gamma, clob, clock });
-  const discoveryNowTs = clock.now();
-  const secsToCurrentClose = discovery.current.endTs - discoveryNowTs;
-  const secsFromCurrentOpen = discoveryNowTs - discovery.current.startTs;
-  const currentMarketAlreadyStarted =
-    env.LIVE_PAPER_START_AT_MARKET_OPEN &&
-    secsFromCurrentOpen > 0 &&
-    discovery.next.startTs > discoveryNowTs;
-  const currentMarketTooOldForEarlyPaper =
-    env.LIVE_PAPER_MAX_CURRENT_MARKET_AGE_SEC > 0 &&
-    secsFromCurrentOpen > env.LIVE_PAPER_MAX_CURRENT_MARKET_AGE_SEC &&
-    discovery.next.startTs > discoveryNowTs;
-  const selection: "current" | "next" =
-    secsToCurrentClose <= config.normalEntryCutoffSecToClose ||
-    currentMarketAlreadyStarted ||
-    currentMarketTooOldForEarlyPaper
-      ? "next"
-      : "current";
-  const market = selection === "next" ? discovery.next : discovery.current;
+  const marketSelection = options.marketOverride ?? await resolveLivePaperMarketSelection(env);
+  const {
+    selection,
+    market,
+    discoveryNowTs,
+    secsFromCurrentOpen,
+    currentMarketAlreadyStarted,
+    currentMarketTooOldForEarlyPaper,
+  } = marketSelection;
   const client = new MarketWsClient(env);
   const startedAt = clock.now();
   const auditFile =

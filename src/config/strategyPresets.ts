@@ -842,7 +842,7 @@ export function buildStrategyConfig(env: AppEnv): XuanStrategyConfig {
 
 function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConfig {
   const aggressive = config.xuanCloneIntensity === "AGGRESSIVE";
-  const ladder = aggressive ? [80, 100, 125, 145] : [30, 60, 90, 120, 145];
+  const ladder = aggressive ? [60, 80, 145, 214, 265] : [30, 60, 90, 120, 145];
   const elevatedBehaviorCap = Math.max(config.xuanBehaviorCap, aggressive ? 1.3 : 1.25);
   const maxLadderLot = Math.max(ladder[ladder.length - 1] ?? 145, 145);
   const controlledRhythmMin = Math.max(1, Math.min(config.xuanRhythmMinWaitSec, config.xuanRhythmBaseWaitSec));
@@ -888,9 +888,9 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     coveredSeedMaxQty: Math.max(config.coveredSeedMaxQty, maxLadderLot),
     singleLegSeedMaxQty: Math.max(config.singleLegSeedMaxQty, maxLadderLot),
     maxSingleOrphanQty: Math.max(config.maxSingleOrphanQty, maxLadderLot),
-    singleLegOrphanCap: Math.max(config.singleLegOrphanCap, 0.78),
-    orphanLegMaxNotionalUsdc: Math.max(config.orphanLegMaxNotionalUsdc, 80),
-    maxMarketOrphanUsdc: Math.max(config.maxMarketOrphanUsdc, 160),
+    singleLegOrphanCap: Math.max(config.singleLegOrphanCap, aggressive ? 0.97 : 0.78),
+    orphanLegMaxNotionalUsdc: Math.max(config.orphanLegMaxNotionalUsdc, aggressive ? 320 : 80),
+    maxMarketOrphanUsdc: Math.max(config.maxMarketOrphanUsdc, aggressive ? 650 : 160),
     maxNegativePairEdgePerCycleUsdc: Math.max(config.maxNegativePairEdgePerCycleUsdc, aggressive ? 60 : 20),
     maxNegativePairEdgePerMarketUsdc: Math.max(config.maxNegativePairEdgePerMarketUsdc, aggressive ? 140 : 20),
     maxNegativeDailyBudgetUsdc: Math.max(config.maxNegativeDailyBudgetUsdc, aggressive ? 180 : 25),
@@ -904,7 +904,7 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     ),
     campaignLaunchXuanProbeMaxDebtUsdc: Math.max(
       config.campaignLaunchXuanProbeMaxDebtUsdc,
-      aggressive ? 8 : config.campaignLaunchXuanProbeMaxDebtUsdc,
+      aggressive ? 10 : config.campaignLaunchXuanProbeMaxDebtUsdc,
     ),
     campaignLaunchXuanProbeMaxAgeSec: Math.max(
       config.campaignLaunchXuanProbeMaxAgeSec,
@@ -1022,7 +1022,7 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     highSideCompletionRequiresHardImbalance: aggressive ? false : config.highSideCompletionRequiresHardImbalance,
     xuanBehaviorCap: elevatedBehaviorCap,
     cloneChildPreferredShares: aggressive
-      ? Math.max(config.cloneChildPreferredShares, ladder[0] ?? 80)
+      ? Math.max(config.cloneChildPreferredShares, ladder[0] ?? 80, 80)
       : Math.min(config.cloneChildPreferredShares, 20),
     cloneChildOrderDelayMs: Math.max(config.cloneChildOrderDelayMs, 120),
     cloneStaleCheapOppositeQuoteMinAgeSec: Math.min(config.cloneStaleCheapOppositeQuoteMinAgeSec, 75),

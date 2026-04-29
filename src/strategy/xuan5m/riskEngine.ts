@@ -108,6 +108,12 @@ export function evaluateRisk(
     mergeableShares(state) >= config.marketBasketContinuationMinMatchedShares - 1e-9 &&
     Math.abs(state.upShares - state.downShares) <= Math.max(config.postMergeFlatDustShares, 1e-6) + 1e-9 &&
     matchedEffectivePairCost(state, config.cryptoTakerFeeRate) > 1 + 1e-9;
+  const postMergeDustRecycleWindowOpen =
+    aggressivePublicFootprint &&
+    state.mergeHistory.length > 0 &&
+    state.upShares + state.downShares <=
+      Math.max(config.postMergeFlatDustShares * 2, state.market.minOrderSize * 0.01, 0.05) + 1e-9 &&
+    ctx.secsToClose > config.finalWindowNoChaseSec;
   const shouldCompletionOnlyForLowBalance = lowBalanceForNewEntry && completionAllowedUnderLowBalance;
   const completionOnly =
     hardCancel ||
@@ -124,7 +130,7 @@ export function evaluateRisk(
     !hardCancel &&
     !ctx.forceNoNewEntries &&
     !ctx.forceCompletionOnly &&
-    (ctx.secsToClose > config.normalEntryCutoffSecToClose || campaignRepairWindowOpen) &&
+    (ctx.secsToClose > config.normalEntryCutoffSecToClose || campaignRepairWindowOpen || postMergeDustRecycleWindowOpen) &&
     blockingReasons.length === 0 &&
     (!lowBalanceForNewEntry || config.allowNewEntryUnderMinBalance);
   const tradable =

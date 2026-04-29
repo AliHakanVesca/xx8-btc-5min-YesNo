@@ -806,6 +806,81 @@ describe("merge coordinator", () => {
     expect(gate.basketEffectivePair).toBeGreaterThan(1);
   });
 
+  it("holds a fresh post-merge final carry completion instead of merging immediately", () => {
+    const config = buildConfig({
+      BOT_MODE: "XUAN",
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+      MARKET_BASKET_MIN_MERGE_SHARES: "30",
+      MARKET_BASKET_MERGE_EFFECTIVE_PAIR_CAP: "1",
+    });
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      price: 0.48,
+      size: 214,
+      timestamp: market.startTs + 126,
+      makerTaker: "taker",
+    });
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.23,
+      size: 214,
+      timestamp: market.startTs + 174,
+      makerTaker: "taker",
+    });
+    state = applyMerge(state, {
+      amount: 214,
+      timestamp: market.startTs + 178,
+      simulated: true,
+    });
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.56,
+      size: 255,
+      timestamp: market.startTs + 230,
+      makerTaker: "taker",
+      executionMode: "PAIRGROUP_COVERED_SEED",
+    });
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      price: 0.79,
+      size: 255,
+      timestamp: market.startTs + 276,
+      makerTaker: "taker",
+      executionMode: "PARTIAL_SOFT_COMPLETION",
+    });
+    let tracker = createMergeBatchTracker();
+    tracker = syncMergeBatchTracker(tracker, 255, market.startTs + 276);
+
+    const gate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 276,
+      secsFromOpen: 276,
+      secsToClose: 24,
+      usdcBalance: 100,
+      tracker,
+    });
+
+    expect(gate.allow).toBe(false);
+    expect(gate.reason).toBe("not_ready");
+
+    const laterGate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 290,
+      secsFromOpen: 290,
+      secsToClose: 10,
+      usdcBalance: 100,
+      tracker,
+    });
+
+    expect(laterGate.allow).toBe(false);
+    expect(laterGate.reason).toBe("not_ready");
+  });
+
   it("releases a public-footprint basket once the xuan-sized merge target is reached", () => {
     const config = buildConfig({
       BOT_MODE: "XUAN",

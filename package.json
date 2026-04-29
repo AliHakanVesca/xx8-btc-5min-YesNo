@@ -34,6 +34,7 @@
     "paper:multi": "tsx src/cli.ts paper:multi",
     "paper:session": "tsx src/cli.ts paper:session",
     "paper:live": "tsx src/cli.ts paper:live",
+    "xuan:watch-loop": "tsx src/cli.ts xuan:watch-loop",
     "bot:dry": "tsx src/cli.ts bot:dry",
     "bot:live": "tsx src/cli.ts bot:live",
     "bot:resume": "tsx src/cli.ts bot:resume",

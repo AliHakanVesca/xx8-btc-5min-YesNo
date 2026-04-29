@@ -223,6 +223,16 @@ export class Xuan5mBot {
         }
       : risk;
 
+    const upTopTwoAskDepth = books.depthAtOrBetter(
+      "UP",
+      Math.min(1, bestAskUp + Math.max(books.tickSize(), 0.01)),
+      "ask",
+    );
+    const downTopTwoAskDepth = books.depthAtOrBetter(
+      "DOWN",
+      Math.min(1, bestAskDown + Math.max(books.tickSize(), 0.01)),
+      "ask",
+    );
     const lot = chooseLot(config, {
       marketSlug: state.market.slug,
       dryRunOrSmallLive: input.dryRunOrSmallLive,
@@ -241,6 +251,12 @@ export class Xuan5mBot {
           books.depthAtOrBetter("UP", bestAskUp, "ask"),
           books.depthAtOrBetter("DOWN", bestAskDown, "ask"),
         ) >= config.defaultLot,
+      bestAskUp,
+      bestAskDown,
+      topTwoAskDepthMin: Math.min(upTopTwoAskDepth, downTopTwoAskDepth),
+      flatPosition: totalShares <= Math.max(config.postMergeFlatDustShares * 2, state.market.minOrderSize * 0.01, 0.05),
+      postMergeCount: state.mergeHistory.length,
+      totalShares,
       pairCostWithinCap: pairTakerCost <= effectivePairDecisionCap,
       pairCostComfortable: pairTakerCost <= effectivePairDecisionCap - config.minEdgePerShare,
       pairGatePressure,

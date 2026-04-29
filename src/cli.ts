@@ -15,6 +15,7 @@ import {
 import { runSyntheticReplay } from "./analytics/replaySimulator.js";
 import { runMultiSyntheticReplay } from "./analytics/multiReplay.js";
 import { runLivePaperSession } from "./analytics/livePaper.js";
+import { runLiveXuanCompareLoop } from "./analytics/liveXuanCompare.js";
 import {
   isPaperSessionVariant,
   paperSessionVariants,
@@ -1158,6 +1159,51 @@ async function runPaperLive(options: {
   console.log(JSON.stringify(payload, null, 2));
 }
 
+async function runXuanWatchLoop(options: {
+  targetScore: string;
+  confirmations: string;
+  maxIterations: string;
+  durationSec: string;
+  sampleMs: string;
+  initialBookWaitMs: string;
+  bookDepthLevels: string;
+  postClosePollSec: string;
+}): Promise<void> {
+  process.env.DRY_RUN = "true";
+  process.env.LIVE_PAPER_START_AT_MARKET_OPEN = "true";
+  const env = loadEnv();
+  const results = await runLiveXuanCompareLoop(env, {
+    targetScore: Number(options.targetScore),
+    confirmations: Number(options.confirmations),
+    maxIterations: Number(options.maxIterations),
+    durationSec: Number(options.durationSec),
+    sampleMs: Number(options.sampleMs),
+    initialBookWaitMs: Number(options.initialBookWaitMs),
+    bookDepthLevels: Number(options.bookDepthLevels),
+    postClosePollSec: Number(options.postClosePollSec),
+  });
+  const payload = {
+    event: "xuan_watch_loop",
+    dryRun: env.DRY_RUN,
+    iterations: results.map((result) => ({
+      iteration: result.iteration,
+      slug: result.comparison.slug,
+      score: result.comparison.similarity.score,
+      status: result.comparison.similarity.status,
+      gaps: result.comparison.similarity.gaps,
+      reportJson: result.comparison.reportJson,
+      reportMarkdown: result.comparison.reportMarkdown,
+      auditFile: result.comparison.auditFile,
+      xuanActivityFile: result.comparison.xuanActivityFile,
+      paperConformanceScore: result.paper.summary.xuanConformanceScore,
+      paperConformanceStatus: result.paper.summary.xuanConformanceStatus,
+      paperBlockers: result.paper.summary.xuanPassBlockers,
+    })),
+  };
+  await writeStructuredLog("markets", payload);
+  console.log(JSON.stringify(payload, null, 2));
+}
+
 async function runConfigShow(): Promise<void> {
   const env = loadEnv();
   const config = buildStrategyConfig(env);
@@ -1734,6 +1780,29 @@ export async function runCli(argv = process.argv): Promise<void> {
         ...(options.auditFile !== undefined ? { auditFile: options.auditFile } : {}),
         bookDepthLevels: Number(options.bookDepthLevels),
       }),
+    );
+  program
+    .command("xuan:watch-loop")
+    .description("Observe BTC 5m markets, poll xuan public activity, run paper-live, and score trade similarity.")
+    .option("--target-score <n>", "Stop threshold for trade-behavior similarity", "95")
+    .option("--confirmations <n>", "Required consecutive markets at or above target before stopping", "2")
+    .option("--max-iterations <n>", "Max markets to observe; 0 means keep going until confirmations", "1")
+    .option("--duration-sec <n>", "Paper-live duration per market", "305")
+    .option("--sample-ms <n>", "Orderbook sampling interval", "1000")
+    .option("--initial-book-wait-ms <n>", "How long to wait for initial orderbooks", "8000")
+    .option("--book-depth-levels <n>", "How many bid/ask levels to include in audit ticks", "20")
+    .option("--post-close-poll-sec <n>", "Continue polling xuan activity after market close", "150")
+    .action(
+      async (options: {
+        targetScore: string;
+        confirmations: string;
+        maxIterations: string;
+        durationSec: string;
+        sampleMs: string;
+        initialBookWaitMs: string;
+        bookDepthLevels: string;
+        postClosePollSec: string;
+      }) => runXuanWatchLoop(options),
     );
   program.command("bot:dry").action(async () => runBotDry());
   program

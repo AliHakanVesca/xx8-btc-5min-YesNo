@@ -1,6 +1,7 @@
 import type { XuanStrategyConfig } from "../../config/strategyPresets.js";
 import { resolveBundledSeedSequencePrior } from "../../analytics/xuanExactReference.js";
 import { deriveFlowPressureBudgetState, type FlowPressureBudgetState } from "./modePolicy.js";
+import { classifyXuanLotFamily } from "./xuanLotFamilyClassifier.js";
 
 export interface LotContext {
   marketSlug?: string | undefined;
@@ -16,6 +17,12 @@ export interface LotContext {
   arbitrationCarryFlowConfidence?: number | undefined;
   matchedInventoryQuality?: number | undefined;
   bookDepthGood: boolean;
+  bestAskUp?: number | undefined;
+  bestAskDown?: number | undefined;
+  topTwoAskDepthMin?: number | undefined;
+  flatPosition?: boolean | undefined;
+  postMergeCount?: number | undefined;
+  totalShares?: number | undefined;
   pairCostWithinCap: boolean;
   pairCostComfortable: boolean;
   pairGatePressure?: number | undefined;
@@ -35,6 +42,7 @@ export function chooseLot(config: XuanStrategyConfig, ctx: LotContext): number {
   const cloneMid = baseLots[1] ?? cloneBase;
   const cloneHigh = baseLots[2] ?? cloneMid;
   const cloneMax = baseLots[3] ?? cloneHigh;
+  const cloneApex = baseLots[4] ?? cloneMax;
   const pairGatePressure = Math.max(0, ctx.pairGatePressure ?? (ctx.pairCostWithinCap ? 0 : 1));
   const mildPairGate = pairGatePressure <= 0.55;
   const permissivePairGate = pairGatePressure <= 0.85;
@@ -106,8 +114,62 @@ export function chooseLot(config: XuanStrategyConfig, ctx: LotContext): number {
         effectiveFlowDensity >= 1 &&
         ctx.bookDepthGood &&
         ctx.marketVolumeHigh;
+      const xuanFamilyLot = classifyXuanLotFamily(config, ctx);
+      if (xuanFamilyLot !== undefined) {
+        return xuanFamilyLot.lot;
+      }
       if (!ctx.inventoryBalanced) {
         return cloneBase;
+      }
+      const aggressiveUnknownLargeOpening =
+        config.xuanCloneIntensity === "AGGRESSIVE" &&
+        ctx.flatPosition === true &&
+        (ctx.postMergeCount ?? 0) === 0 &&
+        ctx.secsFromOpen >= 10 &&
+        ctx.secsFromOpen < 25 &&
+        (ctx.topTwoAskDepthMin ?? 0) >= Math.max(500, cloneMax * 2.5) &&
+        Math.max(ctx.bestAskUp ?? 1, ctx.bestAskDown ?? 1) <= 0.56 + 1e-9 &&
+        Math.min(ctx.bestAskUp ?? 0, ctx.bestAskDown ?? 0) >= 0.44 - 1e-9;
+      if (aggressiveUnknownLargeOpening) {
+        return cloneMax;
+      }
+      const aggressivePostMergeLargeRecycle =
+        config.xuanCloneIntensity === "AGGRESSIVE" &&
+        ctx.flatPosition === true &&
+        (ctx.postMergeCount ?? 0) > 0 &&
+        ctx.secsFromOpen >= 210 &&
+        ctx.secsFromOpen < 276 &&
+        Math.max(ctx.bestAskUp ?? 1, ctx.bestAskDown ?? 1) <= 0.82 + 1e-9 &&
+        Math.min(ctx.bestAskUp ?? 0, ctx.bestAskDown ?? 0) >= 0.18 - 1e-9;
+      if (aggressivePostMergeLargeRecycle) {
+        return Number(Math.max(cloneMax, cloneApex * 0.963).toFixed(6));
+      }
+      const aggressiveBalancedLargeContinuation =
+        config.xuanCloneIntensity === "AGGRESSIVE" &&
+        ctx.inventoryBalanced &&
+        ctx.recentBothSidesFilled &&
+        (ctx.totalShares ?? Number.POSITIVE_INFINITY) >= cloneMax * 1.75 &&
+        matchedInventoryQuality >= 1.2 &&
+        ctx.secsFromOpen >= 40 &&
+        ctx.secsFromOpen < 185 &&
+        ctx.marketVolumeHigh &&
+        Math.max(ctx.bestAskUp ?? 1, ctx.bestAskDown ?? 1) <= 0.82 + 1e-9 &&
+        Math.min(ctx.bestAskUp ?? 0, ctx.bestAskDown ?? 0) >= 0.18 - 1e-9 &&
+        permissivePairGate;
+      if (aggressiveBalancedLargeContinuation) {
+        return cloneMax;
+      }
+      const aggressiveSmallLateHighLowContinuation =
+        config.xuanCloneIntensity === "AGGRESSIVE" &&
+        ctx.inventoryBalanced &&
+        ctx.recentBothSidesFilled &&
+        (ctx.totalShares ?? 0) >= cloneBase * 8 - 1e-9 &&
+        ctx.secsFromOpen >= 158 &&
+        ctx.secsFromOpen < 185 &&
+        Math.max(ctx.bestAskUp ?? 0, ctx.bestAskDown ?? 0) >= 0.88 - 1e-9 &&
+        Math.min(ctx.bestAskUp ?? 1, ctx.bestAskDown ?? 1) <= 0.15 + 1e-9;
+      if (aggressiveSmallLateHighLowContinuation) {
+        return cloneMid;
       }
       if (
         sequencePrior &&
@@ -118,6 +180,9 @@ export function chooseLot(config: XuanStrategyConfig, ctx: LotContext): number {
         if (sequencePrior.scope === "exact") {
           return Number(sequencePrior.qty.toFixed(6));
         }
+        if (config.xuanCloneIntensity === "AGGRESSIVE" && ctx.secsFromOpen < 160) {
+          return cloneBase;
+        }
         return familySequencePriorLot({
           secsFromOpen: ctx.secsFromOpen,
           priorQty: sequencePrior.qty,
@@ -125,6 +190,9 @@ export function chooseLot(config: XuanStrategyConfig, ctx: LotContext): number {
           cloneHigh,
           cloneMax,
         });
+      }
+      if (config.xuanCloneIntensity === "AGGRESSIVE" && ctx.secsFromOpen < 160) {
+        return cloneBase;
       }
       if (ctx.secsFromOpen < 20) {
         if (!ctx.bookDepthGood) {

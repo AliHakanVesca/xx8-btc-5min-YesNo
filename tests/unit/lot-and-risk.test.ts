@@ -138,7 +138,7 @@ describe("lot ladder and risk windows", () => {
       }),
     );
 
-    expect(xuanConfig.xuanBaseLotLadder).toEqual([80, 100, 125, 145]);
+    expect(xuanConfig.xuanBaseLotLadder).toEqual([60, 80, 145, 214, 265]);
     expect(xuanConfig.maxMarketExposureShares).toBeGreaterThanOrEqual(4200);
     expect(xuanConfig.maxMarketSharesPerSide).toBeGreaterThanOrEqual(4200);
     expect(xuanConfig.maxOneSidedExposureShares).toBeGreaterThanOrEqual(1800);

@@ -14,14 +14,33 @@ export class OrderBookState {
     public readonly down?: OrderBook,
   ) {}
 
+  private book(side: "UP" | "DOWN"): OrderBook | undefined {
+    return side === "UP" ? this.up : this.down;
+  }
+
+  private oppositeBook(side: "UP" | "DOWN"): OrderBook | undefined {
+    return side === "UP" ? this.down : this.up;
+  }
+
+  private executableAskLevels(side: "UP" | "DOWN") {
+    const directAsks = this.book(side)?.asks ?? [];
+    if (directAsks.length > 0) {
+      return directAsks;
+    }
+    const syntheticAsks = (this.oppositeBook(side)?.bids ?? []).map((level) => ({
+      price: Math.max(0, Math.min(1, 1 - level.price)),
+      size: level.size,
+    }));
+    return syntheticAsks;
+  }
+
   bestBid(side: "UP" | "DOWN"): number {
-    const book = side === "UP" ? this.up : this.down;
-    return book?.bids[0]?.price ?? 0;
+    const book = this.book(side);
+    return book?.bids.reduce((best, level) => Math.max(best, level.price), 0) ?? 0;
   }
 
   bestAsk(side: "UP" | "DOWN"): number {
-    const book = side === "UP" ? this.up : this.down;
-    return book?.asks[0]?.price ?? 1;
+    return this.executableAskLevels(side).reduce((best, level) => Math.min(best, level.price), 1);
   }
 
   tickSize(): number {
@@ -29,10 +48,10 @@ export class OrderBookState {
   }
 
   quoteForSize(side: "UP" | "DOWN", direction: "bid" | "ask", requestedSize: number): ExecutionQuote {
-    const book = side === "UP" ? this.up : this.down;
-    const levels = [...(book?.[direction === "bid" ? "bids" : "asks"] ?? [])].sort((left, right) =>
-      direction === "bid" ? right.price - left.price : left.price - right.price,
-    );
+    const book = this.book(side);
+    const levels = [
+      ...(direction === "ask" ? this.executableAskLevels(side) : book?.bids ?? []),
+    ].sort((left, right) => (direction === "bid" ? right.price - left.price : left.price - right.price));
 
     if (requestedSize <= 0 || levels.length === 0) {
       return {
@@ -73,7 +92,7 @@ export class OrderBookState {
   }
 
   depthAtOrBetter(side: "UP" | "DOWN", limitPrice: number, direction: "bid" | "ask"): number {
-    const levels = (side === "UP" ? this.up : this.down)?.[direction === "bid" ? "bids" : "asks"] ?? [];
+    const levels = direction === "ask" ? this.executableAskLevels(side) : this.book(side)?.bids ?? [];
     return levels
       .filter((level) => (direction === "bid" ? level.price >= limitPrice : level.price <= limitPrice))
       .reduce((acc, level) => acc + level.size, 0);

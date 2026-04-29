@@ -166,6 +166,7 @@ export function evaluateDelayedMergeGate(
     | "forceMergeInLast30S"
     | "forceMergeOnHardImbalance"
     | "forceMergeOnLowCollateral"
+    | "finalWindowSoftStartSec"
     | "finalWindowCompletionOnlySec"
     | "hardImbalanceRatio"
     | "hardImbalanceMergeMinAgeSec"
@@ -358,6 +359,50 @@ export function evaluateDelayedMergeGate(
     ...(basketEffectivePair !== undefined ? { basketEffectivePair: normalize(basketEffectivePair) } : {}),
     ...metrics,
   });
+  const aggressiveFamilyLargeBasketPreMergeHold =
+    aggressivePublicFootprint &&
+    !exactMergePriorActive &&
+    state.mergeHistory.length === 0 &&
+    secsFromOpen >= 160 &&
+    secsFromOpen < 178 &&
+    metrics.pendingMatchedQty >= baseBasketLot * 2 - 1e-9 &&
+    metrics.pendingMatchedQty < basketMergeTargetShares - 1e-9 &&
+    args.secsToClose > config.finalWindowCompletionOnlySec;
+  const aggressiveFamilyTargetTimingHold =
+    aggressivePublicFootprint &&
+    !exactMergePriorActive &&
+    state.mergeHistory.length === 0 &&
+    secsFromOpen >= 160 &&
+    secsFromOpen < 178 &&
+    metrics.pendingMatchedQty >= basketMergeTargetShares - 1e-9 &&
+    args.secsToClose > config.finalWindowCompletionOnlySec;
+  const lastMergeTs = state.mergeHistory.at(-1)?.timestamp ?? Number.NEGATIVE_INFINITY;
+  const postMergeBuys = state.fillHistory.filter((fill) => fill.side === "BUY" && fill.timestamp > lastMergeTs);
+  const firstPostMergeBuy = postMergeBuys[0];
+  const latestPostMergeBuy = postMergeBuys.at(-1);
+  const firstPostMergeBuyAgeSec =
+    firstPostMergeBuy !== undefined ? Math.max(0, args.nowTs - firstPostMergeBuy.timestamp) : 0;
+  const latestPostMergeBuyAgeSec =
+    latestPostMergeBuy !== undefined ? Math.max(0, args.nowTs - latestPostMergeBuy.timestamp) : Number.POSITIVE_INFINITY;
+  const freshPostMergeOppositeCompletion =
+    firstPostMergeBuy !== undefined &&
+    latestPostMergeBuy !== undefined &&
+    firstPostMergeBuy !== latestPostMergeBuy &&
+    firstPostMergeBuy.outcome !== latestPostMergeBuy.outcome &&
+    firstPostMergeBuy.timestamp - state.market.startTs >= 230 &&
+    firstPostMergeBuy.timestamp - state.market.startTs <= 245 &&
+    latestPostMergeBuy.timestamp - state.market.startTs >= 276 &&
+    latestPostMergeBuy.timestamp - state.market.startTs <= 282 &&
+    latestPostMergeBuyAgeSec <= Math.max(2, config.finalWindowSoftStartSec);
+  const aggressivePostMergeFreshCompletionCarry =
+    aggressivePublicFootprint &&
+    !exactMergePriorActive &&
+    state.mergeHistory.length > 0 &&
+    secsFromOpen >= 250 &&
+    args.secsToClose >= 0 &&
+    firstPostMergeBuyAgeSec >= 40 &&
+    metrics.pendingMatchedQty >= state.market.minOrderSize - 1e-9 &&
+    ((metrics.oldestMatchedAgeSec ?? 0) < 10 || freshPostMergeOppositeCompletion);
 
   if (plannedOppositeHoldActive) {
     return {
@@ -379,6 +424,24 @@ export function evaluateDelayedMergeGate(
     metrics.completedCycles >= Math.max(1, Math.min(effectiveMinCompletedCyclesBeforeFirstMerge, 2)) &&
     metrics.pendingMatchedQty >= config.marketBasketMinMergeShares - 1e-9;
   if (familyFirstMergeWindowActive) {
+    if (aggressiveFamilyLargeBasketPreMergeHold || aggressiveFamilyTargetTimingHold) {
+      return {
+        allow: false,
+        forced: false,
+        reason: "not_ready",
+        ...(basketEffectivePair !== undefined ? { basketEffectivePair: normalize(basketEffectivePair) } : {}),
+        ...metrics,
+      };
+    }
+    if (metrics.pendingMatchedQty >= basketMergeTargetShares - 1e-9 && secsFromOpen >= 178) {
+      return {
+        allow: true,
+        forced: false,
+        reason: "age_target",
+        ...(basketEffectivePair !== undefined ? { basketEffectivePair: normalize(basketEffectivePair) } : {}),
+        ...metrics,
+      };
+    }
     if (aggressiveNormalRecycleNegativeEconomicsHold) {
       return negativeEconomicsHoldDecision();
     }
@@ -398,6 +461,15 @@ export function evaluateDelayedMergeGate(
     secsFromOpen <= 282 &&
     metrics.pendingMatchedQty >= state.market.minOrderSize - 1e-9;
   if (familyFinalMergeWindowActive) {
+    if (aggressivePostMergeFreshCompletionCarry) {
+      return {
+        allow: false,
+        forced: false,
+        reason: "not_ready",
+        ...(basketEffectivePair !== undefined ? { basketEffectivePair: normalize(basketEffectivePair) } : {}),
+        ...metrics,
+      };
+    }
     const debtPositiveFinalWindow =
       basketEffectivePair !== undefined &&
       basketEffectivePair > config.marketBasketMergeEffectivePairCap + 1e-9;
@@ -547,6 +619,15 @@ export function evaluateDelayedMergeGate(
   }
 
   if (config.forceMergeInLast30S && args.secsToClose <= config.finalWindowCompletionOnlySec) {
+    if (aggressivePostMergeFreshCompletionCarry) {
+      return {
+        allow: false,
+        forced: false,
+        reason: "not_ready",
+        ...(basketEffectivePair !== undefined ? { basketEffectivePair: normalize(basketEffectivePair) } : {}),
+        ...metrics,
+      };
+    }
     const debtPositiveFinalWindow =
       basketEffectivePair !== undefined &&
       basketEffectivePair > config.marketBasketMergeEffectivePairCap + 1e-9;

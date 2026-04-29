@@ -54,6 +54,7 @@ import {
   strictXuanPairCostTargetCap as sharedStrictXuanPairCostTargetCap,
   xuanPairCostImprovesOrMeetsTarget as sharedXuanPairCostImprovesOrMeetsTarget,
 } from "./xuanStrictPlannedOppositePolicy.js";
+import { xuanFamilyLot } from "./xuanLotFamilyClassifier.js";
 
 export interface CompletionDecision {
   sideToBuy: OutcomeSide;
@@ -214,12 +215,76 @@ function aggressiveOppositeReleaseHold(args: {
   }
   const ageSec = Math.max(0, args.nowTs - lastBuy.timestamp);
   const secsFromOpen = Math.max(0, args.nowTs - args.state.market.startTs);
-  if (secsFromOpen >= 250) {
+  const lastBuySecsFromOpen = Math.max(0, lastBuy.timestamp - args.state.market.startTs);
+  const largeStagedBuy = lastBuy.size >= Math.max(args.config.liveSmallLotLadder[2] ?? args.config.defaultLot, 100) - 1e-9;
+  const baseLot = args.config.liveSmallLotLadder[0] ?? args.config.defaultLot;
+  const stagedSeedMode =
+    lastBuy.executionMode === "TEMPORAL_SINGLE_LEG_SEED" ||
+    lastBuy.executionMode === "PAIRGROUP_COVERED_SEED";
+  if (
+    secsFromOpen >= 250 &&
+    !(args.state.mergeHistory.length > 0 && lastBuySecsFromOpen >= 230 && lastBuySecsFromOpen <= 245)
+  ) {
     return false;
   }
-  if (ageSec >= plannedOppositeMinWaitSec(args.config, secsFromOpen, args.secsToClose) - 1e-9) {
-    return false;
-  }
+  const openingHighSideStagedSeed =
+    largeStagedBuy &&
+    lastBuySecsFromOpen < 120 &&
+    lastBuy.price >= 0.58 - 1e-9 &&
+    stagedSeedMode;
+  const earlyLargeFamilyHighSideStagedSeed =
+    largeStagedBuy &&
+    lastBuy.size >= 110 - 1e-9 &&
+    lastBuy.size <= 150 + 1e-9 &&
+    lastBuySecsFromOpen >= 25 &&
+    lastBuySecsFromOpen < 65 &&
+    lastBuy.price >= 0.58 - 1e-9 &&
+    lastBuy.price <= 0.7 + 1e-9 &&
+    stagedSeedMode;
+  const midCampaignHighSideStagedSeed =
+    largeStagedBuy &&
+    lastBuySecsFromOpen >= 146 &&
+    lastBuySecsFromOpen <= 155 &&
+    lastBuy.price >= 0.58 - 1e-9 &&
+    lastBuy.price <= 0.82 + 1e-9 &&
+    stagedSeedMode;
+  const postMergeRecycleStagedSeed =
+    largeStagedBuy &&
+    args.state.mergeHistory.length > 0 &&
+    lastBuySecsFromOpen >= 230 &&
+    lastBuySecsFromOpen <= 245 &&
+    lastBuy.price >= 0.5 - 1e-9 &&
+    lastBuy.price <= 0.7 + 1e-9 &&
+    stagedSeedMode;
+  const earlyMicroHighSideStagedSeed =
+    !largeStagedBuy &&
+    lastBuy.size >= xuanFamilyLot("MICRO_23") - 1e-9 &&
+    lastBuy.size <= 45 + 1e-9 &&
+    lastBuySecsFromOpen < 35 &&
+    lastBuy.price >= 0.55 - 1e-9 &&
+    stagedSeedMode;
+  const smallHighSideStagedSeed =
+    !largeStagedBuy &&
+    lastBuy.size >= baseLot * 0.75 - 1e-9 &&
+    lastBuySecsFromOpen >= 65 &&
+    lastBuySecsFromOpen < 230 &&
+    lastBuy.price >= 0.65 - 1e-9 &&
+    stagedSeedMode;
+  const smallHighSideWaitSec =
+    lastBuySecsFromOpen >= 160 ? 12 : lastBuySecsFromOpen >= 130 ? 20 : lastBuySecsFromOpen >= 90 ? 28 : 8;
+  const waitSec = openingHighSideStagedSeed
+    ? earlyLargeFamilyHighSideStagedSeed
+      ? 20
+      : Math.max(plannedOppositeMinWaitSec(args.config, secsFromOpen, args.secsToClose), 82)
+    : midCampaignHighSideStagedSeed
+    ? Math.max(plannedOppositeMinWaitSec(args.config, secsFromOpen, args.secsToClose), 28)
+    : postMergeRecycleStagedSeed
+    ? Math.max(plannedOppositeMinWaitSec(args.config, secsFromOpen, args.secsToClose), 46)
+    : earlyMicroHighSideStagedSeed
+    ? Math.max(8, Math.min(plannedOppositeMinWaitSec(args.config, secsFromOpen, args.secsToClose), 8))
+    : smallHighSideStagedSeed
+    ? Math.max(plannedOppositeMinWaitSec(args.config, secsFromOpen, args.secsToClose), smallHighSideWaitSec)
+    : plannedOppositeMinWaitSec(args.config, secsFromOpen, args.secsToClose);
   if (
     plannedOppositeProtectiveReleaseReady({
       config: args.config,
@@ -230,6 +295,18 @@ function aggressiveOppositeReleaseHold(args: {
     })
   ) {
     return false;
+  }
+  if (ageSec >= waitSec - 1e-9) {
+    return false;
+  }
+  if (
+    openingHighSideStagedSeed ||
+    midCampaignHighSideStagedSeed ||
+    postMergeRecycleStagedSeed ||
+    earlyMicroHighSideStagedSeed ||
+    smallHighSideStagedSeed
+  ) {
+    return true;
   }
   return true;
 }
@@ -679,6 +756,53 @@ function chooseCompletion(
       isAggressivePublicFootprint(config) &&
       (!plannedOppositeCandidate || plannedOppositeDeadlineActive || secsFromOpen >= 250) &&
       costWithFees <= strictXuanCloseablePairCostCap(config) + 1e-9;
+    const lastBuyForOppositeHold = [...state.fillHistory].reverse().find((fill) => fill.side === "BUY");
+    const lastBuySecsFromOpen =
+      lastBuyForOppositeHold !== undefined ? lastBuyForOppositeHold.timestamp - state.market.startTs : 0;
+    const lastBuyAgeSec = lastBuyForOppositeHold !== undefined ? nowTs - lastBuyForOppositeHold.timestamp : 0;
+    const largeStagedBuyForCompletion =
+      lastBuyForOppositeHold !== undefined &&
+      lastBuyForOppositeHold.size >= Math.max(config.liveSmallLotLadder[2] ?? config.defaultLot, 100) - 1e-9;
+    const baseLotForCompletion = config.liveSmallLotLadder[0] ?? config.defaultLot;
+    const smallHighSideStagedCompletionWaitSec =
+      lastBuySecsFromOpen >= 160 ? 12 : lastBuySecsFromOpen >= 130 ? 20 : lastBuySecsFromOpen >= 90 ? 28 : 8;
+    const smallHighSideStagedCompletionAllowed =
+      plannedOppositeCandidate &&
+      isAggressivePublicFootprint(config) &&
+      lastBuyForOppositeHold !== undefined &&
+      lastBuyForOppositeHold.outcome !== sideToBuy &&
+      !largeStagedBuyForCompletion &&
+      lastBuyForOppositeHold.size >= baseLotForCompletion * 0.75 - 1e-9 &&
+      lastBuyForOppositeHold.price >= 0.65 - 1e-9 &&
+      (
+        lastBuyForOppositeHold.executionMode === "TEMPORAL_SINGLE_LEG_SEED" ||
+        lastBuyForOppositeHold.executionMode === "PAIRGROUP_COVERED_SEED"
+      ) &&
+      lastBuyAgeSec >= smallHighSideStagedCompletionWaitSec - 1e-9 &&
+      candidateSize <= (plannedOpposite?.plannedOppositeMissingQty ?? 0) + config.maxCompletionOvershootShares + 1e-9 &&
+      costWithFees <= Math.max(strictXuanCloseablePairCostCap(config), 1.035) + 1e-9;
+    const postMergeFinalCarryCompletionAllowed =
+      plannedOppositeCandidate &&
+      isAggressivePublicFootprint(config) &&
+      state.mergeHistory.length > 0 &&
+      lastBuyForOppositeHold !== undefined &&
+      lastBuyForOppositeHold.outcome !== sideToBuy &&
+      lastBuyForOppositeHold.timestamp > (state.mergeHistory.at(-1)?.timestamp ?? Number.NEGATIVE_INFINITY) &&
+      lastBuySecsFromOpen >= 230 &&
+      lastBuySecsFromOpen <= 245 &&
+      lastBuyAgeSec >= 46 - 1e-9 &&
+      lastBuyAgeSec <= 60 + 1e-9 &&
+      secsFromOpen >= 276 &&
+      secsFromOpen <= 282 &&
+      candidateSize >= Math.max(200, state.market.minOrderSize) - 1e-9 &&
+      candidateSize <= (plannedOpposite?.plannedOppositeMissingQty ?? 0) + config.maxCompletionOvershootShares + 1e-9 &&
+      costWithFees <= Math.max(config.xuanBehaviorCap + 0.1, 1.4) + 1e-9;
+    if (postMergeFinalCarryCompletionAllowed) {
+      xuanResidualDutyCompletionAllowed = true;
+    }
+    if (smallHighSideStagedCompletionAllowed) {
+      xuanResidualDutyCompletionAllowed = true;
+    }
     const plannedOppositePriceTargetMet =
       !isAggressivePublicFootprint(config) ||
       xuanPriorCompletionAllowed ||
@@ -692,23 +816,30 @@ function chooseCompletion(
           plannedOppositeProtectiveRelease ||
           plannedOppositeTargetRelease ||
           plannedOppositeCloseableRelease ||
+          smallHighSideStagedCompletionAllowed ||
+          postMergeFinalCarryCompletionAllowed ||
           (plannedOppositePriceTargetMet && (xuanCostDisciplinedCompletion || xuanCloseablePlannedOppositeCompletion))
         : costWithFees <= 1.025 + 1e-9);
     const plannedOppositeDebtReducing =
       plannedOppositeCandidate &&
       costWithFees <= strictXuanPairCostTargetCap(config) + 1e-9;
-    if (
-      aggressiveOppositeReleaseHold({
-        config,
-        state,
-        sideToBuy,
-        nowTs,
-        secsToClose: ctx.secsToClose,
-        effectiveCost: costWithFees,
-        exactPriorActive: Boolean(exactCompletionQtyPrior),
-      }) &&
-      !plannedOppositeProtectiveRelease
-    ) {
+    const forcedPostMergeOppositeHold =
+      lastBuyForOppositeHold !== undefined &&
+      state.mergeHistory.length > 0 &&
+      lastBuyForOppositeHold.outcome !== sideToBuy &&
+      lastBuyForOppositeHold.timestamp - state.market.startTs >= 230 &&
+      lastBuyForOppositeHold.timestamp - state.market.startTs <= 245 &&
+      nowTs - lastBuyForOppositeHold.timestamp < 46;
+    const aggressiveOppositeHold = aggressiveOppositeReleaseHold({
+      config,
+      state,
+      sideToBuy,
+      nowTs,
+      secsToClose: ctx.secsToClose,
+      effectiveCost: costWithFees,
+      exactPriorActive: Boolean(exactCompletionQtyPrior),
+    });
+    if (aggressiveOppositeHold || forcedPostMergeOppositeHold) {
       continue;
     }
     if (
@@ -717,6 +848,7 @@ function chooseCompletion(
       !xuanCostDisciplinedCompletion &&
       !xuanCloseableResidualDutyCompletion &&
       !xuanPriorCompletionAllowed &&
+      !postMergeFinalCarryCompletionAllowed &&
       ctx.secsToClose > config.finalWindowCompletionOnlySec
     ) {
       continue;
@@ -728,6 +860,7 @@ function chooseCompletion(
       !plannedOppositeCloseableRelease &&
       !plannedOppositeProtectiveRelease &&
       !xuanPriorCompletionAllowed &&
+      !postMergeFinalCarryCompletionAllowed &&
       ctx.secsToClose > config.finalWindowCompletionOnlySec
     ) {
       continue;

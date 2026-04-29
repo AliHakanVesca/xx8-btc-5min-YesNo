@@ -61,6 +61,7 @@ export interface BotDecisionTrace {
   flowRotationRetryAttempted: boolean;
   flowRotationRetrySelected: boolean;
   sameWindowCompletionAndOverlap: boolean;
+  entryPhaseCompletionPromoted?: boolean | undefined;
   sameSideOverlapPrunedForCompletion?: boolean | undefined;
   sameSideOverlapRecoveryPairCost?: number | undefined;
   entry: EntryDecisionTrace;
@@ -371,8 +372,14 @@ export class Xuan5mBot {
       effectiveRisk.allowNewEntries &&
       (sameSideOverlapArbitration.forceCompletion ||
         shouldAllowSameWindowCompletionAndOverlap(config, state, entryEvaluation, entryBuys, inventoryAdjustmentProbe));
+    const entryPhaseCompletionPromoted = shouldPromoteEntryPhaseCompletion(
+      config,
+      effectiveRisk,
+      entryBuys,
+      inventoryAdjustmentProbe,
+    );
     const inventoryAdjustment =
-      !effectiveRisk.allowNewEntries || sameWindowCompletionAndOverlap
+      !effectiveRisk.allowNewEntries || sameWindowCompletionAndOverlap || entryPhaseCompletionPromoted
         ? inventoryAdjustmentProbe
         : undefined;
     const mergePlan = planMerge(config, projectMergeState(state, entryBuys, inventoryAdjustment?.completion));
@@ -400,6 +407,7 @@ export class Xuan5mBot {
         flowRotationRetryAttempted: shouldAttemptFlowRotationRetry,
         flowRotationRetrySelected,
         sameWindowCompletionAndOverlap,
+        ...(entryPhaseCompletionPromoted ? { entryPhaseCompletionPromoted: true } : {}),
         ...(sameSideOverlapArbitration.prunedForCompletion
           ? {
               sameSideOverlapPrunedForCompletion: true,
@@ -428,6 +436,40 @@ export class Xuan5mBot {
       },
     };
   }
+}
+
+function shouldPromoteEntryPhaseCompletion(
+  config: XuanStrategyConfig,
+  risk: RiskEvaluation,
+  entryBuys: EntryBuyDecision[],
+  inventoryAdjustment: InventoryAdjustmentDecision | undefined,
+): boolean {
+  if (
+    config.botMode !== "XUAN" ||
+    config.xuanCloneMode !== "PUBLIC_FOOTPRINT" ||
+    !risk.tradable ||
+    risk.hardCancel ||
+    !risk.allowNewEntries ||
+    entryBuys.length > 0 ||
+    !inventoryAdjustment?.completion
+  ) {
+    return false;
+  }
+
+  const completion = inventoryAdjustment.completion;
+  if (completion.newGap >= completion.oldGap - 1e-9) {
+    return false;
+  }
+
+  const fallbackReason = completion.residualCompletionFallbackReason;
+  return (
+    fallbackReason === "temporal_orphan_terminal_loss_reduction" ||
+    fallbackReason === "temporal_orphan_terminal_carry" ||
+    fallbackReason === "temporal_orphan_controlled_negative" ||
+    fallbackReason === "planned_opposite_completion" ||
+    fallbackReason === "planned_opposite_debt_reducing" ||
+    Boolean(completion.mustCloseBeforeMerge && completion.plannedOppositeMissingQty !== undefined)
+  );
 }
 
 interface SameSideOverlapArbitrationResult {

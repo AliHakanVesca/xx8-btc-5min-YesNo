@@ -1,6 +1,17 @@
 
 ##############################################
 
+Version : V.0.0.62
+Date    : 30.04.2026
+Author  : Ali Hakan Çakır
+Changes : - XUAN terminal-loss temporal orphan completion fallback eklendi.
+          - Entry penceresi acikken zarar azaltan completion kararinin one alinmasi saglandi.
+          - Terminal completion regresyon test kapsami genisletildi.
+
+##############################################
+
+##############################################
+
 Version : V.0.0.61
 Date    : 30.04.2026
 Author  : Ali Hakan Çakır

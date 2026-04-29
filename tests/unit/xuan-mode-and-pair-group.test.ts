@@ -444,7 +444,7 @@ describe("xuan mode and pair order groups", () => {
     });
 
     const books = new OrderBookState(
-      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.84, size: 200 }], [{ price: 0.85, size: 200 }]),
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.99, size: 200 }], [{ price: 1, size: 200 }]),
       buildBook(
         market.tokens.DOWN.tokenId,
         market.conditionId,
@@ -472,6 +472,110 @@ describe("xuan mode and pair order groups", () => {
     );
 
     expect(adjustment).toBeNull();
+  });
+
+  it("releases a terminal-loss-reducing temporal orphan completion above the normal xuan cap", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.64,
+      size: 15,
+      timestamp: market.startTs + 8,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.73, size: 200 }], [{ price: 0.74, size: 200 }]),
+      buildBook(
+        market.tokens.DOWN.tokenId,
+        market.conditionId,
+        [{ price: 0.27, size: 200 }],
+        [{ price: 0.28, size: 200 }],
+      ),
+    );
+    const config = buildRuntimeConfig({
+      BOT_MODE: "XUAN",
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+    });
+
+    const adjustment = chooseInventoryAdjustment(config, state, books, {
+      secsToClose: 180,
+      nowTs: market.startTs + 120,
+      fairValueSnapshot: {
+        status: "live_missing",
+        estimatedThreshold: false,
+        note: "test_missing",
+      },
+    });
+
+    expect(adjustment?.completion).toMatchObject({
+      sideToBuy: "UP",
+      missingShares: 15,
+      residualCompletionFairValueFallback: true,
+      residualCompletionFallbackReason: "temporal_orphan_terminal_loss_reduction",
+    });
+    expect(adjustment?.completion?.costWithFees).toBeGreaterThan(config.xuanBehaviorCap);
+    expect(adjustment?.completion?.newGap).toBe(0);
+  });
+
+  it("promotes terminal-loss completion while the entry window is still open", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.64,
+      size: 15,
+      timestamp: market.startTs + 8,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.73, size: 200 }], [{ price: 0.74, size: 200 }]),
+      buildBook(
+        market.tokens.DOWN.tokenId,
+        market.conditionId,
+        [{ price: 0.27, size: 200 }],
+        [{ price: 0.28, size: 200 }],
+      ),
+    );
+
+    const decision = new Xuan5mBot().evaluateTick({
+      config: buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      }),
+      state,
+      books,
+      nowTs: market.startTs + 120,
+      riskContext: {
+        secsToClose: 180,
+        staleBookMs: 100,
+        balanceStaleMs: 100,
+        bookIsCrossed: false,
+        dailyLossUsdc: 0,
+        marketLossUsdc: 0,
+        usdcBalance: 1000,
+      },
+      dryRunOrSmallLive: true,
+      fairValueSnapshot: {
+        status: "live_missing",
+        estimatedThreshold: false,
+        note: "test_missing",
+      },
+    });
+
+    expect(decision.entryBuys).toHaveLength(0);
+    expect(decision.completion).toMatchObject({
+      sideToBuy: "UP",
+      missingShares: 15,
+      residualCompletionFallbackReason: "temporal_orphan_terminal_loss_reduction",
+    });
+    expect(decision.trace.entryPhaseCompletionPromoted).toBe(true);
   });
 
   it("blocks fee-inclusive completion when the effective merged result exceeds the quality cap", () => {

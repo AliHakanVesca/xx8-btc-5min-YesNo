@@ -839,6 +839,21 @@ function chooseCompletion(
       effectiveCost: costWithFees,
       exactPriorActive: Boolean(exactCompletionQtyPrior),
     });
+    const temporalOrphanFallback = temporalSingleLegOrphanCompletionFallback({
+      config,
+      state,
+      leadingSide,
+      leadingAverageCost: existingAverage,
+      partialAgeSec,
+      secsToClose: ctx.secsToClose,
+      repairCost: costWithFees,
+      executableSize: candidateSize,
+      oldGap,
+      newGap: projectedGap,
+      negativeEdgeUsdc: Math.max(0, costWithFees - 1) * candidateSize,
+    });
+    const terminalLossReductionFallbackActive =
+      temporalOrphanFallback.reason === "temporal_orphan_terminal_loss_reduction";
     if (aggressiveOppositeHold || forcedPostMergeOppositeHold) {
       continue;
     }
@@ -849,6 +864,7 @@ function chooseCompletion(
       !xuanCloseableResidualDutyCompletion &&
       !xuanPriorCompletionAllowed &&
       !postMergeFinalCarryCompletionAllowed &&
+      !terminalLossReductionFallbackActive &&
       ctx.secsToClose > config.finalWindowCompletionOnlySec
     ) {
       continue;
@@ -861,6 +877,7 @@ function chooseCompletion(
       !plannedOppositeProtectiveRelease &&
       !xuanPriorCompletionAllowed &&
       !postMergeFinalCarryCompletionAllowed &&
+      !terminalLossReductionFallbackActive &&
       ctx.secsToClose > config.finalWindowCompletionOnlySec
     ) {
       continue;
@@ -930,18 +947,6 @@ function chooseCompletion(
       newGap: projectedGap,
       orphanCompletionDutyActive,
       phaseCap: phase.cap,
-    });
-    const temporalOrphanFallback = temporalSingleLegOrphanCompletionFallback({
-      config,
-      state,
-      leadingSide,
-      partialAgeSec,
-      secsToClose: ctx.secsToClose,
-      repairCost: costWithFees,
-      executableSize: candidateSize,
-      oldGap,
-      newGap: projectedGap,
-      negativeEdgeUsdc: allowance.negativeEdgeUsdc,
     });
     const earlyTemporalCompletionWait =
       config.botMode === "XUAN" &&
@@ -1722,6 +1727,7 @@ function temporalSingleLegOrphanCompletionFallback(args: {
   config: XuanStrategyConfig;
   state: XuanMarketState;
   leadingSide: OutcomeSide;
+  leadingAverageCost: number;
   partialAgeSec: number;
   secsToClose: number;
   repairCost: number;
@@ -1772,7 +1778,11 @@ function temporalSingleLegOrphanCompletionFallback(args: {
         ? Math.min(args.config.temporalRepairPatientCap, args.config.xuanBehaviorCap)
         : Math.min(args.config.temporalRepairSoftCap, args.config.xuanBehaviorCap);
   if (args.repairCost > maxEffectiveCost + 1e-9) {
-    return { allowed: false };
+    const terminalLossReduction = temporalOrphanTerminalLossReduction(args);
+    if (!terminalLossReduction.allowed) {
+      return { allowed: false };
+    }
+    return { allowed: true, reason: terminalLossReduction.reason };
   }
 
   const maxAddedDebt =
@@ -1806,6 +1816,40 @@ function temporalSingleLegOrphanCompletionFallback(args: {
           ? "temporal_orphan_terminal_carry"
           : "temporal_orphan_controlled_negative",
   };
+}
+
+function temporalOrphanTerminalLossReduction(args: {
+  config: XuanStrategyConfig;
+  state: XuanMarketState;
+  leadingAverageCost: number;
+  repairCost: number;
+  executableSize: number;
+  negativeEdgeUsdc: number;
+}): { allowed: boolean; reason?: string | undefined } {
+  if (!args.config.terminalCarryImprovementEnabled || !Number.isFinite(args.leadingAverageCost)) {
+    return { allowed: false };
+  }
+
+  const nakedWorstLossPerShare = Math.max(0, args.leadingAverageCost);
+  const mergedLossPerShare = Math.max(0, args.repairCost - 1);
+  const improvementPerShare = nakedWorstLossPerShare - mergedLossPerShare;
+  const totalImprovement = improvementPerShare * args.executableSize;
+  const minImprovementPerShare = Math.max(args.config.minEdgePerShare, 0.005);
+  if (
+    improvementPerShare < minImprovementPerShare - 1e-9 ||
+    totalImprovement < args.config.terminalCarryMinMinPnlImprovementUsdc - 1e-9
+  ) {
+    return { allowed: false };
+  }
+
+  if (
+    args.state.negativeCompletionEdgeConsumedUsdc + args.negativeEdgeUsdc >
+    args.config.maxNegativeEdgePerMarketUsdc + 1e-9
+  ) {
+    return { allowed: false };
+  }
+
+  return { allowed: true, reason: "temporal_orphan_terminal_loss_reduction" };
 }
 
 function resolveGuidedMinCompletionSize(args: {

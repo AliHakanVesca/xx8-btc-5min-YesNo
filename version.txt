@@ -1,6 +1,17 @@
 
 ##############################################
 
+Version : V.0.0.63
+Date    : 30.04.2026
+Author  : Ali Hakan Çakır
+Changes : - Agresif XUAN post-merge completion-only disiplin ayarlari zorunlu hale getirildi.
+          - Flat post-merge re-entry cooldown ve completion-ready basket seed engeli eklendi.
+          - Post-merge re-entry regresyon testleri genisletildi.
+
+##############################################
+
+##############################################
+
 Version : V.0.0.62
 Date    : 30.04.2026
 Author  : Ali Hakan Çakır

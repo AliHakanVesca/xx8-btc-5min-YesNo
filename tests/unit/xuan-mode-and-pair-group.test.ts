@@ -7986,6 +7986,86 @@ describe("xuan mode and pair order groups", () => {
     expect(evaluation.trace.candidates?.[0]?.gateReason).toBe("xuan_post_merge_seed_pair_cost_wait");
   });
 
+  it("forces post-merge completion-only discipline for aggressive public footprint even when env disables it", () => {
+    const config = buildRuntimeConfig({
+      BOT_MODE: "XUAN",
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+      XUAN_BASE_LOT_LADDER: "5,8,12,15",
+      LIVE_SMALL_LOT_LADDER: "5,8,12,15",
+      POST_MERGE_ONLY_COMPLETION: "false",
+      POST_MERGE_ONLY_COMPLETION_WHILE_RESIDUAL: "false",
+      POST_MERGE_NEW_SEED_COOLDOWN_MS: "0",
+      POST_MERGE_PAIR_REOPEN_COOLDOWN_MS: "0",
+    });
+
+    expect(config.postMergeOnlyCompletion).toBe(true);
+    expect(config.postMergeOnlyCompletionWhileResidual).toBe(true);
+    expect(config.postMergeAllowNewPairIfFlat).toBe(true);
+    expect(config.postMergeNewSeedCooldownMs).toBeGreaterThanOrEqual(20000);
+    expect(config.postMergePairReopenCooldownMs).toBeGreaterThanOrEqual(20000);
+  });
+
+  it("blocks flat post-merge temporal re-entry until the configured cooldown expires", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 15,
+      price: 0.44,
+      timestamp: market.startTs + 15,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      size: 15,
+      price: 0.43,
+      timestamp: market.startTs + 35,
+      makerTaker: "taker",
+      executionMode: "PARTIAL_SOFT_COMPLETION",
+    });
+    state = applyMerge(state, {
+      amount: 14.99,
+      timestamp: market.startTs + 75,
+      simulated: true,
+    });
+    state = {
+      ...state,
+      reentryDisabled: false,
+      postMergeCompletionOnlyUntil: market.startTs + 95,
+    };
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.61, size: 200 }], [{ price: 0.62, size: 200 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.37, size: 200 }], [{ price: 0.38, size: 200 }]),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+        XUAN_BASE_LOT_LADDER: "5,8,12,15",
+        LIVE_SMALL_LOT_LADDER: "5,8,12,15",
+        MARKET_BASKET_MIN_MERGE_SHARES: "15",
+        POST_MERGE_ONLY_COMPLETION: "false",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 80,
+        secsToClose: 220,
+        lot: 15,
+      },
+    );
+
+    expect(evaluation.decisions).toHaveLength(0);
+    expect(evaluation.trace.skipReason).toBe("xuan_post_merge_reentry_cooldown");
+  });
+
   it("keeps strict late pair-cost discipline even when the old blocker would have been daily budget", () => {
     const market = buildOfflineMarket(1713696000);
     let state = createMarketState(market);

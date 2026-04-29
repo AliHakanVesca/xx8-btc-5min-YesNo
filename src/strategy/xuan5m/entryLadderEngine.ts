@@ -892,6 +892,49 @@ function shouldHoldEntryForMergeFirstAfterCompletion(
   return basketState.basketEffectiveAvg <= config.marketBasketMergeEffectivePairCap + 1e-9;
 }
 
+function postMergeReentryHoldReason(
+  config: XuanStrategyConfig,
+  state: XuanMarketState,
+  nowTs: number,
+): string | undefined {
+  if (
+    config.botMode !== "XUAN" ||
+    !config.postMergeOnlyCompletion ||
+    state.mergeHistory.length === 0
+  ) {
+    return undefined;
+  }
+  const flatDust = Math.max(config.postMergeFlatDustShares, state.market.minOrderSize * 0.01, 1e-6);
+  if (Math.abs(state.upShares - state.downShares) > flatDust + 1e-9) {
+    return undefined;
+  }
+  if (state.reentryDisabled) {
+    return "xuan_post_merge_completion_only";
+  }
+  if (state.postMergeCompletionOnlyUntil !== undefined && nowTs < state.postMergeCompletionOnlyUntil) {
+    return "xuan_post_merge_reentry_cooldown";
+  }
+  return undefined;
+}
+
+function completionReadyBasketShouldAvoidStagedSeed(config: XuanStrategyConfig, state: XuanMarketState): boolean {
+  if (config.botMode !== "XUAN") {
+    return false;
+  }
+  const lastBuy = lastBuyFill(state);
+  if (!lastBuy || !isCompletionLikeBuyMode(lastBuy.executionMode)) {
+    return false;
+  }
+  const flatDust = Math.max(config.postMergeFlatDustShares, state.market.minOrderSize * 0.01, 1e-6);
+  const mergeFirstTarget = isAggressivePublicFootprint(config)
+    ? publicFootprintBasketMergeTargetQty(config)
+    : config.mergeMinShares;
+  return (
+    Math.abs(state.upShares - state.downShares) <= flatDust + 1e-9 &&
+    mergeableShares(state) >= mergeFirstTarget - 1e-9
+  );
+}
+
 function xuanTemporalSeedRhythmSkipReason(args: {
   config: XuanStrategyConfig;
   state: XuanMarketState;
@@ -2922,6 +2965,7 @@ export function evaluateEntryBuys(
   const referencePriorActive = referenceFreshCyclePriorActive(config, state, ctx);
   const currentBasketState = marketBasketStateTrace(config, state);
   const mergeFirstAfterCompletion = shouldHoldEntryForMergeFirstAfterCompletion(config, state, ctx, currentBasketState);
+  const postMergeHoldReason = postMergeReentryHoldReason(config, state, state.market.startTs + ctx.secsFromOpen);
   const sequencePriorDustRecycleActive =
     config.botMode === "XUAN" &&
     config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
@@ -2962,6 +3006,25 @@ export function evaluateEntryBuys(
         pairCap,
         skipReason: "xuan_merge_first_after_completion",
         cycleSkippedReason: "xuan_merge_first_after_completion",
+        stateBefore: inventoryTraceState(state),
+        ...basketTraceFields(config, state),
+        recentBadCycleCount: freshCycleStats.recentBadCycleCount,
+        candidates: [],
+      },
+    };
+  }
+
+  if (postMergeHoldReason) {
+    return {
+      decisions: [],
+      trace: {
+        mode: "balanced_pair",
+        requestedLot: ctx.lot,
+        totalShares,
+        shareGap,
+        pairCap,
+        skipReason: postMergeHoldReason,
+        cycleSkippedReason: postMergeHoldReason,
         stateBefore: inventoryTraceState(state),
         ...basketTraceFields(config, state),
         recentBadCycleCount: freshCycleStats.recentBadCycleCount,
@@ -8811,6 +8874,9 @@ function buildAggressiveStagedPairSeed(args: {
       plannedOppositeAgeSec: materialOpenPlannedOpposite.plannedOppositeAgeSec,
       mustCloseBeforeMerge: true,
     });
+  }
+  if (completionReadyBasketShouldAvoidStagedSeed(args.config, args.state)) {
+    return undefined;
   }
 
   let stagedQty = args.candidate.requestedSize;

@@ -1044,10 +1044,13 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     allowOverlapOnlyWhenCompletionEngineActive: aggressive ? false : config.allowOverlapOnlyWhenCompletionEngineActive,
     requireMatchedInventoryBeforeSecondGroup: aggressive ? false : config.requireMatchedInventoryBeforeSecondGroup,
     worstCaseAmplificationToleranceShares: config.worstCaseAmplificationToleranceShares,
-    postMergeNewSeedCooldownMs: 0,
-    postMergePairReopenCooldownMs: 0,
-    postMergeOnlyCompletion: false,
-    postMergeOnlyCompletionWhileResidual: false,
+    postMergeNewSeedCooldownMs: aggressive ? Math.max(config.postMergeNewSeedCooldownMs, 20000) : config.postMergeNewSeedCooldownMs,
+    postMergePairReopenCooldownMs: aggressive
+      ? Math.max(config.postMergePairReopenCooldownMs, 20000)
+      : config.postMergePairReopenCooldownMs,
+    postMergeOnlyCompletion: aggressive ? true : config.postMergeOnlyCompletion,
+    postMergeOnlyCompletionWhileResidual: aggressive ? true : config.postMergeOnlyCompletionWhileResidual,
+    postMergeAllowNewPairIfFlat: aggressive ? true : config.postMergeAllowNewPairIfFlat,
     allowHighSideEmergencyChase: true,
     highSideEmergencyMaxQty: Math.max(config.highSideEmergencyMaxQty, maxLadderLot),
     highSideEmergencyRequiresFairValue: false,

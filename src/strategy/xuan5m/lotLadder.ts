@@ -43,6 +43,8 @@ export function chooseLot(config: XuanStrategyConfig, ctx: LotContext): number {
   const cloneHigh = baseLots[2] ?? cloneMid;
   const cloneMax = baseLots[3] ?? cloneHigh;
   const cloneApex = baseLots[4] ?? cloneMax;
+  const capAggressivePublicFootprintLot = (lot: number): number =>
+    config.xuanCloneIntensity === "AGGRESSIVE" ? Number(Math.min(lot, cloneMax).toFixed(6)) : Number(lot.toFixed(6));
   const pairGatePressure = Math.max(0, ctx.pairGatePressure ?? (ctx.pairCostWithinCap ? 0 : 1));
   const mildPairGate = pairGatePressure <= 0.55;
   const permissivePairGate = pairGatePressure <= 0.85;
@@ -116,7 +118,7 @@ export function chooseLot(config: XuanStrategyConfig, ctx: LotContext): number {
         ctx.marketVolumeHigh;
       const xuanFamilyLot = classifyXuanLotFamily(config, ctx);
       if (xuanFamilyLot !== undefined) {
-        return xuanFamilyLot.lot;
+        return capAggressivePublicFootprintLot(xuanFamilyLot.lot);
       }
       if (!ctx.inventoryBalanced) {
         return cloneBase;
@@ -178,18 +180,20 @@ export function chooseLot(config: XuanStrategyConfig, ctx: LotContext): number {
         ctx.bookDepthGood
       ) {
         if (sequencePrior.scope === "exact") {
-          return Number(sequencePrior.qty.toFixed(6));
+          return capAggressivePublicFootprintLot(sequencePrior.qty);
         }
         if (config.xuanCloneIntensity === "AGGRESSIVE" && ctx.secsFromOpen < 160) {
           return cloneBase;
         }
-        return familySequencePriorLot({
-          secsFromOpen: ctx.secsFromOpen,
-          priorQty: sequencePrior.qty,
-          cloneBase,
-          cloneHigh,
-          cloneMax,
-        });
+        return capAggressivePublicFootprintLot(
+          familySequencePriorLot({
+            secsFromOpen: ctx.secsFromOpen,
+            priorQty: sequencePrior.qty,
+            cloneBase,
+            cloneHigh,
+            cloneMax,
+          }),
+        );
       }
       if (config.xuanCloneIntensity === "AGGRESSIVE" && ctx.secsFromOpen < 160) {
         return cloneBase;

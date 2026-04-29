@@ -71,7 +71,11 @@ import {
   strictXuanPairCostTargetCap as sharedStrictXuanPairCostTargetCap,
   xuanPairCostImprovesOrMeetsTarget as sharedXuanPairCostImprovesOrMeetsTarget,
 } from "./xuanStrictPlannedOppositePolicy.js";
-import { xuanFamilyLot } from "./xuanLotFamilyClassifier.js";
+import {
+  xuanConfiguredFreshStagedSeedMinLot,
+  xuanConfiguredMicroLot,
+  xuanFamilyLot,
+} from "./xuanLotFamilyClassifier.js";
 
 export type EntryBuyReason =
   | "balanced_pair_seed"
@@ -749,7 +753,7 @@ function aggressiveOppositeReleaseHold(args: {
     stagedSeedMode;
   const earlyMicroHighSideStagedSeed =
     !largeStagedBuy &&
-    lastBuy.size >= xuanFamilyLot("MICRO_23") - 1e-9 &&
+    lastBuy.size >= xuanConfiguredMicroLot(args.config) - 1e-9 &&
     lastBuy.size <= 45 + 1e-9 &&
     lastBuySecsFromOpen < 35 &&
     lastBuy.price >= 0.55 - 1e-9 &&
@@ -839,6 +843,53 @@ function lastTemporalSeedFill(state: XuanMarketState): FillRecord | undefined {
 
 function lastBuyFill(state: XuanMarketState): FillRecord | undefined {
   return [...state.fillHistory].reverse().find((fill) => fill.side === "BUY");
+}
+
+function isCompletionLikeBuyMode(mode: StrategyExecutionMode | undefined): boolean {
+  return (
+    mode === "PARTIAL_FAST_COMPLETION" ||
+    mode === "PARTIAL_SOFT_COMPLETION" ||
+    mode === "PARTIAL_EMERGENCY_COMPLETION" ||
+    mode === "POST_MERGE_RESIDUAL_COMPLETION" ||
+    mode === "HIGH_LOW_COMPLETION_CHASE" ||
+    mode === "CHEAP_LATE_COMPLETION_CHASE"
+  );
+}
+
+function shouldHoldEntryForMergeFirstAfterCompletion(
+  config: XuanStrategyConfig,
+  state: XuanMarketState,
+  ctx: EntryLadderContext,
+  basketState: MarketBasketStateTrace,
+): boolean {
+  if (config.botMode !== "XUAN" || config.mergeMode !== "AUTO") {
+    return false;
+  }
+  const lastBuy = lastBuyFill(state);
+  if (!lastBuy || !isCompletionLikeBuyMode(lastBuy.executionMode)) {
+    return false;
+  }
+  const mergeableQty = mergeableShares(state);
+  const mergeFirstTarget = isAggressivePublicFootprint(config)
+    ? publicFootprintBasketMergeTargetQty(config)
+    : config.mergeMinShares;
+  if (mergeableQty < mergeFirstTarget - 1e-9) {
+    return false;
+  }
+  if (basketState.campaignActive || basketState.balancedButDebted) {
+    return false;
+  }
+  const lastBuyAgeSec = Math.max(0, state.market.startTs + ctx.secsFromOpen - lastBuy.timestamp);
+  const smallExplicitMergeTarget = mergeFirstTarget <= Math.max(20, state.market.minOrderSize * 4);
+  const immediateCompletionLockSec = Math.max(3, Math.ceil(config.reentryDelayMs / 1000) + 1);
+  if (!smallExplicitMergeTarget && lastBuyAgeSec > immediateCompletionLockSec + 1e-9) {
+    return false;
+  }
+  const flatDust = Math.max(config.postMergeFlatDustShares, state.market.minOrderSize * 0.01, 1e-6);
+  if (Math.abs(state.upShares - state.downShares) > flatDust + 1e-9) {
+    return false;
+  }
+  return basketState.basketEffectiveAvg <= config.marketBasketMergeEffectivePairCap + 1e-9;
 }
 
 function xuanTemporalSeedRhythmSkipReason(args: {
@@ -1163,7 +1214,7 @@ function openingWeakPairSkipReason(
     isAggressivePublicFootprint(config) &&
     ctx.secsFromOpen >= 90 &&
     ctx.secsFromOpen <= 130 &&
-    candidateContext.requestedSize <= xuanFamilyLot("MICRO_23") + 1e-9 &&
+    candidateContext.requestedSize <= xuanConfiguredMicroLot(config) + 1e-9 &&
     rawPair <= 1.02 + 1e-9 &&
     effectivePair <= 1.06 + 1e-9
   ) {
@@ -2821,7 +2872,7 @@ function freshCycleCandidateSkipReason(
     candidateContext?.route === "temporal_seed" &&
     candidateContext.ctx.secsFromOpen >= 90 &&
     candidateContext.ctx.secsFromOpen <= 130 &&
-    candidateContext.requestedSize <= xuanFamilyLot("MICRO_23") + 1e-9 &&
+    candidateContext.requestedSize <= xuanConfiguredMicroLot(config) + 1e-9 &&
     (candidateContext.rawPair ?? Number.POSITIVE_INFINITY) <= 1.02 + 1e-9 &&
     (candidateContext.effectivePair ?? Number.POSITIVE_INFINITY) <= 1.06 + 1e-9
   ) {
@@ -2870,6 +2921,7 @@ export function evaluateEntryBuys(
   const freshCycleStats = buildFreshCycleStats(config, state);
   const referencePriorActive = referenceFreshCyclePriorActive(config, state, ctx);
   const currentBasketState = marketBasketStateTrace(config, state);
+  const mergeFirstAfterCompletion = shouldHoldEntryForMergeFirstAfterCompletion(config, state, ctx, currentBasketState);
   const sequencePriorDustRecycleActive =
     config.botMode === "XUAN" &&
     config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
@@ -2894,6 +2946,25 @@ export function evaluateEntryBuys(
         recentBadCycleCount: freshCycleStats.recentBadCycleCount,
         ...(freshCycleStats.lastCycle ? { lastCycleNet: freshCycleStats.lastCycle.expectedNetIfMerged } : {}),
         ...(freshCycleStats.lastCycle ? { lastCycleClosedAt: freshCycleStats.lastCycle.closedAt } : {}),
+        candidates: [],
+      },
+    };
+  }
+
+  if (mergeFirstAfterCompletion) {
+    return {
+      decisions: [],
+      trace: {
+        mode: "balanced_pair",
+        requestedLot: ctx.lot,
+        totalShares,
+        shareGap,
+        pairCap,
+        skipReason: "xuan_merge_first_after_completion",
+        cycleSkippedReason: "xuan_merge_first_after_completion",
+        stateBefore: inventoryTraceState(state),
+        ...basketTraceFields(config, state),
+        recentBadCycleCount: freshCycleStats.recentBadCycleCount,
         candidates: [],
       },
     };
@@ -5970,23 +6041,24 @@ function evaluateTemporalSingleLegSeed(
           targetEffectivePair: temporalSeedCostPlan.targetEffectivePair,
           requestedSize: executableSize > 0 ? executableSize : requestedSize,
           exactPriorActive: exactSeedPriorQty !== undefined,
-	          hasVisibleOppositePath:
-	            executableSize > 0 &&
-	            oppositeCoverageRatio + 1e-9 >= config.temporalSingleLegMinOppositeDepthRatio &&
-	            oppositeFilledSize >= state.market.minOrderSize - 1e-9,
-	          seedPrice: seedQuote.averagePrice,
-	          oppositePrice: oppositeQuote.averagePrice,
-	          lowSideSeed: seedQuote.averagePrice <= oppositeQuote.averagePrice + 1e-9,
-	        });
+          seedRoute: "temporal_single_leg",
+          hasVisibleOppositePath:
+            executableSize > 0 &&
+            oppositeCoverageRatio + 1e-9 >= config.temporalSingleLegMinOppositeDepthRatio &&
+            oppositeFilledSize >= state.market.minOrderSize - 1e-9,
+          seedPrice: seedQuote.averagePrice,
+          oppositePrice: oppositeQuote.averagePrice,
+          lowSideSeed: seedQuote.averagePrice <= oppositeQuote.averagePrice + 1e-9,
+        });
     const materialOpenPlannedOpposite = completingExistingResidual
       ? undefined
       : materialOpenPlannedOppositeState(config, state, state.market.startTs + ctx.secsFromOpen);
-	    const strictNormalMicroSeedBlocked =
-	      isAggressivePublicFootprint(config) &&
-	      !completingExistingResidual &&
-	      exactSeedPriorQty === undefined &&
-	      Math.min(executableSize > 0 ? executableSize : requestedSize, requestedSize) <
-	        Math.max(xuanFamilyLot("MICRO_23"), state.market.minOrderSize) - 1e-9;
+    const strictNormalMicroSeedBlocked =
+      isAggressivePublicFootprint(config) &&
+      !completingExistingResidual &&
+      exactSeedPriorQty === undefined &&
+      Math.min(executableSize > 0 ? executableSize : requestedSize, requestedSize) <
+        Math.max(xuanConfiguredMicroLot(config), state.market.minOrderSize) - 1e-9;
     const freshCycleCandidateContext: FreshCycleCandidateContext = {
       route: "temporal_seed",
       ctx,
@@ -6873,12 +6945,13 @@ function inspectBalancedPairCandidates(
             referencePairCost: pairCost,
             targetEffectivePair: stagedSequenceCostPlan.targetEffectivePair,
             requestedSize,
-	            exactPriorActive: familySeedPrior?.scope === "exact",
-	            hasVisibleOppositePath: upExecution.fullyFilled && downExecution.fullyFilled,
-	            seedPrice: stagedSequenceSeedPrice,
-	            oppositePrice: stagedSequenceOppositePrice,
-	            lowSideSeed: stagedSequenceSeedIsLow,
-	          })
+            exactPriorActive: familySeedPrior?.scope === "exact",
+            seedRoute: "staged_pair",
+            hasVisibleOppositePath: upExecution.fullyFilled && downExecution.fullyFilled,
+            seedPrice: stagedSequenceSeedPrice,
+            oppositePrice: stagedSequenceOppositePrice,
+            lowSideSeed: stagedSequenceSeedIsLow,
+          })
         : undefined;
     const xuanStrictSeedCostBlocked = xuanStrictSeedCostReason !== undefined;
     const xuanStagedPairCostReducingSetup =
@@ -8188,6 +8261,7 @@ function strictXuanSeedCostBlockReason(args: {
   targetEffectivePair?: number | undefined;
   requestedSize: number;
   exactPriorActive: boolean;
+  seedRoute?: "temporal_single_leg" | "staged_pair" | undefined;
   hasVisibleOppositePath: boolean;
   seedPrice?: number | undefined;
   lowSideSeed?: boolean | undefined;
@@ -8245,7 +8319,7 @@ function strictXuanSeedCostBlockReason(args: {
     freshMarket &&
     args.secsFromOpen >= 90 &&
     args.secsFromOpen <= 130 &&
-    args.requestedSize <= xuanFamilyLot("MICRO_23") + 1e-9 &&
+    args.requestedSize <= xuanConfiguredMicroLot(args.config) + 1e-9 &&
     args.referencePairCost <= 1.06 + 1e-9;
   const freshLargeHighSideOpeningAllowed =
     largeSeed &&
@@ -8346,6 +8420,15 @@ function strictXuanSeedCostBlockReason(args: {
     args.referencePairCost > closeableCap + 1e-9
   ) {
     return "xuan_seed_wait_for_recycle";
+  }
+
+  if (
+    args.seedRoute === "temporal_single_leg" &&
+    !args.exactPriorActive &&
+    args.lowSideSeed === true &&
+    !immediatelyCloseablePath
+  ) {
+    return "xuan_open_planned_opposite_no_closeable_path";
   }
 
   if (
@@ -8759,13 +8842,14 @@ function buildAggressiveStagedPairSeed(args: {
     targetEffectivePair: targetPlan.targetEffectivePair,
     requestedSize: args.candidate.requestedSize,
     exactPriorActive: false,
-	    hasVisibleOppositePath:
-	      originalOppositeExecution.fullyFilled &&
-	      originalOppositeExecution.filledSize >= args.state.market.minOrderSize - 1e-9,
-	    seedPrice: originalSeedExecution.averagePrice,
-	    oppositePrice: originalOppositeExecution.averagePrice,
-	    lowSideSeed: seedIsLowSide,
-	  });
+    seedRoute: "staged_pair",
+    hasVisibleOppositePath:
+      originalOppositeExecution.fullyFilled &&
+      originalOppositeExecution.filledSize >= args.state.market.minOrderSize - 1e-9,
+    seedPrice: originalSeedExecution.averagePrice,
+    oppositePrice: originalOppositeExecution.averagePrice,
+    lowSideSeed: seedIsLowSide,
+  });
   if (strictSeedCostBlockReason === "xuan_high_cost_seed_exploratory_cap") {
     return blockedPlan("xuan_strict_seed_abort_high_cost", {
       plannedOppositeSide: oppositeSide,
@@ -8792,7 +8876,10 @@ function buildAggressiveStagedPairSeed(args: {
     );
   }
   const freshMarketStagedSeed = args.state.fillHistory.length === 0 && args.state.mergeHistory.length === 0;
-  const minFreshStagedSeedQty = Math.max(args.state.market.minOrderSize, 40);
+  const minFreshStagedSeedQty = Math.max(
+    args.state.market.minOrderSize,
+    xuanConfiguredFreshStagedSeedMinLot(args.config),
+  );
   if (freshMarketStagedSeed && stagedQty < minFreshStagedSeedQty - 1e-9) {
     return blockedPlan("xuan_strict_seed_abort_micro_reentry", {
       plannedOppositeSide: oppositeSide,

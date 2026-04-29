@@ -6,6 +6,10 @@ import { evaluateRisk } from "../../src/strategy/xuan5m/riskEngine.js";
 import { buildOfflineMarket } from "../../src/infra/gamma/marketDiscovery.js";
 import { createMarketState } from "../../src/strategy/xuan5m/marketState.js";
 import { applyFill } from "../../src/strategy/xuan5m/inventoryState.js";
+import {
+  xuanConfiguredFreshStagedSeedMinLot,
+  xuanConfiguredMicroLot,
+} from "../../src/strategy/xuan5m/xuanLotFamilyClassifier.js";
 
 describe("lot ladder and risk windows", () => {
   const config = buildStrategyConfig(
@@ -139,6 +143,7 @@ describe("lot ladder and risk windows", () => {
     );
 
     expect(xuanConfig.xuanBaseLotLadder).toEqual([60, 80, 145, 214, 265]);
+    expect(xuanConfiguredFreshStagedSeedMinLot(xuanConfig)).toBe(40);
     expect(xuanConfig.maxMarketExposureShares).toBeGreaterThanOrEqual(4200);
     expect(xuanConfig.maxMarketSharesPerSide).toBeGreaterThanOrEqual(4200);
     expect(xuanConfig.maxOneSidedExposureShares).toBeGreaterThanOrEqual(1800);
@@ -150,6 +155,7 @@ describe("lot ladder and risk windows", () => {
     expect(xuanConfig.allowSingleLegSeedInLast60S).toBe(true);
     expect(xuanConfig.finalWindowCompletionOnlySec).toBe(10);
     expect(xuanConfig.finalWindowNoChaseSec).toBe(5);
+    expect(xuanConfig.maxMatchedAgeBeforeForcedMergeSec).toBeGreaterThanOrEqual(180);
     expect(xuanConfig.allowAnyNewBuyInLast10S).toBe(false);
     expect(xuanConfig.xuanRhythmMinWaitSec).toBeGreaterThanOrEqual(4);
     expect(xuanConfig.xuanRhythmMaxWaitSec).toBeLessThanOrEqual(12);
@@ -201,6 +207,66 @@ describe("lot ladder and risk windows", () => {
     expect(xuanConfig.maxMarketOrphanUsdc).toBeGreaterThanOrEqual(99);
     expect(xuanConfig.maxMarketOrphanUsdc).toBeLessThan(650);
     expect(xuanConfig.maxSingleOrphanQty).toBe(90);
+  });
+
+  it("keeps explicit small aggressive public-footprint merge windows small", () => {
+    const xuanConfig = buildStrategyConfig(
+      parseEnv({
+        DRY_RUN: "true",
+        POLY_STACK_MODE: "current-prod-v1",
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+        XUAN_BASE_LOT_LADDER: "5,8,12,15",
+        LIVE_SMALL_LOT_LADDER: "5,8,12,15",
+        MAX_MATCHED_AGE_BEFORE_FORCED_MERGE_SEC: "75",
+      }),
+    );
+
+    expect(xuanConfig.xuanBaseLotLadder).toEqual([5, 8, 12, 15]);
+    expect(xuanConfig.xuanMicroPairMaxQty).toBe(15);
+    expect(xuanConfiguredMicroLot(xuanConfig)).toBe(15);
+    expect(xuanConfiguredFreshStagedSeedMinLot(xuanConfig)).toBe(15);
+    expect(xuanConfig.marketBasketMinMergeShares).toBe(15);
+    expect(xuanConfig.marketBasketMergeTargetMaxShares).toBe(45);
+    expect(xuanConfig.maxMatchedAgeBeforeForcedMergeSec).toBe(75);
+  });
+
+  it("caps public-footprint family lots to the configured ladder max", () => {
+    const xuanConfig = buildStrategyConfig(
+      parseEnv({
+        DRY_RUN: "true",
+        POLY_STACK_MODE: "current-prod-v1",
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+        XUAN_BASE_LOT_LADDER: "5,8,12,15",
+        LIVE_SMALL_LOT_LADDER: "5,8,12,15",
+        DEFAULT_LOT: "5",
+      }),
+    );
+
+    const lot = chooseLot(xuanConfig, {
+      marketSlug: "btc-updown-5m-1777464000",
+      dryRunOrSmallLive: false,
+      secsFromOpen: 13,
+      imbalance: 0,
+      bookDepthGood: true,
+      bestAskUp: 0.5,
+      bestAskDown: 0.5,
+      topTwoAskDepthMin: 1000,
+      flatPosition: true,
+      postMergeCount: 0,
+      totalShares: 0,
+      pairCostWithinCap: true,
+      pairCostComfortable: true,
+      inventoryBalanced: true,
+      recentBothSidesFilled: false,
+      marketVolumeHigh: true,
+      pnlTodayPositive: false,
+    });
+
+    expect(lot).toBe(15);
   });
 
   it("does not flag moderate recycle imbalance as a risk reason in aggressive public-footprint mode", () => {

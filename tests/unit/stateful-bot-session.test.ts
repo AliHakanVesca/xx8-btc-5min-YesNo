@@ -8,6 +8,7 @@ import {
   applyRuntimeFlowBudgetConsumption,
   applyRuntimeFlowBudgetLedgerAction,
   applyRuntimeFlowBudgetLineageLedgerAction,
+  clampEntryRepairBuyDecision,
   deriveRuntimeFlowCalibrationBias,
   deriveRuntimeFlowBudgetState,
   deriveArbitrationCarryExpiry,
@@ -500,6 +501,93 @@ describe("stateful bot session helpers", () => {
     expect(applied.state.upShares).toBe(40);
     expect(applied.state.downShares).toBe(40);
     expect(Math.abs(applied.state.upShares - applied.state.downShares)).toBe(0);
+  });
+
+  it("clamps entry repair orders to the traced repair quantity before execution", () => {
+    const market = buildOfflineMarket(1713696000);
+    const clamped = clampEntryRepairBuyDecision({
+      minOrderSize: 5,
+      entryTrace: {
+        repairRequestedQty: 15,
+        repairSize: 15,
+      },
+      entryBuy: {
+        side: "DOWN",
+        size: 71.325,
+        reason: "lagging_rebalance",
+        mode: "HIGH_LOW_COMPLETION_CHASE",
+        expectedAveragePrice: 0.48,
+        effectivePricePerShare: 0.497,
+        order: {
+          tokenId: market.tokens.DOWN.tokenId,
+          side: "BUY",
+          price: 0.48,
+          amount: 34.236,
+          shareTarget: 71.325,
+          orderType: "FAK",
+        },
+      },
+    });
+
+    expect(clamped.clamped).toBe(true);
+    expect(clamped.originalShares).toBe(71.325);
+    expect(clamped.capShares).toBe(15);
+    expect(clamped.entryBuy.size).toBe(15);
+    expect(clamped.entryBuy.order.shareTarget).toBe(15);
+    expect(clamped.entryBuy.order.amount).toBe(7.2);
+  });
+
+  it("applies matched entry repair order results to state immediately", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      price: 0.41,
+      size: 71.325,
+      timestamp: 1713696004,
+      makerTaker: "taker",
+      executionMode: "PAIRGROUP_COVERED_SEED",
+    });
+
+    const applied = applyImmediateOrderResultFill({
+      state,
+      outcome: "DOWN",
+      nowTs: 1713696061,
+      mode: "HIGH_LOW_COMPLETION_CHASE",
+      order: {
+        tokenId: market.tokens.DOWN.tokenId,
+        side: "BUY",
+        price: 0.48,
+        amount: 7.2,
+        shareTarget: 15,
+        orderType: "FAK",
+      },
+      result: {
+        success: true,
+        simulated: false,
+        orderId: "entry-repair-1",
+        status: "matched",
+        requestedAt: 1713696061,
+        raw: {
+          takingAmount: "15",
+          makingAmount: "7.2",
+        },
+      },
+      flowLineage: "entry-repair-flow",
+    });
+
+    expect(applied.fill).toMatchObject({
+      outcome: "DOWN",
+      side: "BUY",
+      size: 15,
+      price: 0.48,
+      executionMode: "HIGH_LOW_COMPLETION_CHASE",
+      flowLineage: "entry-repair-flow",
+    });
+    expect(applied.state.upShares).toBe(71.325);
+    expect(applied.state.downShares).toBe(15);
+    expect(Math.abs(applied.state.upShares - applied.state.downShares)).toBe(56.325);
   });
 
   it("blocks duplicate completion submissions while an accepted result has no immediate fill quantity", () => {

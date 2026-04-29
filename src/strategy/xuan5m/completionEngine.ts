@@ -54,7 +54,7 @@ import {
   strictXuanPairCostTargetCap as sharedStrictXuanPairCostTargetCap,
   xuanPairCostImprovesOrMeetsTarget as sharedXuanPairCostImprovesOrMeetsTarget,
 } from "./xuanStrictPlannedOppositePolicy.js";
-import { xuanFamilyLot } from "./xuanLotFamilyClassifier.js";
+import { xuanConfiguredMicroLot } from "./xuanLotFamilyClassifier.js";
 
 export interface CompletionDecision {
   sideToBuy: OutcomeSide;
@@ -258,7 +258,7 @@ function aggressiveOppositeReleaseHold(args: {
     stagedSeedMode;
   const earlyMicroHighSideStagedSeed =
     !largeStagedBuy &&
-    lastBuy.size >= xuanFamilyLot("MICRO_23") - 1e-9 &&
+    lastBuy.size >= xuanConfiguredMicroLot(args.config) - 1e-9 &&
     lastBuy.size <= 45 + 1e-9 &&
     lastBuySecsFromOpen < 35 &&
     lastBuy.price >= 0.55 - 1e-9 &&

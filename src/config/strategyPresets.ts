@@ -879,6 +879,26 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     : [30, 60, 90, 120, 145];
   const elevatedBehaviorCap = Math.max(config.xuanBehaviorCap, aggressive ? 1.3 : 1.25);
   const maxLadderLot = Math.max(ladder[ladder.length - 1] ?? 145, customAggressiveLadder ? 1 : 145);
+  const customMarketBasketMinMergeShares = customAggressiveLadder
+    ? Math.max(config.mergeMinShares, Math.min(config.marketBasketMinMergeShares, maxLadderLot))
+    : config.marketBasketMinMergeShares;
+  const publicFootprintMergeTargetMaxShares = customAggressiveLadder
+    ? Math.max(
+        customMarketBasketMinMergeShares,
+        Math.min(
+          config.marketBasketMergeTargetMaxShares,
+          maxLadderLot * Math.max(1, config.marketBasketMergeTargetMultiplier),
+        ),
+      )
+    : Math.max(config.marketBasketMergeTargetMaxShares, 900);
+  const publicFootprintForcedMergeAgeSec = customAggressiveLadder
+    ? config.maxMatchedAgeBeforeForcedMergeSec
+    : Math.max(config.maxMatchedAgeBeforeForcedMergeSec, 180);
+  const customSmallLadderMaxLot = customAggressiveLadder && maxLadderLot < 23.4 ? maxLadderLot : undefined;
+  const publicFootprintMicroPairMaxQty =
+    customSmallLadderMaxLot !== undefined
+      ? Math.max(config.xuanMicroPairMaxQty, customSmallLadderMaxLot)
+      : Math.min(Math.max(config.xuanMicroPairMaxQty, 5), ladder[0] ?? 5);
   const controlledRhythmMin = Math.max(1, Math.min(config.xuanRhythmMinWaitSec, config.xuanRhythmBaseWaitSec));
   const controlledRhythmBase = Math.max(config.xuanRhythmBaseWaitSec, controlledRhythmMin);
   const controlledRhythmMax = Math.max(config.xuanRhythmMaxWaitSec, controlledRhythmBase);
@@ -898,7 +918,7 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     xuanTruePassRequiresPairedContinuation: true,
     xuanMicroPairContinuationEnabled: true,
     xuanMicroPairProjectedEffectiveCap: Math.max(config.xuanMicroPairProjectedEffectiveCap, 1.01),
-    xuanMicroPairMaxQty: Math.min(Math.max(config.xuanMicroPairMaxQty, 5), ladder[0] ?? 5),
+    xuanMicroPairMaxQty: publicFootprintMicroPairMaxQty,
     xuanRhythmMinWaitSec: aggressive ? aggressiveRhythmMin : controlledRhythmMin,
     xuanRhythmBaseWaitSec: aggressive ? aggressiveRhythmBase : controlledRhythmBase,
     xuanRhythmMaxWaitSec: aggressive ? aggressiveRhythmMax : controlledRhythmMax,
@@ -982,8 +1002,9 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
       1.01,
     ),
     marketBasketBorderlineAvgCap: Math.max(config.marketBasketBorderlineAvgCap, 1.02),
+    marketBasketMinMergeShares: customMarketBasketMinMergeShares,
     marketBasketMergeTargetMultiplier: Math.max(config.marketBasketMergeTargetMultiplier, 2.5),
-    marketBasketMergeTargetMaxShares: Math.max(config.marketBasketMergeTargetMaxShares, 900),
+    marketBasketMergeTargetMaxShares: publicFootprintMergeTargetMaxShares,
     xuanPairSweepSoftCap: Math.max(config.xuanPairSweepSoftCap, aggressive ? 1.08 : config.xuanPairSweepSoftCap),
     xuanPairSweepHardCap: Math.max(config.xuanPairSweepHardCap, aggressive ? 1.12 : config.xuanPairSweepHardCap),
     xuanMinTimeLeftForSoftSweep: aggressive ? Math.min(config.xuanMinTimeLeftForSoftSweep, 5) : config.xuanMinTimeLeftForSoftSweep,
@@ -1108,7 +1129,7 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     mergeBatchMode: "HYBRID_DELAYED",
     minCompletedCyclesBeforeFirstMerge: config.minCompletedCyclesBeforeFirstMerge,
     minFirstMatchedAgeBeforeMergeSec: config.minFirstMatchedAgeBeforeMergeSec,
-    maxMatchedAgeBeforeForcedMergeSec: Math.max(config.maxMatchedAgeBeforeForcedMergeSec, 180),
+    maxMatchedAgeBeforeForcedMergeSec: publicFootprintForcedMergeAgeSec,
     mergeShieldSecFromOpen: config.mergeShieldSecFromOpen,
     forceMergeInLast30S: true,
     forceMergeOnHardImbalance: true,

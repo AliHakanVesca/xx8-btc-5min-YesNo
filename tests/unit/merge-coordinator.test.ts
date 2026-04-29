@@ -181,6 +181,62 @@ describe("merge coordinator", () => {
     expect(gate.oldestMatchedAgeSec).toBe(76);
   });
 
+  it("forces small explicit aggressive public-footprint baskets once the first family window opens", () => {
+    const config = buildConfig({
+      BOT_MODE: "XUAN",
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+      XUAN_BASE_LOT_LADDER: "5,8,12,15",
+      LIVE_SMALL_LOT_LADDER: "5,8,12,15",
+      MAX_MATCHED_AGE_BEFORE_FORCED_MERGE_SEC: "75",
+    });
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      price: 0.43,
+      size: 15,
+      timestamp: market.startTs + 60,
+      makerTaker: "taker",
+      executionMode: "PAIRGROUP_COVERED_SEED",
+    });
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.47,
+      size: 15,
+      timestamp: market.startTs + 63,
+      makerTaker: "taker",
+      executionMode: "HIGH_LOW_COMPLETION_CHASE",
+    });
+    let tracker = createMergeBatchTracker();
+    tracker = syncMergeBatchTracker(tracker, 15, market.startTs + 63);
+
+    const earlyGate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 159,
+      secsFromOpen: 159,
+      secsToClose: 141,
+      usdcBalance: 100,
+      tracker,
+    });
+    const releasedGate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 160,
+      secsFromOpen: 160,
+      secsToClose: 140,
+      usdcBalance: 100,
+      tracker,
+    });
+
+    expect(config.marketBasketMinMergeShares).toBe(15);
+    expect(config.maxMatchedAgeBeforeForcedMergeSec).toBe(75);
+    expect(earlyGate.allow).toBe(false);
+    expect(earlyGate.reason).toBe("not_ready");
+    expect(releasedGate.allow).toBe(true);
+    expect(releasedGate.forced).toBe(true);
+    expect(releasedGate.reason).toBe("forced_age");
+  });
+
   it("releases a large high-quality matched basket before the generic age target", () => {
     const config = buildConfig({
       MARKET_BASKET_MIN_MERGE_SHARES: "40",

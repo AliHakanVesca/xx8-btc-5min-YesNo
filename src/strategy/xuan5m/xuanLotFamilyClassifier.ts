@@ -31,6 +31,11 @@ export interface XuanLotFamilyDecision {
   reason: string;
 }
 
+type XuanConfiguredLotConfig = Pick<
+  XuanStrategyConfig,
+  "botMode" | "xuanCloneMode" | "xuanCloneIntensity" | "xuanBaseLotLadder" | "liveSmallLotLadder" | "defaultLot"
+>;
+
 const FAMILY_LOTS: Record<XuanLotFamily, number> = {
   MICRO_23: 23.4,
   EARLY_43: 43.4,
@@ -45,6 +50,50 @@ const FAMILY_LOTS: Record<XuanLotFamily, number> = {
 
 export function xuanFamilyLot(family: XuanLotFamily): number {
   return FAMILY_LOTS[family];
+}
+
+export function xuanConfiguredMicroLot(config: XuanConfiguredLotConfig): number {
+  const familyMicroLot = xuanFamilyLot("MICRO_23");
+  if (
+    config.botMode !== "XUAN" ||
+    config.xuanCloneMode !== "PUBLIC_FOOTPRINT" ||
+    config.xuanCloneIntensity !== "AGGRESSIVE"
+  ) {
+    return familyMicroLot;
+  }
+
+  const configuredMaxLot = Math.max(
+    0,
+    ...config.xuanBaseLotLadder,
+    ...config.liveSmallLotLadder,
+    config.defaultLot,
+  );
+  if (configuredMaxLot > 0 && configuredMaxLot < familyMicroLot) {
+    return configuredMaxLot;
+  }
+  return familyMicroLot;
+}
+
+export function xuanConfiguredFreshStagedSeedMinLot(config: XuanConfiguredLotConfig): number {
+  const legacyFreshSeedLot = 40;
+  if (
+    config.botMode !== "XUAN" ||
+    config.xuanCloneMode !== "PUBLIC_FOOTPRINT" ||
+    config.xuanCloneIntensity !== "AGGRESSIVE"
+  ) {
+    return legacyFreshSeedLot;
+  }
+
+  const configuredMaxLot = Math.max(
+    0,
+    ...config.xuanBaseLotLadder,
+    ...config.liveSmallLotLadder,
+    config.defaultLot,
+  );
+  if (configuredMaxLot > 0 && configuredMaxLot < legacyFreshSeedLot) {
+    return configuredMaxLot;
+  }
+  return legacyFreshSeedLot;
 }
 
 export function classifyXuanLotFamily(

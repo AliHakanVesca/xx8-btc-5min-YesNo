@@ -36,7 +36,14 @@ import {
   type FillRecord,
   type XuanMarketState,
 } from "../strategy/xuan5m/marketState.js";
-import { applyFill, applyMerge, averageCost, shrinkOutcomeToObservedShares } from "../strategy/xuan5m/inventoryState.js";
+import {
+  applyFill,
+  applyMerge,
+  averageCost,
+  matchedEffectivePairCost,
+  mergeableShares,
+  shrinkOutcomeToObservedShares,
+} from "../strategy/xuan5m/inventoryState.js";
 import { chooseInventoryAdjustment } from "../strategy/xuan5m/completionEngine.js";
 import {
   createMergeBatchTracker,
@@ -63,7 +70,7 @@ import {
 } from "../analytics/xuanReplayComparator.js";
 import { resolveConfiguredFunderAddress } from "./topology.js";
 import { isClassifiedBuyMode, type StrategyExecutionMode } from "../strategy/xuan5m/executionModes.js";
-import type { EntryBuyDecision } from "../strategy/xuan5m/entryLadderEngine.js";
+import type { EntryBuyDecision, EntryDecisionTrace } from "../strategy/xuan5m/entryLadderEngine.js";
 import {
   buildInventoryActionPlan,
   executeInventoryActionPlan,
@@ -1295,6 +1302,119 @@ function normalizeShares(value: number): number {
   return Number(value.toFixed(6));
 }
 
+function normalizePositiveShares(value: number): number {
+  return Number(Math.max(0, value).toFixed(6));
+}
+
+function normalizePositiveAmount(value: number): number {
+  return Number(Math.max(0, value).toFixed(6));
+}
+
+function completionLikeEntrySubmission(mode: StrategyExecutionMode | undefined): boolean {
+  return runtimeFlowBudgetReleaseActionForFillMode(mode) === "completion_submit";
+}
+
+function runtimeMergeFirstTarget(config: XuanStrategyConfig): number {
+  const baseLot = config.liveSmallLotLadder[0] ?? config.defaultLot;
+  if (config.botMode === "XUAN" && config.xuanCloneMode === "PUBLIC_FOOTPRINT") {
+    return normalizePositiveShares(
+      Math.max(
+        config.marketBasketMinMergeShares,
+        Math.min(
+          config.marketBasketMergeTargetMaxShares,
+          baseLot * Math.max(1, config.marketBasketMergeTargetMultiplier),
+        ),
+      ),
+    );
+  }
+  return config.mergeMinShares;
+}
+
+function shouldHoldRuntimeEntryForMergeFirstAfterCompletion(
+  config: XuanStrategyConfig,
+  state: XuanMarketState,
+  nowTs: number,
+): boolean {
+  if (config.botMode !== "XUAN" || config.mergeMode !== "AUTO") {
+    return false;
+  }
+  const lastBuy = [...state.fillHistory].reverse().find((fill) => fill.side === "BUY");
+  if (!lastBuy || runtimeFlowBudgetReleaseActionForFillMode(lastBuy.executionMode) !== "completion_submit") {
+    return false;
+  }
+  const mergeFirstTarget = runtimeMergeFirstTarget(config);
+  if (mergeableShares(state) < mergeFirstTarget - 1e-9) {
+    return false;
+  }
+  const flatDust = Math.max(config.postMergeFlatDustShares, state.market.minOrderSize * 0.01, 1e-6);
+  if (Math.abs(state.upShares - state.downShares) > flatDust + 1e-9) {
+    return false;
+  }
+  const lastBuyAgeSec = Math.max(0, nowTs - lastBuy.timestamp);
+  const smallExplicitMergeTarget = mergeFirstTarget <= Math.max(20, state.market.minOrderSize * 4);
+  const immediateCompletionLockSec = Math.max(3, Math.ceil(config.reentryDelayMs / 1000) + 1);
+  if (!smallExplicitMergeTarget && lastBuyAgeSec > immediateCompletionLockSec + 1e-9) {
+    return false;
+  }
+  return matchedEffectivePairCost(state, config.cryptoTakerFeeRate) <= config.marketBasketMergeEffectivePairCap + 1e-9;
+}
+
+function repairTraceQuantityCap(
+  entryTrace: Pick<EntryDecisionTrace, "repairFinalQty" | "repairSize" | "repairRequestedQty">,
+): number | undefined {
+  for (const value of [entryTrace.repairFinalQty, entryTrace.repairSize, entryTrace.repairRequestedQty]) {
+    if (value !== undefined && Number.isFinite(value) && value > 0) {
+      return normalizePositiveShares(value);
+    }
+  }
+  return undefined;
+}
+
+function resizeMarketBuyOrderShareTarget(order: MarketOrderArgs, shareTarget: number): MarketOrderArgs {
+  const normalizedShareTarget = normalizePositiveShares(shareTarget);
+  const price = order.price;
+  const amount =
+    price !== undefined && Number.isFinite(price) && price > 0
+      ? normalizePositiveAmount(normalizedShareTarget * price)
+      : order.shareTarget !== undefined && order.shareTarget > 0
+        ? normalizePositiveAmount(order.amount * (normalizedShareTarget / order.shareTarget))
+        : order.amount;
+  return {
+    ...order,
+    shareTarget: normalizedShareTarget,
+    amount,
+  };
+}
+
+export function clampEntryRepairBuyDecision(args: {
+  entryBuy: EntryBuyDecision;
+  entryTrace: Pick<EntryDecisionTrace, "repairFinalQty" | "repairSize" | "repairRequestedQty">;
+  minOrderSize: number;
+}): { entryBuy: EntryBuyDecision; clamped: boolean; capShares?: number | undefined; originalShares?: number | undefined } {
+  if (!completionLikeEntrySubmission(args.entryBuy.mode)) {
+    return { entryBuy: args.entryBuy, clamped: false };
+  }
+  const capShares = repairTraceQuantityCap(args.entryTrace);
+  if (capShares === undefined || capShares + 1e-9 < args.minOrderSize) {
+    return { entryBuy: args.entryBuy, clamped: false };
+  }
+  const originalShares = args.entryBuy.order.shareTarget ?? args.entryBuy.size;
+  if (!Number.isFinite(originalShares) || originalShares <= capShares + 1e-9) {
+    return { entryBuy: args.entryBuy, clamped: false, capShares, originalShares };
+  }
+
+  return {
+    entryBuy: {
+      ...args.entryBuy,
+      size: normalizePositiveShares(Math.min(args.entryBuy.size, capShares)),
+      order: resizeMarketBuyOrderShareTarget(args.entryBuy.order, capShares),
+    },
+    clamped: true,
+    capShares,
+    originalShares: normalizePositiveShares(originalShares),
+  };
+}
+
 function isProtectedResidualSeedMode(
   mode: StrategyExecutionMode | undefined,
 ): mode is Extract<StrategyExecutionMode, "TEMPORAL_SINGLE_LEG_SEED" | "PAIRGROUP_COVERED_SEED"> {
@@ -2505,6 +2625,7 @@ export async function runStatefulBotSession(
   const events: Array<Record<string, unknown>> = [];
   let pendingPairExecution: PendingPairExecution | undefined;
   let pendingCompletionSubmission: PendingCompletionSubmission | undefined;
+  let pendingEntryRepairSubmission: PendingCompletionSubmission | undefined;
   let partialOpenGroupLock: PartialOpenGroupLock | undefined;
   let runtimeProtectedResidualLock: RuntimeProtectedResidualLock | undefined;
   let arbitrationCarry: ArbitrationCarry | undefined;
@@ -3236,6 +3357,14 @@ export async function runStatefulBotSession(
     const fillOldGap = Math.abs(state.upShares - state.downShares);
     state = applyFill(state, normalizedFill);
     const fillNewGap = Math.abs(state.upShares - state.downShares);
+    if (normalizedFill.side === "BUY") {
+      if (pendingCompletionSubmission?.side === normalizedFill.outcome) {
+        pendingCompletionSubmission = undefined;
+      }
+      if (pendingEntryRepairSubmission?.side === normalizedFill.outcome) {
+        pendingEntryRepairSubmission = undefined;
+      }
+    }
     const fillReleaseAction = runtimeFlowBudgetReleaseActionForFillMode(normalizedFill.executionMode);
     if (fillReleaseAction) {
       applyRuntimeFlowBudgetAction(fillReleaseAction, {
@@ -3500,6 +3629,9 @@ export async function runStatefulBotSession(
     }
     if (pendingCompletionSubmission && args.nowTs >= pendingCompletionSubmission.submittedAt) {
       pendingCompletionSubmission = undefined;
+    }
+    if (pendingEntryRepairSubmission && args.nowTs >= pendingEntryRepairSubmission.submittedAt) {
+      pendingEntryRepairSubmission = undefined;
     }
   };
 
@@ -4605,7 +4737,24 @@ export async function runStatefulBotSession(
         decision.entryBuys.length > 0 &&
         decision.trace.entry.overlapRepairOutcome === "overlap_seed";
       if (sameWindowCompletionFirst) {
-        await submitDecisionCompletion("same_window_completion_first");
+        const completionAccepted = await submitDecisionCompletion("same_window_completion_first");
+        if (
+          completionAccepted &&
+          decision.entryBuys.length > 0 &&
+          shouldHoldRuntimeEntryForMergeFirstAfterCompletion(config, state, nowTs)
+        ) {
+          await traceLogger.write("orders", {
+            eventType: "entry_submit_blocked",
+            selectedMode: decision.entryBuys[0]?.mode ?? null,
+            side: decision.entryBuys[0]?.side ?? null,
+            requestedSize: decision.entryBuys[0]?.size ?? null,
+            reason: "xuan_merge_first_after_completion",
+            mergeableShares: mergeableShares(state),
+            basketEffectivePair: matchedEffectivePairCost(state, config.cryptoTakerFeeRate),
+          });
+          await waitForDecisionPulse();
+          continue;
+        }
       }
 
       if (decision.entryBuys.length > 0) {
@@ -4914,9 +5063,52 @@ export async function runStatefulBotSession(
             activePairSubmission = undefined;
           }
         } else {
-          const entryBuy = decision.entryBuys[0];
-          if (!entryBuy) {
+          const rawEntryBuy = decision.entryBuys[0];
+          if (!rawEntryBuy) {
             throw new Error("Expected a single entry buy decision.");
+          }
+          if (pendingEntryRepairSubmission && nowTs > pendingEntryRepairSubmission.expiresAt) {
+            pendingEntryRepairSubmission = undefined;
+          }
+          const clampedEntryRepair = clampEntryRepairBuyDecision({
+            entryBuy: rawEntryBuy,
+            entryTrace: decision.trace.entry,
+            minOrderSize: state.market.minOrderSize,
+          });
+          const entryBuy = clampedEntryRepair.entryBuy;
+          if (clampedEntryRepair.clamped) {
+            await traceLogger.write("orders", {
+              eventType: "entry_submit_clamped",
+              selectedMode: rawEntryBuy.mode,
+              side: rawEntryBuy.side,
+              requestedSize: rawEntryBuy.size,
+              originalShareTarget: clampedEntryRepair.originalShares ?? rawEntryBuy.order.shareTarget ?? null,
+              capShares: clampedEntryRepair.capShares ?? null,
+              finalShareTarget: entryBuy.order.shareTarget ?? entryBuy.size,
+              reason: "repair_trace_quantity_cap",
+            });
+          }
+          if (
+            completionLikeEntrySubmission(entryBuy.mode) &&
+            shouldBlockCompletionForPendingSubmission({
+              pending: pendingEntryRepairSubmission,
+              side: entryBuy.side,
+              nowTs,
+            })
+          ) {
+            await traceLogger.write("orders", {
+              eventType: "entry_submit_blocked",
+              selectedMode: entryBuy.mode,
+              side: entryBuy.side,
+              requestedSize: entryBuy.size,
+              reason: "pending_entry_repair_order_result",
+              pendingOrderId: pendingEntryRepairSubmission?.orderId ?? null,
+              pendingRequestedShares: pendingEntryRepairSubmission?.requestedShares ?? null,
+              pendingSubmittedAt: pendingEntryRepairSubmission?.submittedAt ?? null,
+              pendingExpiresAt: pendingEntryRepairSubmission?.expiresAt ?? null,
+            });
+            await waitForDecisionPulse();
+            continue;
           }
           const temporalSeedGroup =
             (entryBuy.mode === "TEMPORAL_SINGLE_LEG_SEED" || entryBuy.mode === "PAIRGROUP_COVERED_SEED")
@@ -4953,12 +5145,12 @@ export async function runStatefulBotSession(
                   preferredChildShares: config.cloneChildPreferredShares,
                 })
               : [groupedSingleOrder];
-            const liveOrders = assignSequentialUsdcBalances(
-              plannedOrders,
-              cachedUsdcBalance,
-              config,
-              state.market.minOrderSize,
-            );
+          const liveOrders = assignSequentialUsdcBalances(
+            plannedOrders,
+            cachedUsdcBalance,
+            config,
+            state.market.minOrderSize,
+          );
           if (temporalSeedGroup) {
             stateStore.upsertPairGroup(temporalSeedGroup);
             activePairSubmission = {
@@ -4968,45 +5160,45 @@ export async function runStatefulBotSession(
                 {
                   outcome: entryBuy.side,
                   price: liveOrders[0]?.price,
-                    expectedShares: sumOrderShareTargets(liveOrders) ?? 0,
+                  expectedShares: sumOrderShareTargets(liveOrders) ?? 0,
                   mode: entryBuy.mode,
                 },
               ],
             };
           }
-            const executions =
-              liveOrders.length > 0
-                ? await executeMarketOrdersInSequence(
-                    completionManager,
-                    liveOrders,
-                    config.cloneChildOrderDelayMs,
-                  )
-                : [
-                    {
-                      order: { ...entryBuy.order, amount: 0, shareTarget: 0 },
-                      result: skippedOrderResult("skipped_insufficient_balance", "entry_order_not_affordable"),
-                    },
-                  ];
-            updateCachedUsdcBalanceAfterExecutions(executions);
-            const representativeExecution = selectRepresentativeExecution(executions);
-            const result = representativeExecution.result;
-            const accepted = executions.some((execution) => isOrderResultAccepted(execution.result));
-            const submittedEntryShares = sumOrderShareTargets(liveOrders) ?? 0;
-	          if (liveOrders.length > 0) {
-	            rememberSubmittedPrices(
-	              submittedPrices,
-	              market,
-	              executions.map(({ order, result: executionResult }) => ({
-	                ...order,
-	                side: order.side,
-	                mode: entryBuy.mode,
-	                groupId: temporalSeedGroup?.groupId,
-	                orderId: executionResult.orderId,
-	                expectedShares: expectedSharesForSubmission(order.shareTarget, executionResult),
-	              })),
-	              submittedAtTs,
-	            );
-	          }
+          const executions =
+            liveOrders.length > 0
+              ? await executeMarketOrdersInSequence(
+                  completionManager,
+                  liveOrders,
+                  config.cloneChildOrderDelayMs,
+                )
+              : [
+                  {
+                    order: { ...entryBuy.order, amount: 0, shareTarget: 0 },
+                    result: skippedOrderResult("skipped_insufficient_balance", "entry_order_not_affordable"),
+                  },
+                ];
+          updateCachedUsdcBalanceAfterExecutions(executions);
+          const representativeExecution = selectRepresentativeExecution(executions);
+          const result = representativeExecution.result;
+          const accepted = executions.some((execution) => isOrderResultAccepted(execution.result));
+          const submittedEntryShares = sumOrderShareTargets(liveOrders) ?? 0;
+          if (liveOrders.length > 0) {
+            rememberSubmittedPrices(
+              submittedPrices,
+              market,
+              executions.map(({ order, result: executionResult }) => ({
+                ...order,
+                side: order.side,
+                mode: entryBuy.mode,
+                groupId: temporalSeedGroup?.groupId,
+                orderId: executionResult.orderId,
+                expectedShares: expectedSharesForSubmission(order.shareTarget, executionResult),
+              })),
+              submittedAtTs,
+            );
+          }
           if (temporalSeedGroup) {
             pendingPairExecution = {
               group: temporalSeedGroup,
@@ -5019,15 +5211,90 @@ export async function runStatefulBotSession(
               reconciledAfterSubmit: false,
             };
           }
-            if (accepted && !temporalSeedGroup) {
-              applyRuntimeFlowBudgetAction("seed_submit", {
-                quantityShares: submittedEntryShares,
-                lineage: currentRuntimeFlowLineage(entryBuy.side),
+          if (accepted && !temporalSeedGroup) {
+            applyRuntimeFlowBudgetAction("seed_submit", {
+              quantityShares: submittedEntryShares,
+              lineage: currentRuntimeFlowLineage(entryBuy.side),
+            });
+            let sawImmediateEntryFill = false;
+            for (const execution of executions) {
+              const immediateEntry = applyImmediateOrderResultFill({
+                state,
+                result: execution.result,
+                order: execution.order,
+                outcome: entryBuy.side,
+                nowTs,
+                mode: entryBuy.mode,
+                flowLineage:
+                  currentRuntimeFlowLineage(entryBuy.side) ??
+                  deriveCarryFlowLineageKey({
+                    recommendation: arbitrationCarry?.recommendation,
+                    preferredSeedSide: arbitrationCarry?.preferredSeedSide,
+                    protectedResidualSide:
+                      arbitrationCarry?.protectedResidualSide ??
+                      (partialOpenGroupLock ?? runtimeProtectedResidualLock)?.protectedSide,
+                  }),
               });
+              state = immediateEntry.state;
+              if (!immediateEntry.fill) {
+                continue;
+              }
+              sawImmediateEntryFill = true;
+              pendingEntryRepairSubmission = undefined;
+              stateStore.recordFill(state, immediateEntry.fill, {
+                orderId: execution.result.orderId,
+                executionMode: entryBuy.mode,
+                source: "ORDER_RESULT",
+              });
+              rememberBotOwnedBuyFill(immediateEntry.fill, {
+                orderId: execution.result.orderId,
+              });
+              runtimeProtectedResidualLock =
+                partialOpenGroupLock !== undefined
+                  ? undefined
+                  : refreshRuntimeProtectedResidualLock({
+                      lock: runtimeProtectedResidualLock,
+                      state,
+                      nowTs,
+                      mode: entryBuy.mode,
+                    });
+              consumeSubmittedIntent(submittedPrices, immediateEntry.fill.outcome, immediateEntry.fill.size);
+              rememberOrderResultFillSuppression(immediateEntry.fill);
+              pushEvent(events, {
+                timestamp: nowTs,
+                type: "order_result_fill",
+                phase: "entry",
+                outcome: immediateEntry.fill.outcome,
+                size: immediateEntry.fill.size,
+                price: immediateEntry.fill.price,
+                orderId: execution.result.orderId ?? null,
+              });
+              await traceLogger.write("user_fills", {
+                eventType: "order_result_fill",
+                phase: "entry",
+                outcome: immediateEntry.fill.outcome,
+                side: immediateEntry.fill.side,
+                size: immediateEntry.fill.size,
+                price: immediateEntry.fill.price,
+                executionMode: entryBuy.mode,
+                orderId: execution.result.orderId ?? null,
+                source: "ORDER_RESULT",
+                correlationId: execution.result.orderId,
+              });
+            }
+            if (!sawImmediateEntryFill && completionLikeEntrySubmission(entryBuy.mode)) {
+              pendingEntryRepairSubmission = createPendingCompletionSubmission({
+                result,
+                side: entryBuy.side,
+                requestedShares: submittedEntryShares,
+                nowTs,
+                maxAgeSec: submittedIntentMaxAgeSec,
+              });
+            }
             state = reserveNegativeEdgeBudget(state, entryBuy.negativeEdgeUsdc ?? 0, "pair");
             persistDailyBudget(state);
             state = updateSeedSubmissionState(state, entryBuy.mode, entryBuy.side);
-            persistMarketState();
+            persistMarketState(sawImmediateEntryFill ? "order_result_fill" : undefined);
           } else if (!accepted) {
             await logRejectedOrder({
               traceLogger,

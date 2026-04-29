@@ -117,6 +117,15 @@ function normalize(value: number): number {
   return Number(value.toFixed(6));
 }
 
+function isUsableFillOrderId(orderId: string | undefined): orderId is string {
+  return Boolean(
+    orderId &&
+      orderId !== "unknown-order-id" &&
+      orderId !== "rate-limited" &&
+      orderId !== "skipped-order",
+  );
+}
+
 function normalizeFeeRate(rawFeeRate: number): number {
   if (!Number.isFinite(rawFeeRate) || rawFeeRate < 0) {
     return 0.072;
@@ -495,8 +504,43 @@ export class PersistentStateStore {
       .run(payload);
   }
 
-  recordFill(state: XuanMarketState, fill: FillRecord, context: PersistentFillContext): void {
+  recordFill(state: XuanMarketState, fill: FillRecord, context: PersistentFillContext): boolean {
     if (fill.side === "BUY") {
+      const qtyOriginal = normalize(fill.size);
+      if (isUsableFillOrderId(context.orderId)) {
+        const qtyTolerance = Math.max(1e-6, Math.abs(qtyOriginal) * 0.001);
+        const priceTolerance = 0.005;
+        const timestampToleranceSec = 3;
+        const existing = this.db
+          .prepare(`
+            SELECT lot_id
+            FROM inventory_lots
+            WHERE market_slug = @marketSlug
+              AND condition_id = @conditionId
+              AND outcome = @outcome
+              AND side = 'BUY'
+              AND order_id = @orderId
+              AND ABS(qty_original - @qtyOriginal) <= @qtyTolerance
+              AND ABS(price - @price) <= @priceTolerance
+              AND ABS(timestamp - @timestamp) <= @timestampToleranceSec
+            LIMIT 1
+          `)
+          .get({
+            marketSlug: state.market.slug,
+            conditionId: state.market.conditionId,
+            outcome: fill.outcome,
+            orderId: context.orderId,
+            qtyOriginal,
+            price: fill.price,
+            timestamp: fill.timestamp,
+            qtyTolerance,
+            priceTolerance,
+            timestampToleranceSec,
+          }) as { lot_id: string } | undefined;
+        if (existing) {
+          return false;
+        }
+      }
       const feePerShare = takerFeePerShare(fill.price, normalizeFeeRate(state.market.feeRate));
       this.db
         .prepare(`
@@ -515,8 +559,8 @@ export class PersistentStateStore {
           conditionId: state.market.conditionId,
           outcome: fill.outcome,
           side: fill.side,
-          qtyOriginal: normalize(fill.size),
-          qtyOpen: normalize(fill.size),
+          qtyOriginal,
+          qtyOpen: qtyOriginal,
           price: fill.price,
           effectivePrice: normalize(fill.price + feePerShare),
           feeUsdc: normalize(fill.size * feePerShare),
@@ -527,13 +571,14 @@ export class PersistentStateStore {
           source: context.source,
           timestamp: fill.timestamp,
         });
-      return;
+      return true;
     }
 
     const consumed = this.consumeLots(state.market.slug, fill.outcome, fill.size, fill.timestamp, "sell");
     if (consumed.consumedQty <= 1e-6) {
-      return;
+      return false;
     }
+    return true;
   }
 
   shrinkOpenLotsToObservedShares(
@@ -1447,9 +1492,9 @@ export class PersistentStateStore {
   loadPairGroupFillSnapshot(groupId: string): { upBoughtQty: number; downBoughtQty: number } {
     const rows = this.db
       .prepare(`
-        SELECT outcome, COALESCE(SUM(qty_original), 0) AS bought_qty
+        SELECT outcome, COALESCE(SUM(qty_open), 0) AS bought_qty
         FROM inventory_lots
-        WHERE group_id = ? AND side = 'BUY'
+        WHERE group_id = ? AND side = 'BUY' AND qty_open > 1e-6
         GROUP BY outcome
       `)
       .all(groupId) as Array<{ outcome: OutcomeSide; bought_qty: number }>;

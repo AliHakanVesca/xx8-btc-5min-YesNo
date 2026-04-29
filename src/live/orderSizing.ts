@@ -1,12 +1,14 @@
 import type { MarketOrderArgs, OrderResult } from "../infra/clob/types.js";
 
 const DEFAULT_FEE_CUSHION_RATIO = 0.04;
+const DEFAULT_MIN_MARKET_BUY_AMOUNT = 1;
 const USDC_DECIMALS = 6;
 const EPSILON = 1e-9;
 
 export interface AffordableBuyOrderOptions {
   usdcBalance?: number | undefined;
   minOrderSize: number;
+  minMarketBuyAmount?: number | undefined;
   sizeLadder?: number[] | undefined;
   feeCushionRatio?: number | undefined;
 }
@@ -22,6 +24,7 @@ export interface AffordableBuyOrderResult {
     | "not_buy"
     | "no_balance_cap"
     | "missing_price_or_shares"
+    | "below_min_market_buy_amount"
     | "fits_balance"
     | "downshifted_to_affordable_ladder"
     | "insufficient_balance";
@@ -85,6 +88,7 @@ export function fitBuyOrderToUsdcBalance(
   }
 
   const usdcBalance = options.usdcBalance;
+  const minMarketBuyAmount = Math.max(0, options.minMarketBuyAmount ?? DEFAULT_MIN_MARKET_BUY_AMOUNT);
   if (usdcBalance === undefined || !Number.isFinite(usdcBalance) || usdcBalance <= 0) {
     return {
       order,
@@ -104,6 +108,13 @@ export function fitBuyOrderToUsdcBalance(
     !Number.isFinite(requestedShares) ||
     requestedShares <= 0
   ) {
+    if (order.amount + EPSILON < minMarketBuyAmount) {
+      return {
+        adjusted: false,
+        skipped: true,
+        reason: "below_min_market_buy_amount",
+      };
+    }
     const fitsAmount = orderCostWithCushion(order.amount, options.feeCushionRatio ?? DEFAULT_FEE_CUSHION_RATIO) <= usdcBalance + EPSILON;
     return fitsAmount
       ? {
@@ -116,7 +127,16 @@ export function fitBuyOrderToUsdcBalance(
           adjusted: false,
           skipped: true,
           reason: "missing_price_or_shares",
-        };
+      };
+  }
+
+  if (order.amount + EPSILON < minMarketBuyAmount) {
+    return {
+      ...(requestedShares !== undefined ? { requestedShares: normalizeShares(requestedShares) } : {}),
+      adjusted: false,
+      skipped: true,
+      reason: "below_min_market_buy_amount",
+    };
   }
 
   const feeCushionRatio = options.feeCushionRatio ?? DEFAULT_FEE_CUSHION_RATIO;

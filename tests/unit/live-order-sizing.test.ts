@@ -46,6 +46,25 @@ describe("live order sizing", () => {
     expect(result.reason).toBe("insufficient_balance");
   });
 
+  it("skips marketable BUY orders below the CLOB one-dollar notional floor", () => {
+    const result = fitBuyOrderToUsdcBalance(
+      buyOrder({
+        price: 0.15,
+        amount: 0.085394,
+        shareTarget: 0.569292,
+      }),
+      {
+        usdcBalance: 10,
+        minOrderSize: 0.01,
+        sizeLadder: [15, 12, 8, 5],
+      },
+    );
+
+    expect(result.skipped).toBe(true);
+    expect(result.order).toBeUndefined();
+    expect(result.reason).toBe("below_min_market_buy_amount");
+  });
+
   it("debits accepted buys with the same fee cushion used for affordability", () => {
     expect(debitBuyOrderFromUsdcBalance(20.46254, buyOrder({ amount: 17.4, shareTarget: 30 }))).toBe(2.36654);
   });

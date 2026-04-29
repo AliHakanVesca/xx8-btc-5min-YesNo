@@ -9,13 +9,20 @@ import {
   applyRuntimeFlowBudgetLedgerAction,
   applyRuntimeFlowBudgetLineageLedgerAction,
   clampEntryRepairBuyDecision,
+  botFillAccountingKey,
   deriveRuntimeFlowCalibrationBias,
   deriveRuntimeFlowBudgetState,
   deriveArbitrationCarryExpiry,
   deriveCarryFlowConfidence,
+  detectOrderResultShareOverfill,
+  expectedSharesForSubmission,
   deriveConfirmedCarryAlignmentStreak,
   applyImmediateOrderResultFill,
+  BOT_OWNED_SETTLEMENT_GRACE_SEC,
+  computeRecentBotOwnedSettlementLockedShares,
   createPendingCompletionSubmission,
+  evaluateSessionEndMergeDecision,
+  findRecentBotOwnedFillForShortfall,
   restorePersistedArbitrationCarry,
   refreshRuntimeProtectedResidualLock,
   inferImmediateOrderResultFill,
@@ -24,6 +31,8 @@ import {
   resolveSessionTradingDeadline,
   runtimeFlowBudgetReleaseQuantityForResidualChange,
   shouldBlockCompletionForPendingSubmission,
+  shouldAllowControlledOverlap,
+  shouldRegisterSubmittedIntentForResult,
   shouldPreserveCarryDrivenOverlap,
 } from "../../src/live/statefulBotSession.js";
 
@@ -60,6 +69,139 @@ describe("stateful bot session helpers", () => {
         durationSec: 60,
       }),
     ).toBe(1160);
+  });
+
+  it("does not session-end safety merge before market close even for a balanced low-cost pair", () => {
+    const config = buildConfig({
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+      LIVE_SMALL_LOT_LADDER: "5,8,12,15",
+      XUAN_BASE_LOT_LADDER: "5,8,12,15",
+      MARKET_BASKET_MIN_MERGE_SHARES: "15",
+      MARKET_BASKET_MERGE_TARGET_MAX_SHARES: "45",
+      POST_MERGE_ONLY_COMPLETION: "false",
+    });
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.34,
+      size: 15,
+      timestamp: market.startTs + 5,
+      makerTaker: "taker",
+      executionMode: "PAIRGROUP_COVERED_SEED",
+    });
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      price: 0.33,
+      size: 15,
+      timestamp: market.startTs + 20,
+      makerTaker: "taker",
+      executionMode: "HIGH_LOW_COMPLETION_CHASE",
+    });
+
+    const decision = evaluateSessionEndMergeDecision({
+      config,
+      state,
+      endedAt: market.startTs + 159,
+      pendingPairExecutionActive: false,
+      mergeTxCount: 0,
+    });
+
+    expect(decision).toMatchObject({
+      allow: false,
+      trigger: "session_end_safety_merge",
+      reason: "session_end_before_market_close",
+      amount: 14.99,
+      mergeable: 15,
+    });
+    expect(decision.basketEffectivePair).toBeCloseTo(0.702076, 6);
+  });
+
+  it("allows a market-close merge for a balanced low-cost pair", () => {
+    const config = buildConfig({
+      LIVE_SMALL_LOT_LADDER: "5,8,12,15",
+      XUAN_BASE_LOT_LADDER: "5,8,12,15",
+      MARKET_BASKET_MIN_MERGE_SHARES: "15",
+      MARKET_BASKET_MERGE_TARGET_MAX_SHARES: "45",
+    });
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.34,
+      size: 15,
+      timestamp: market.startTs + 5,
+      makerTaker: "taker",
+      executionMode: "PAIRGROUP_COVERED_SEED",
+    });
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      price: 0.33,
+      size: 15,
+      timestamp: market.startTs + 20,
+      makerTaker: "taker",
+      executionMode: "HIGH_LOW_COMPLETION_CHASE",
+    });
+
+    const decision = evaluateSessionEndMergeDecision({
+      config,
+      state,
+      endedAt: market.endTs,
+      pendingPairExecutionActive: false,
+      mergeTxCount: 0,
+    });
+
+    expect(decision).toMatchObject({
+      allow: true,
+      trigger: "market_close",
+      reason: "market_close",
+      amount: 14.99,
+      mergeable: 15,
+    });
+  });
+
+  it("does not safety-merge an imbalanced pair when the session ends early", () => {
+    const config = buildConfig({
+      LIVE_SMALL_LOT_LADDER: "5,8,12,15",
+      XUAN_BASE_LOT_LADDER: "5,8,12,15",
+      MARKET_BASKET_MIN_MERGE_SHARES: "15",
+    });
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.34,
+      size: 15,
+      timestamp: market.startTs + 5,
+      makerTaker: "taker",
+      executionMode: "PAIRGROUP_COVERED_SEED",
+    });
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      price: 0.33,
+      size: 10,
+      timestamp: market.startTs + 20,
+      makerTaker: "taker",
+      executionMode: "HIGH_LOW_COMPLETION_CHASE",
+    });
+
+    const decision = evaluateSessionEndMergeDecision({
+      config,
+      state,
+      endedAt: market.startTs + 159,
+      pendingPairExecutionActive: false,
+      mergeTxCount: 0,
+    });
+
+    expect(decision.allow).toBe(false);
+    expect(decision.reason).toBe("session_end_before_market_close");
   });
 
   it("derives a shared runtime flow-budget state from carry, quality, density, and pressure", () => {
@@ -450,6 +592,88 @@ describe("stateful bot session helpers", () => {
     });
   });
 
+  it("keeps submitted intent capped to shareTarget and reports order-result overfill separately", () => {
+    const market = buildOfflineMarket(1713696000);
+    const order = {
+      tokenId: market.tokens.UP.tokenId,
+      side: "BUY" as const,
+      price: 0.5,
+      amount: 7.5,
+      shareTarget: 15,
+      orderType: "FAK" as const,
+    };
+    const result = {
+      success: true,
+      simulated: false,
+      orderId: "overfill-order-1",
+      status: "matched",
+      requestedAt: 1713696015,
+      raw: {
+        takingAmount: "17.857141",
+        makingAmount: "7.499999",
+      },
+    };
+
+    const fill = inferImmediateOrderResultFill({
+      outcome: "UP",
+      nowTs: 1713696015,
+      mode: "PAIRGROUP_COVERED_SEED",
+      order,
+      result,
+    });
+
+    expect(expectedSharesForSubmission(order.shareTarget, result)).toBe(15);
+    expect(fill).toMatchObject({
+      outcome: "UP",
+      side: "BUY",
+      price: 0.42,
+      size: 17.857141,
+    });
+    expect(
+      detectOrderResultShareOverfill({
+        order,
+        fill: fill!,
+        orderId: "overfill-order-1",
+        groupId: "pair-1",
+      }),
+    ).toEqual({
+      orderId: "overfill-order-1",
+      groupId: "pair-1",
+      outcome: "UP",
+      shareTarget: 15,
+      filledShares: 17.857141,
+      excessShares: 2.857141,
+    });
+    expect(botFillAccountingKey(fill!, { orderId: "overfill-order-1" })).toBe(
+      "order:overfill-order-1:UP:BUY:17.857141:0.42:1713696015",
+    );
+  });
+
+  it("does not register submitted fill intents for rejected child orders", () => {
+    expect(
+      shouldRegisterSubmittedIntentForResult({
+        success: false,
+        simulated: false,
+        orderId: "rejected-child",
+        status: "400",
+        requestedAt: 1713696015,
+        raw: {
+          error: "no match",
+        },
+      }),
+    ).toBe(false);
+    expect(
+      shouldRegisterSubmittedIntentForResult({
+        success: true,
+        simulated: false,
+        orderId: "accepted-child",
+        status: "accepted",
+        requestedAt: 1713696015,
+        raw: {},
+      }),
+    ).toBe(true);
+  });
+
   it("applies matched completion order results to state immediately", () => {
     const market = buildOfflineMarket(1713696000);
     let state = createMarketState(market);
@@ -701,6 +925,72 @@ describe("stateful bot session helpers", () => {
     expect(reconciled.state.upCost).toBeCloseTo(2.10125, 8);
   });
 
+  it("keeps recent bot-owned order-result fills locked during settlement lag", () => {
+    const fills = [
+      {
+        outcome: "UP" as const,
+        size: 15,
+        price: 0.38,
+        timestamp: 1777491010,
+        expiresAt: 1777491030,
+        orderId: "up-1",
+      },
+      {
+        outcome: "UP" as const,
+        size: 15,
+        price: 0.26,
+        timestamp: 1777491016,
+        expiresAt: 1777491036,
+        orderId: "up-2",
+      },
+      {
+        outcome: "DOWN" as const,
+        size: 15,
+        price: 0.63,
+        timestamp: 1777491004,
+        expiresAt: 1777491024,
+        orderId: "down-1",
+      },
+    ];
+
+    expect(
+      findRecentBotOwnedFillForShortfall(fills, {
+        outcome: "DOWN",
+        fromShares: 15,
+        toShares: 0,
+        nowTs: 1777491010,
+      }),
+    ).toMatchObject({ orderId: "down-1" });
+    expect(
+      findRecentBotOwnedFillForShortfall(fills, {
+        outcome: "UP",
+        fromShares: 30,
+        toShares: 4.9036,
+        nowTs: 1777491019,
+      }),
+    ).toMatchObject({ orderId: "up-2" });
+    expect(
+      findRecentBotOwnedFillForShortfall(fills, {
+        outcome: "UP",
+        fromShares: 30,
+        toShares: 0,
+        nowTs: 1777491019,
+      }),
+    ).toMatchObject({ orderId: "up-2" });
+    expect(computeRecentBotOwnedSettlementLockedShares(fills, 1777491019)).toEqual({
+      up: 30,
+      down: 15,
+    });
+    expect(
+      findRecentBotOwnedFillForShortfall(fills, {
+        outcome: "UP",
+        fromShares: 30,
+        toShares: 0,
+        nowTs: 1777491016 + BOT_OWNED_SETTLEMENT_GRACE_SEC + 1,
+      }),
+    ).toBeUndefined();
+  });
+
   it("shrinks a bot-owned order-result fill to the settled on-chain share quantity without adding a duplicate buy", () => {
     const market = buildOfflineMarket(1713696000);
     let state = createMarketState(market);
@@ -873,6 +1163,54 @@ describe("stateful bot session helpers", () => {
 
     expect(withoutCarry).toBe(false);
     expect(withCarry).toBe(true);
+  });
+
+  it("blocks controlled overlap when the protected residual is below actionable repair size", () => {
+    const market = buildOfflineMarket(1713696000);
+    const config = buildConfig({
+      REQUIRE_MATCHED_INVENTORY_BEFORE_SECOND_GROUP: "false",
+      MAX_OPEN_GROUPS_PER_MARKET: "3",
+      MAX_OPEN_PARTIAL_GROUPS: "2",
+      REPAIR_MIN_QTY: "5",
+      COMPLETION_MIN_QTY: "5",
+      LIVE_SMALL_LOT_LADDER: "5,8,12,15",
+    });
+
+    const entryBuys = (["UP", "DOWN"] as const).map((side) => ({
+      side,
+      size: 5,
+      reason: "balanced_pair_reentry" as const,
+      mode: "PAIRGROUP_COVERED_SEED" as const,
+      expectedAveragePrice: 0.5,
+      effectivePricePerShare: 0.5,
+      order: {
+        tokenId: side === "UP" ? market.tokens.UP.tokenId : market.tokens.DOWN.tokenId,
+        side: "BUY" as const,
+        price: 0.5,
+        amount: 2.5,
+        shareTarget: 5,
+        orderType: "FAK" as const,
+      },
+    }));
+
+    expect(
+      shouldAllowControlledOverlap({
+        config,
+        nowTs: market.startTs + 40,
+        secsToClose: 260,
+        protectedResidualLock: {
+          openedAt: market.startTs + 5,
+        },
+        protectedResidualShares: 2.857141,
+        completionActive: true,
+        linkageHealthy: true,
+        entryBuys,
+        matchedInventoryTargetMet: true,
+        worstCaseAmplificationShares: 0,
+        recentSeedFlowCount: 1,
+        activeIndependentFlowCount: 1,
+      }),
+    ).toBe(false);
   });
 
   it("still blocks carry-preserved overlap when matched inventory quality is too weak", () => {

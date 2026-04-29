@@ -11,7 +11,7 @@ import { UserWsClient, type UserOrderEvent, type UserTradeEvent } from "../infra
 import { MarketWsClient } from "../infra/ws/marketWsClient.js";
 import { BtcPriceFeed } from "../infra/ws/btcPriceFeed.js";
 import { SystemClock } from "../infra/time/clock.js";
-import { CtfClient } from "../infra/ctf/ctfClient.js";
+import { CtfClient, shouldAccountCtfTxResult } from "../infra/ctf/ctfClient.js";
 import { createLogger, writeStructuredLog } from "../observability/logger.js";
 import { JsonlTraceLogger } from "../observability/jsonlTrace.js";
 import { renderDashboard } from "../observability/dashboard.js";
@@ -147,6 +147,15 @@ interface ExecutedMarketOrder {
 
 type PairOrderPlan = Record<OutcomeSide, MarketOrderArgs[]>;
 
+export interface SessionEndMergeDecision {
+  allow: boolean;
+  trigger: "market_close" | "session_end_safety_merge";
+  reason: string;
+  amount: number;
+  mergeable: number;
+  basketEffectivePair?: number | undefined;
+}
+
 export interface BotSessionReport {
   runtime: {
     mode: "live";
@@ -189,6 +198,8 @@ export interface BotSessionReport {
     entryArbitrationActionDeltaCount: number;
     arbitrationCarryExtensionRate: number;
     entryArbitrationActionDeltaRate: number;
+    endReason: "market_end" | "duration_elapsed" | "shutdown_requested";
+    shutdownSignal?: NodeJS.Signals | undefined;
   };
   finalState: {
     upShares: number;
@@ -266,7 +277,7 @@ interface ActivePairSubmission {
   }>;
 }
 
-interface RecentBotOwnedBuyFill {
+export interface RecentBotOwnedBuyFill {
   outcome: OutcomeSide;
   size: number;
   price: number;
@@ -277,7 +288,7 @@ interface RecentBotOwnedBuyFill {
 }
 
 const DECISION_TRACE_INTERVAL_SEC = 20;
-const BOT_OWNED_ZERO_BALANCE_GRACE_SEC = 3;
+export const BOT_OWNED_SETTLEMENT_GRACE_SEC = 20;
 
 interface DecisionTraceContext {
   eventSeq: number;
@@ -1086,6 +1097,60 @@ function normalizeMergeAmount(mergeable: number, dustLeaveShares: number): numbe
   return Number(Math.max(0, mergeable - Math.max(0, dustLeaveShares)).toFixed(6));
 }
 
+export function evaluateSessionEndMergeDecision(args: {
+  config: XuanStrategyConfig;
+  state: XuanMarketState;
+  endedAt: number;
+  pendingPairExecutionActive: boolean;
+  mergeTxCount: number;
+  mergeableUnlocked?: number | undefined;
+  mergeAmount?: number | undefined;
+}): SessionEndMergeDecision {
+  const { config, state } = args;
+  const mergeable = args.mergeableUnlocked ?? mergeableShares(state);
+  const amount = args.mergeAmount ?? normalizeMergeAmount(mergeable, config.mergeDustLeaveShares);
+  const basketEffectivePair =
+    mergeable > 1e-9 ? Number(matchedEffectivePairCost(state, config.cryptoTakerFeeRate).toFixed(6)) : undefined;
+  const marketClosed = args.endedAt >= state.market.endTs - 1e-9;
+  const trigger = marketClosed ? "market_close" : "session_end_safety_merge";
+  const deny = (reason: string): SessionEndMergeDecision => ({
+    allow: false,
+    trigger,
+    reason,
+    amount,
+    mergeable,
+    ...(basketEffectivePair !== undefined ? { basketEffectivePair } : {}),
+  });
+
+  if (config.mergeMode !== "AUTO") {
+    return deny("merge_mode_not_auto");
+  }
+  if (amount < config.mergeMinShares - 1e-9) {
+    return deny("merge_amount_below_min");
+  }
+  if (args.pendingPairExecutionActive && !config.allowMergeWithPendingGroups) {
+    return deny("pending_pair_execution");
+  }
+  if (args.mergeTxCount >= config.mergeMaxTxPerMarket) {
+    return deny("merge_tx_limit");
+  }
+  if (marketClosed) {
+    if (!config.mergeOnMarketClose) {
+      return deny("market_close_merge_disabled");
+    }
+    return {
+      allow: true,
+      trigger: "market_close",
+      reason: "market_close",
+      amount,
+      mergeable,
+      ...(basketEffectivePair !== undefined ? { basketEffectivePair } : {}),
+    };
+  }
+
+  return deny("session_end_before_market_close");
+}
+
 function computePendingLockedShares(
   pending: PendingPairExecution | undefined,
   fillSnapshot: { upBoughtQty: number; downBoughtQty: number } | undefined,
@@ -1112,7 +1177,87 @@ function unlockedMergeableShares(
   );
 }
 
-function shouldAllowControlledOverlap(args: {
+function combineLockedShares(
+  first: { up: number; down: number },
+  second: { up: number; down: number },
+): { up: number; down: number } {
+  return {
+    up: Number((first.up + second.up).toFixed(6)),
+    down: Number((first.down + second.down).toFixed(6)),
+  };
+}
+
+export function computeRecentBotOwnedSettlementLockedShares(
+  fills: readonly RecentBotOwnedBuyFill[],
+  nowTs: number,
+  graceSec = BOT_OWNED_SETTLEMENT_GRACE_SEC,
+): { up: number; down: number } {
+  return fills.reduce(
+    (acc, fill) => {
+      if (nowTs - fill.timestamp > graceSec) {
+        return acc;
+      }
+      if (fill.outcome === "UP") {
+        acc.up = Number((acc.up + fill.size).toFixed(6));
+      } else {
+        acc.down = Number((acc.down + fill.size).toFixed(6));
+      }
+      return acc;
+    },
+    { up: 0, down: 0 },
+  );
+}
+
+export function findRecentBotOwnedFillForShortfall(
+  fills: readonly RecentBotOwnedBuyFill[],
+  candidate: Pick<BalanceShortfallCandidate, "outcome" | "fromShares" | "toShares" | "nowTs">,
+  graceSec = BOT_OWNED_SETTLEMENT_GRACE_SEC,
+): RecentBotOwnedBuyFill | undefined {
+  const activeFills = [...fills]
+    .filter((fill) => fill.outcome === candidate.outcome && candidate.nowTs - fill.timestamp <= graceSec)
+    .sort((left, right) => right.timestamp - left.timestamp);
+
+  const directMatch = activeFills.find((fill) => {
+    const fillTolerance = Math.max(0.5, fill.size * 0.08);
+    const shortfall = candidate.fromShares - candidate.toShares;
+    if (candidate.toShares <= 1e-6) {
+      return Math.abs(candidate.fromShares - fill.size) <= fillTolerance;
+    }
+    return (
+      candidate.fromShares >= fill.size - fillTolerance &&
+      shortfall > 0 &&
+      shortfall <= fill.size + fillTolerance
+    );
+  });
+  if (directMatch) {
+    return directMatch;
+  }
+
+  if (activeFills.length === 0) {
+    return undefined;
+  }
+
+  const aggregateSize = activeFills.reduce((sum, fill) => sum + fill.size, 0);
+  const aggregateTolerance = Math.max(0.5, aggregateSize * 0.08);
+  const aggregateShortfall = candidate.fromShares - candidate.toShares;
+  if (
+    candidate.fromShares <= aggregateSize + aggregateTolerance &&
+    candidate.fromShares >= aggregateSize - aggregateTolerance
+  ) {
+    return activeFills[0];
+  }
+  if (
+    candidate.fromShares >= aggregateSize - aggregateTolerance &&
+    aggregateShortfall > 0 &&
+    aggregateShortfall <= aggregateSize + aggregateTolerance
+  ) {
+    return activeFills[0];
+  }
+
+  return undefined;
+}
+
+export function shouldAllowControlledOverlap(args: {
   config: Pick<
     XuanStrategyConfig,
     | "allowControlledOverlap"
@@ -1152,6 +1297,10 @@ function shouldAllowControlledOverlap(args: {
     return false;
   }
   if (!args.protectedResidualLock || args.entryBuys.length !== 2) {
+    return false;
+  }
+  const minimumActionableResidualShares = Math.max(args.config.repairMinQty, args.config.completionMinQty);
+  if (args.protectedResidualShares + 1e-9 < minimumActionableResidualShares) {
     return false;
   }
   if (args.config.maxOpenGroupsPerMarket < 2 || args.config.maxOpenPartialGroups < 1) {
@@ -1911,7 +2060,7 @@ function findActiveSubmittedIntent(
   outcome: OutcomeSide,
 ): SubmittedIntent | undefined {
   const intents = submittedPrices[outcome] ?? [];
-  return intents.find((intent) => intent.active);
+  return [...intents].reverse().find((intent) => intent.active);
 }
 
 function consumeSubmittedIntent(
@@ -1992,11 +2141,76 @@ function extractExpectedSharesFromOrderResult(result: OrderResult | undefined): 
   return normalizeShares(value);
 }
 
-function expectedSharesForSubmission(
+export function expectedSharesForSubmission(
   shareTarget: number | undefined,
   result: OrderResult | undefined,
 ): number | undefined {
-  return extractExpectedSharesFromOrderResult(result) ?? (shareTarget !== undefined ? normalizeShares(shareTarget) : undefined);
+  return shareTarget !== undefined ? normalizeShares(shareTarget) : extractExpectedSharesFromOrderResult(result);
+}
+
+export function shouldRegisterSubmittedIntentForResult(result: OrderResult | undefined): boolean {
+  return Boolean(result && isOrderResultAccepted(result));
+}
+
+export function isUsableBotFillOrderId(orderId: string | undefined): orderId is string {
+  return Boolean(
+    orderId &&
+      orderId !== "unknown-order-id" &&
+      orderId !== "rate-limited" &&
+      orderId !== "skipped-order",
+  );
+}
+
+export function botFillAccountingKey(
+  fill: Pick<FillRecord, "outcome" | "side" | "size" | "price" | "timestamp">,
+  context: { orderId?: string | undefined },
+): string | undefined {
+  if (fill.side !== "BUY" || !isUsableBotFillOrderId(context.orderId)) {
+    return undefined;
+  }
+  return [
+    "order",
+    context.orderId,
+    fill.outcome,
+    fill.side,
+    normalizeShares(fill.size),
+    Number(fill.price.toFixed(6)),
+    fill.timestamp,
+  ].join(":");
+}
+
+export interface OrderResultShareOverfill {
+  orderId?: string | undefined;
+  groupId?: string | undefined;
+  outcome: OutcomeSide;
+  shareTarget: number;
+  filledShares: number;
+  excessShares: number;
+}
+
+export function detectOrderResultShareOverfill(args: {
+  order: MarketOrderArgs;
+  fill: Pick<FillRecord, "outcome" | "side" | "size">;
+  orderId?: string | undefined;
+  groupId?: string | undefined;
+}): OrderResultShareOverfill | undefined {
+  if (args.fill.side !== "BUY" || args.order.shareTarget === undefined) {
+    return undefined;
+  }
+  const shareTarget = normalizeShares(args.order.shareTarget);
+  const filledShares = normalizeShares(args.fill.size);
+  const tolerance = Math.max(1e-6, shareTarget * 0.001);
+  if (filledShares <= shareTarget + tolerance) {
+    return undefined;
+  }
+  return {
+    outcome: args.fill.outcome,
+    shareTarget,
+    filledShares,
+    excessShares: normalizeShares(filledShares - shareTarget),
+    ...(args.orderId !== undefined ? { orderId: args.orderId } : {}),
+    ...(args.groupId !== undefined ? { groupId: args.groupId } : {}),
+  };
 }
 
 function asOrderRawObject(result: OrderResult | undefined): Record<string, unknown> | undefined {
@@ -2184,6 +2398,21 @@ function skippedOrderResult(status: string, reason: string): OrderResult {
   };
 }
 
+function failedOrderResult(status: string, error: unknown): OrderResult {
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    success: false,
+    simulated: false,
+    orderId: "order-exception",
+    status,
+    raw: {
+      error: message,
+      ...(error instanceof Error && error.name ? { errorName: error.name } : {}),
+    },
+    requestedAt: Date.now(),
+  };
+}
+
 function liveOrderSizeLadder(config: XuanStrategyConfig, minOrderSize: number): number[] {
   return [
     ...config.liveSmallLotLadder,
@@ -2237,9 +2466,10 @@ async function executeMarketOrdersInSequence(
   const executed: ExecutedMarketOrder[] = [];
   for (let index = 0; index < orders.length; index += 1) {
     const order = orders[index]!;
+    const result = await executeOrderSafely(completionManager, order);
     executed.push({
       order,
-      result: await completionManager.execute(order),
+      result,
     });
     if (
       interOrderDelayMs > 0 &&
@@ -2250,6 +2480,28 @@ async function executeMarketOrdersInSequence(
     }
   }
   return executed;
+}
+
+async function executeOrderSafely(
+  completionManager: TakerCompletionManager,
+  order: MarketOrderArgs,
+): Promise<OrderResult> {
+  try {
+    return await completionManager.execute(order);
+  } catch (error) {
+    return failedOrderResult("order_submit_exception", error);
+  }
+}
+
+async function completeOrderSafely(
+  completionManager: TakerCompletionManager,
+  order: MarketOrderArgs,
+): Promise<OrderResult> {
+  try {
+    return await completionManager.complete(order);
+  } catch (error) {
+    return failedOrderResult("order_submit_exception", error);
+  }
 }
 
 function selectRepresentativeExecution(executions: ExecutedMarketOrder[]): ExecutedMarketOrder {
@@ -2320,7 +2572,7 @@ async function executePairOrderPlan(args: {
         const order = sideOrders[index]!;
         const execution = {
           order,
-          result: await args.completionManager.execute(order),
+          result: await executeOrderSafely(args.completionManager, order),
         };
         executedBySide[entryBuy.side].push(execution);
         if (!isOrderResultAccepted(execution.result)) {
@@ -2349,7 +2601,7 @@ async function executePairOrderPlan(args: {
     if (batch.length === 0) {
       continue;
     }
-    const results = await Promise.all(batch.map((item) => args.completionManager.execute(item.order)));
+    const results = await Promise.all(batch.map((item) => executeOrderSafely(args.completionManager, item.order)));
     let batchAccepted = true;
     for (let index = 0; index < batch.length; index += 1) {
       const item = batch[index]!;
@@ -2527,10 +2779,16 @@ export async function runStatefulBotSession(
       : resolvedOptions.marketSelection === "next"
         ? { selection: "next" as const, market: discovery.next }
         : pickSessionMarket(discovery, startedAt, config.normalEntryCutoffSecToClose);
-  let startupInventorySnapshot =
-    config.startupInventoryPolicy === "ADOPT_AND_RECONCILE"
-      ? await fetchInventorySnapshot(env, config)
-      : undefined;
+  let startupInventorySnapshot: Awaited<ReturnType<typeof fetchInventorySnapshot>> | undefined;
+  let startupInventorySnapshotError: string | undefined;
+  if (config.startupInventoryPolicy === "ADOPT_AND_RECONCILE") {
+    try {
+      startupInventorySnapshot = await fetchInventorySnapshot(env, config);
+    } catch (error) {
+      startupInventorySnapshotError = error instanceof Error ? error.message : String(error);
+      logger.warn({ error }, "Startup inventory snapshot failed; live session will continue guarded.");
+    }
+  }
   if (
     resolvedOptions.marketSelection === "auto" &&
     startupInventorySnapshot?.currentMarket &&
@@ -2565,6 +2823,34 @@ export async function runStatefulBotSession(
     upTokenId: market.tokens.UP.tokenId,
     downTokenId: market.tokens.DOWN.tokenId,
   });
+  let shutdownRequest:
+    | {
+        signal: NodeJS.Signals;
+        requestedAt: number;
+      }
+    | undefined;
+  const shutdownSignals: NodeJS.Signals[] = ["SIGINT", "SIGTERM", "SIGHUP"];
+  const handleShutdownSignal = (signal: NodeJS.Signals): void => {
+    if (shutdownRequest) {
+      process.exitCode = signal === "SIGINT" ? 130 : 143;
+      return;
+    }
+    shutdownRequest = {
+      signal,
+      requestedAt: clock.now(),
+    };
+    process.exitCode = signal === "SIGINT" ? 130 : 143;
+    logger.warn({ signal, marketSlug: market.slug }, "Stateful live session graceful shutdown requested");
+    void traceLogger.write("market_rollover", {
+      status: "session_shutdown_requested",
+      marketSlug: market.slug,
+      signal,
+      requestedAt: shutdownRequest.requestedAt,
+    });
+  };
+  for (const signal of shutdownSignals) {
+    process.on(signal, handleShutdownSignal);
+  }
   let state = createMarketState(market);
   let cachedUsdcBalance = (await readCollateralBalanceUsdc(env)) ?? Math.max(config.minUsdcBalance, 100);
   const updateCachedUsdcBalanceAfterOrderResult = (order: MarketOrderArgs, result: OrderResult): void => {
@@ -2586,13 +2872,20 @@ export async function runStatefulBotSession(
   let startupBlockNewEntries = false;
   let startupCompletionOnly = false;
   let startupSafeHalt = false;
+  let startupInventoryActionFailed = startupInventorySnapshotError !== undefined;
   let startupExternalReasons: string[] = [];
+  if (startupInventorySnapshotError) {
+    startupBlockNewEntries = true;
+    startupCompletionOnly = true;
+    startupExternalReasons.push("startup_inventory_snapshot_failed");
+  }
   let externalActivityDetected = false;
   let pairgroupLinkageHealthy = true;
   let grouplessFillEvents = 0;
   let lastBalanceSyncAt = 0;
   let actionCooldownUntil = 0;
   let lastMergeAtMs = 0;
+  let lastMergeBlockedTraceAt = 0;
   let mergeTxCount = 0;
   let adoptedInventory = false;
   let userTradeCount = 0;
@@ -2621,6 +2914,7 @@ export async function runStatefulBotSession(
     price: number;
     expiresAt: number;
   }> = [];
+  const appliedBotFillKeys = new Set<string>();
   const recentBotOwnedBuyFills: RecentBotOwnedBuyFill[] = [];
   const events: Array<Record<string, unknown>> = [];
   let pendingPairExecution: PendingPairExecution | undefined;
@@ -2655,6 +2949,9 @@ export async function runStatefulBotSession(
   };
   const persistedSafeHalt = stateStore.loadSafeHalt();
   if (persistedSafeHalt.active && config.requireManualResumeConfirm) {
+    for (const signal of shutdownSignals) {
+      process.off(signal, handleShutdownSignal);
+    }
     stateStore.close();
     throw new Error(
       `SAFE_HALT aktif (${persistedSafeHalt.reason ?? "external_activity"}). Once npm run inventory:reconcile, sonra npm run inventory:report, en son npm run bot:resume --confirm calistir.`,
@@ -2730,6 +3027,92 @@ export async function runStatefulBotSession(
     });
   const submittedIntentMaxAgeSec = Math.max(15, Math.ceil(config.pairgroupFinalizeTimeoutMs / 1000) + 2);
 
+  const markAppliedBotFill = (
+    fill: FillRecord,
+    context: { orderId?: string | undefined },
+  ): { applied: boolean; key?: string | undefined } => {
+    const key = botFillAccountingKey(fill, context);
+    if (!key) {
+      return { applied: true };
+    }
+    if (appliedBotFillKeys.has(key)) {
+      return { applied: false, key };
+    }
+    appliedBotFillKeys.add(key);
+    return { applied: true, key };
+  };
+
+  const deactivateSubmittedIntents = (predicate: (intent: SubmittedIntent) => boolean): void => {
+    for (const bucket of Object.values(submittedPrices)) {
+      for (const intent of bucket ?? []) {
+        if (predicate(intent)) {
+          intent.active = false;
+        }
+      }
+    }
+  };
+
+  const deactivateSubmittedIntentsForGroup = (groupId: string): void => {
+    deactivateSubmittedIntents((intent) => intent.groupId === groupId);
+  };
+
+  const handleOrderResultOverfill = async (args: {
+    fill: FillRecord;
+    order: MarketOrderArgs;
+    orderId?: string | undefined;
+    groupId?: string | undefined;
+    phase: "entry" | "completion" | "pair";
+    mode?: StrategyExecutionMode | undefined;
+  }): Promise<void> => {
+    const overfill = detectOrderResultShareOverfill({
+      order: args.order,
+      fill: args.fill,
+      orderId: args.orderId,
+      groupId: args.groupId,
+    });
+    if (!overfill) {
+      return;
+    }
+    state = {
+      ...state,
+      reentryDisabled: true,
+      postMergeCompletionOnlyUntil: undefined,
+    };
+    runtimeProtectedResidualLock =
+      partialOpenGroupLock !== undefined
+        ? undefined
+        : refreshRuntimeProtectedResidualLock({
+            lock: runtimeProtectedResidualLock,
+            state,
+            nowTs: args.fill.timestamp,
+            mode: args.mode ?? args.fill.executionMode,
+          });
+    const residualSide = dominantResidualSide(state) ?? null;
+    const residualShares = normalizeShares(Math.abs(state.upShares - state.downShares));
+    pushEvent(events, {
+      timestamp: args.fill.timestamp,
+      type: "order_result_overfill",
+      phase: args.phase,
+      ...overfill,
+      residualSide,
+      residualShares,
+    });
+    await traceLogger.write("orders", {
+      eventType: "order_result_overfill",
+      phase: args.phase,
+      executionMode: args.mode ?? args.fill.executionMode ?? null,
+      orderId: overfill.orderId ?? null,
+      groupId: overfill.groupId ?? null,
+      outcome: overfill.outcome,
+      shareTarget: overfill.shareTarget,
+      filledShares: overfill.filledShares,
+      excessShares: overfill.excessShares,
+      residualSide,
+      residualShares,
+      action: "reentry_disabled_until_merge_or_reconcile",
+    });
+  };
+
   const rememberOrderResultFillSuppression = (fill: FillRecord): void => {
     orderResultFillSuppressions.push({
       outcome: fill.outcome,
@@ -2789,28 +3172,20 @@ export async function runStatefulBotSession(
     candidate: Pick<BalanceShortfallCandidate, "outcome" | "fromShares" | "toShares" | "nowTs">,
   ): RecentBotOwnedBuyFill | undefined => {
     pruneBotOwnedBuyFills(candidate.nowTs);
-    return [...recentBotOwnedBuyFills].reverse().find((fill) => {
-      if (fill.outcome !== candidate.outcome) {
-        return false;
-      }
-      const fillTolerance = Math.max(0.5, fill.size * 0.08);
-      if (candidate.toShares <= 1e-6) {
-        return Math.abs(candidate.fromShares - fill.size) <= fillTolerance;
-      }
-      const shortfall = candidate.fromShares - candidate.toShares;
-      return candidate.fromShares >= fill.size - fillTolerance && shortfall > 0 && shortfall <= fillTolerance;
-    });
+    return findRecentBotOwnedFillForShortfall(recentBotOwnedBuyFills, candidate);
+  };
+
+  const computeSettlementLockedShares = (nowTs: number): { up: number; down: number } => {
+    pruneBotOwnedBuyFills(nowTs);
+    return computeRecentBotOwnedSettlementLockedShares(recentBotOwnedBuyFills, nowTs);
   };
 
   const shouldIgnoreTransientBotOwnedShortfall = (candidate: BalanceShortfallCandidate): boolean => {
-    if (candidate.toShares > 1e-6) {
-      return false;
-    }
     const matchedFill = findBotOwnedFillForShortfall(candidate);
     if (!matchedFill) {
       return false;
     }
-    return candidate.nowTs - matchedFill.timestamp <= BOT_OWNED_ZERO_BALANCE_GRACE_SEC;
+    return candidate.nowTs - matchedFill.timestamp <= BOT_OWNED_SETTLEMENT_GRACE_SEC;
   };
 
   const matchActivePairSubmission = (fill: FillRecord): ActivePairSubmission["entries"][number] | undefined => {
@@ -3002,6 +3377,11 @@ export async function runStatefulBotSession(
       };
       runtimeProtectedResidualLock = undefined;
       arbitrationCarry = undefined;
+      state = {
+        ...state,
+        reentryDisabled: true,
+        postMergeCompletionOnlyUntil: undefined,
+      };
     } else if (partialOpenGroupLock?.groupId === finalized.group.groupId) {
       partialOpenGroupLock = undefined;
     }
@@ -3141,6 +3521,18 @@ export async function runStatefulBotSession(
     }
   }
 
+  if (startupInventorySnapshotError) {
+    await traceLogger.write("errors", {
+      channel: "startup_inventory",
+      severity: "warn",
+      message: startupInventorySnapshotError,
+    });
+    await writeRiskEvent("startup_inventory_snapshot_failed", {
+      stage: "startup",
+      error: startupInventorySnapshotError,
+    });
+  }
+
   if (startupInventorySnapshot) {
     await writeInventorySnapshotTrace("startup_before_manage", startupInventorySnapshot);
     const startupPlan = buildInventoryActionPlan(startupInventorySnapshot, config);
@@ -3148,26 +3540,54 @@ export async function runStatefulBotSession(
     startupExternalReasons = [...startupPlan.blockReasons];
 
     if (startupPlan.redeem.length > 0 || startupPlan.merge.length > 0) {
-      const startupActions = await executeInventoryActionPlan(env, startupPlan, config);
-      for (const action of startupActions) {
+      try {
+        const startupActions = await executeInventoryActionPlan(env, startupPlan, config);
+        for (const action of startupActions) {
+          await traceLogger.write("merge_redeem", {
+            action: action.type,
+            slug: action.slug,
+            relation: action.relation,
+            amount: action.amount ?? null,
+            reason: action.reason,
+            txHash: action.result.txHash ?? null,
+            simulated: action.result.simulated,
+            skipped: action.result.skipped ?? false,
+            confirmed: action.result.confirmed ?? null,
+            state: action.result.state ?? null,
+          });
+        }
+        startupInventorySnapshot = await fetchInventorySnapshot(env, config);
+        await writeInventorySnapshotTrace("startup_after_manage", startupInventorySnapshot);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        startupInventoryActionFailed = true;
+        startupBlockNewEntries = true;
+        startupCompletionOnly = true;
+        startupExternalReasons = [...new Set([...startupExternalReasons, "startup_inventory_action_failed"])];
         await traceLogger.write("merge_redeem", {
-          action: action.type,
-          slug: action.slug,
-          relation: action.relation,
-          amount: action.amount ?? null,
-          reason: action.reason,
-          txHash: action.result.txHash ?? null,
-          simulated: action.result.simulated,
-          skipped: action.result.skipped ?? false,
+          action: "startup_inventory_action_failed",
+          redeemCount: startupPlan.redeem.length,
+          mergeCount: startupPlan.merge.length,
+          error: message,
+        });
+        await writeRiskEvent("startup_inventory_action_failed", {
+          stage: "startup",
+          redeemCount: startupPlan.redeem.length,
+          mergeCount: startupPlan.merge.length,
+          error: message,
         });
       }
-      startupInventorySnapshot = await fetchInventorySnapshot(env, config);
-      await writeInventorySnapshotTrace("startup_after_manage", startupInventorySnapshot);
     }
 
     const startupGuardPlan = buildInventoryActionPlan(startupInventorySnapshot, config);
-    startupBlockNewEntries = startupGuardPlan.blockNewEntries;
-    startupExternalReasons = [...startupGuardPlan.blockReasons];
+    startupBlockNewEntries = startupGuardPlan.blockNewEntries || startupInventoryActionFailed;
+    startupCompletionOnly = startupCompletionOnly || startupInventoryActionFailed;
+    startupExternalReasons = [
+      ...new Set([
+        ...startupGuardPlan.blockReasons,
+        ...(startupInventoryActionFailed ? ["startup_inventory_action_failed"] : []),
+      ]),
+    ];
     const startupCurrentInventory =
       startupInventorySnapshot.markets.find(
         (inventoryMarket) => inventoryMarket.conditionId === market.conditionId || inventoryMarket.slug === market.slug,
@@ -3345,6 +3765,34 @@ export async function runStatefulBotSession(
       });
       return;
     }
+    const userFillAccounting = markAppliedBotFill(normalizedFill, {
+      orderId: submittedIntent?.orderId,
+    });
+    if (!userFillAccounting.applied) {
+      pushEvent(events, {
+        timestamp: normalizedFill.timestamp,
+        type: "user_fill_suppressed_fill_dedupe",
+        eventId: event.id,
+        outcome: normalizedFill.outcome,
+        size: normalizedFill.size,
+        price: normalizedFill.price,
+        orderId: submittedIntent?.orderId ?? null,
+        accountingKey: userFillAccounting.key ?? null,
+      });
+      void traceLogger.write("user_fills", {
+        eventType: "user_fill_suppressed_fill_dedupe",
+        eventId: event.id,
+        outcome: normalizedFill.outcome,
+        side: normalizedFill.side,
+        size: normalizedFill.size,
+        price: normalizedFill.price,
+        groupId: submittedIntent?.groupId ?? null,
+        orderId: submittedIntent?.orderId ?? null,
+        accountingKey: userFillAccounting.key ?? null,
+        source: "FILL_ACCOUNTING",
+      });
+      return;
+    }
     if (pendingPairExecution && !submittedIntent?.groupId) {
       void markPairgroupRepairRequired("pairgroup_repair_required", {
         source: "user_ws",
@@ -3376,12 +3824,25 @@ export async function runStatefulBotSession(
         lineage: normalizedFill.flowLineage ?? currentRuntimeFlowLineage(normalizedFill.outcome),
       });
     }
-    stateStore.recordFill(state, normalizedFill, {
+    const userFillPersisted = stateStore.recordFill(state, normalizedFill, {
       orderId: submittedIntent?.orderId,
       groupId: submittedIntent?.groupId,
       executionMode: submittedIntent?.mode,
       source: "USER_WS",
     });
+    if (!userFillPersisted && submittedIntent?.orderId) {
+      void traceLogger.write("user_fills", {
+        eventType: "user_fill_persistent_dedupe",
+        eventId: event.id,
+        outcome: normalizedFill.outcome,
+        side: normalizedFill.side,
+        size: normalizedFill.size,
+        price: normalizedFill.price,
+        groupId: submittedIntent?.groupId ?? null,
+        orderId: submittedIntent.orderId,
+        source: "PERSISTENT_FILL_ACCOUNTING",
+      });
+    }
     if (submittedIntent?.groupId || submittedIntent?.orderId) {
       rememberBotOwnedBuyFill(normalizedFill, {
         groupId: submittedIntent.groupId,
@@ -3449,6 +3910,8 @@ export async function runStatefulBotSession(
 
     const observedBalances = await readObservedBalances(balanceReader, market, balanceOwnerAddress);
     const balanceSyncOldGap = Math.abs(state.upShares - state.downShares);
+    const pendingPairGroupIdAtSync = pendingPairExecution?.group.groupId;
+    let pendingPairObservedAfterSubmit = false;
     const reconciled = reconcileStateWithBalances({
       state,
       observed: observedBalances,
@@ -3497,6 +3960,9 @@ export async function runStatefulBotSession(
           pendingPairGroupId: pendingPairExecution.group.groupId,
         });
       }
+      if (submittedIntent?.groupId && submittedIntent.groupId === pendingPairGroupIdAtSync) {
+        pendingPairObservedAfterSubmit = true;
+      }
       const fillReleaseAction = runtimeFlowBudgetReleaseActionForFillMode(normalizedFill.executionMode);
       if (fillReleaseAction) {
         applyRuntimeFlowBudgetAction(fillReleaseAction, {
@@ -3508,12 +3974,24 @@ export async function runStatefulBotSession(
           lineage: normalizedFill.flowLineage ?? currentRuntimeFlowLineage(normalizedFill.outcome),
         });
       }
-      stateStore.recordFill(state, normalizedFill, {
+      const balanceFillPersisted = stateStore.recordFill(state, normalizedFill, {
         orderId: submittedIntent?.orderId,
         groupId: submittedIntent?.groupId,
         executionMode: submittedIntent?.mode,
         source: "BALANCE_RECONCILE",
       });
+      if (!balanceFillPersisted && submittedIntent?.orderId) {
+        await traceLogger.write("balance_sync", {
+          balanceEvent: "fill_dedupe",
+          scope: args.scope,
+          outcome: normalizedFill.outcome,
+          size: normalizedFill.size,
+          price: normalizedFill.price,
+          groupId: submittedIntent?.groupId ?? null,
+          orderId: submittedIntent.orderId,
+          source: "PERSISTENT_FILL_ACCOUNTING",
+        });
+      }
       if (submittedIntent?.groupId || submittedIntent?.orderId) {
         rememberBotOwnedBuyFill(normalizedFill, {
           groupId: submittedIntent.groupId,
@@ -3546,14 +4024,12 @@ export async function runStatefulBotSession(
           nowTs: args.nowTs,
         }),
       );
-      const persistedShrink = botOwnedCorrection
-        ? stateStore.shrinkOpenLotsToObservedShares(
-            market.slug,
-            correction.outcome,
-            correction.toShares,
-            args.nowTs,
-          )
-        : undefined;
+      const persistedShrink = stateStore.shrinkOpenLotsToObservedShares(
+        market.slug,
+        correction.outcome,
+        correction.toShares,
+        args.nowTs,
+      );
       pushEvent(events, {
         timestamp: args.nowTs,
         type: "balance_sync_correction",
@@ -3621,17 +4097,51 @@ export async function runStatefulBotSession(
       });
     }
 
-    if (pendingPairExecution && args.nowTs >= pendingPairExecution.submittedAt) {
+    if (pendingPairExecution && pendingPairGroupIdAtSync === pendingPairExecution.group.groupId) {
+      const refreshedSnapshot = stateStore.loadPairGroupFillSnapshot(pendingPairExecution.group.groupId);
+      pendingPairObservedAfterSubmit =
+        pendingPairObservedAfterSubmit ||
+        refreshedSnapshot.upBoughtQty > 1e-6 ||
+        refreshedSnapshot.downBoughtQty > 1e-6 ||
+        args.nowTs - pendingPairExecution.submittedAt >= BOT_OWNED_SETTLEMENT_GRACE_SEC;
+    }
+    if (
+      pendingPairExecution &&
+      args.nowTs >= pendingPairExecution.submittedAt &&
+      pendingPairObservedAfterSubmit
+    ) {
       pendingPairExecution = {
         ...pendingPairExecution,
         reconciledAfterSubmit: true,
       };
     }
-    if (pendingCompletionSubmission && args.nowTs >= pendingCompletionSubmission.submittedAt) {
-      pendingCompletionSubmission = undefined;
-    }
-    if (pendingEntryRepairSubmission && args.nowTs >= pendingEntryRepairSubmission.submittedAt) {
-      pendingEntryRepairSubmission = undefined;
+  };
+
+  const safePerformBalanceSync = async (args: {
+    nowTs: number;
+    books: OrderBookState;
+    scope: string;
+    traceLabel: string;
+  }): Promise<boolean> => {
+    try {
+      await performBalanceSync(args);
+      return true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger.warn({ error, marketSlug: market.slug, scope: args.scope }, "Balance sync failed; session will continue.");
+      pushEvent(events, {
+        timestamp: args.nowTs,
+        type: "balance_sync_failed",
+        scope: args.scope,
+        message,
+      });
+      await traceLogger.write("errors", {
+        channel: "balance_sync",
+        severity: "warn",
+        scope: args.scope,
+        message,
+      });
+      return false;
     }
   };
 
@@ -3665,16 +4175,40 @@ export async function runStatefulBotSession(
 
     if (finalized) {
       await persistFinalizedPairGroup(finalized, pendingPairExecution, nowTs);
+      deactivateSubmittedIntentsForGroup(pendingPairExecution.group.groupId);
+      if (activePairSubmission?.groupId === pendingPairExecution.group.groupId) {
+        activePairSubmission = undefined;
+      }
       pendingPairExecution = undefined;
     }
   };
 
+  let sessionFatalError: unknown;
   try {
-    const initial = await waitForInitialBooks(marketWs, market, resolvedOptions.initialBookWaitMs);
-    const initialBooks = new OrderBookState(initial.upBook, initial.downBook);
-    const initialBalances = await readObservedBalances(balanceReader, market, balanceOwnerAddress);
-    latestFairValueSnapshot = fairValueRuntime.evaluate(startedAt);
-    if (initialBalances.up > 0 || initialBalances.down > 0) {
+    const initial = await (async (): Promise<{ upBook: OrderBook; downBook: OrderBook } | undefined> => {
+      try {
+        return await waitForInitialBooks(marketWs, market, resolvedOptions.initialBookWaitMs);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        pushEvent(events, {
+          timestamp: clock.now(),
+          type: "initial_books_timeout",
+          message,
+        });
+        await traceLogger.write("errors", {
+          channel: "market_ws",
+          severity: "warn",
+          message: "initial_books_timeout",
+          error: message,
+        });
+        return undefined;
+      }
+    })();
+    if (initial) {
+      const initialBooks = new OrderBookState(initial.upBook, initial.downBook);
+      const initialBalances = await readObservedBalances(balanceReader, market, balanceOwnerAddress);
+      latestFairValueSnapshot = fairValueRuntime.evaluate(startedAt);
+      if (initialBalances.up > 0 || initialBalances.down > 0) {
       const adopted = reconcileStateWithBalances({
         state,
         observed: initialBalances,
@@ -3723,7 +4257,8 @@ export async function runStatefulBotSession(
         startupSafeHalt = true;
         startupBlockNewEntries = true;
         startupCompletionOnly = false;
-        startupExternalReasons.push("startup_reconcile_mismatch");
+          startupExternalReasons.push("startup_reconcile_mismatch");
+        }
       }
     }
 
@@ -3733,7 +4268,7 @@ export async function runStatefulBotSession(
       marketEndTs: market.endTs,
       durationSec: resolvedOptions.durationSec,
     });
-    while (clock.now() < sessionDeadline && clock.now() < market.endTs) {
+    while (!shutdownRequest && clock.now() < sessionDeadline && clock.now() < market.endTs) {
       const nowTs = clock.now();
       ticks += 1;
       const books = buildBooks(marketWs, market);
@@ -3748,7 +4283,7 @@ export async function runStatefulBotSession(
       latestFairValueSnapshot = fairValueRuntime.evaluate(nowTs);
 
       if (nowTs - lastBalanceSyncAt >= Math.floor(resolvedOptions.balanceSyncMs / 1000)) {
-        await performBalanceSync({
+        await safePerformBalanceSync({
           nowTs,
           books,
           scope: "session_balance_sync",
@@ -3763,11 +4298,13 @@ export async function runStatefulBotSession(
         const pendingMergeFillSnapshot = pendingPairExecution
           ? stateStore.loadPairGroupFillSnapshot(pendingPairExecution.group.groupId)
           : undefined;
-        const lockedPendingShares = computePendingLockedShares(
+        const pendingLockedShares = computePendingLockedShares(
           pendingPairExecution,
           pendingMergeFillSnapshot,
           config,
         );
+        const mergeSettlementLockedShares = computeSettlementLockedShares(nowTs);
+        const lockedPendingShares = combineLockedShares(pendingLockedShares, mergeSettlementLockedShares);
         const mergeResidualLock = partialOpenGroupLock ?? runtimeProtectedResidualLock;
         const mergeProtectedResidualShares = mergeResidualLock
           ? Math.min(mergeResidualLock.protectedShares, Math.abs(state.upShares - state.downShares))
@@ -3848,25 +4385,94 @@ export async function runStatefulBotSession(
             : undefined;
         const mergeTargetQty = mergeClusterPrior ? Math.min(mergeableUnlocked, mergeClusterPrior.totalQty) : mergeableUnlocked;
         const mergeAmount = normalizeMergeAmount(mergeTargetQty, config.mergeDustLeaveShares);
-        const mergeAllowed =
+        const mergeBasketEffectivePair =
+          mergePlan.mergeable > 1e-9 ? matchedEffectivePairCost(state, config.cryptoTakerFeeRate) : undefined;
+        const mergeBaseConditionsMet =
           mergePlan.shouldMerge &&
-          mergeGate.allow &&
           mergeAmount >= config.mergeMinShares &&
           Date.now() - lastMergeAtMs >= config.mergeDebounceMs &&
           (!pendingPairExecution || config.allowMergeWithPendingGroups) &&
           mergeTxCount < config.mergeMaxTxPerMarket;
+        const mergeFirstForceReason =
+          mergeBaseConditionsMet &&
+          !mergeGate.allow &&
+          mergeBasketEffectivePair !== undefined &&
+          mergeBasketEffectivePair <= config.marketBasketMergeEffectivePairCap + 1e-9 &&
+          (externalActivityDetected ||
+            state.reentryDisabled ||
+            nowTs >= market.endTs - config.finalWindowCompletionOnlySec ||
+            mergeProtectedResidualShares + 1e-9 < Math.max(config.repairMinQty, config.completionMinQty))
+            ? externalActivityDetected
+              ? "merge_first_external_activity"
+              : state.reentryDisabled
+                ? "merge_first_reentry_disabled"
+                : nowTs >= market.endTs - config.finalWindowCompletionOnlySec
+                  ? "merge_first_final_window"
+                  : "merge_first_micro_residual"
+            : undefined;
+        const mergeGateReason = mergeFirstForceReason ?? mergeGate.reason;
+        const mergeGateForced = mergeGate.forced || mergeFirstForceReason !== undefined;
+        const mergeAllowed =
+          mergeBaseConditionsMet &&
+          (mergeGate.allow || mergeFirstForceReason !== undefined);
         if (mergeAllowed) {
-          const mergeResult = env.CTF_MERGE_ENABLED
-            ? await ctf.mergePositions(market.conditionId, mergeAmount)
-            : {
-                simulated: true,
-                skipped: true,
-                action: "merge" as const,
-                amount: mergeAmount,
-                conditionId: market.conditionId,
-                reason: "CTF_MERGE_ENABLED=false",
-              };
-          if (mergeResult.simulated || !mergeResult.skipped) {
+          let mergeResult: Awaited<ReturnType<CtfClient["mergePositions"]>>;
+          try {
+            mergeResult = env.CTF_MERGE_ENABLED
+              ? await ctf.mergePositions(market.conditionId, mergeAmount, {
+                  positionTokenIds: {
+                    upTokenId: market.tokens.UP.tokenId,
+                    downTokenId: market.tokens.DOWN.tokenId,
+                  },
+                })
+              : {
+                  simulated: true,
+                  skipped: true,
+                  action: "merge" as const,
+                  amount: mergeAmount,
+                  conditionId: market.conditionId,
+                  reason: "CTF_MERGE_ENABLED=false",
+                };
+          } catch (error) {
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            logger.warn({ error, mergeAmount, marketSlug: market.slug }, "CTF merge failed; session will continue.");
+            lastMergeAtMs = Date.now();
+            actionCooldownUntil = Date.now() + Math.max(config.mergeDebounceMs, 5000);
+            pushEvent(events, {
+              timestamp: nowTs,
+              type: "merge_failed",
+              amount: mergeAmount,
+              mergeGateReason,
+              mergeGateForced,
+              message: errorMessage,
+            });
+            await traceLogger.write("merge_redeem", {
+              action: "merge_failed",
+              amount: mergeAmount,
+              mergeGateReason,
+              mergeGateForced,
+              mergeBasketEffectivePair: mergeBasketEffectivePair ?? null,
+              mergePendingMatchedQty: mergeGate.pendingMatchedQty,
+              mergeCompletedCycles: mergeGate.completedCycles,
+              mergeOldestMatchedAgeSec: mergeGate.oldestMatchedAgeSec ?? null,
+              lockedPendingUpShares: lockedPendingShares.up,
+              lockedPendingDownShares: lockedPendingShares.down,
+              lockedSettlementUpShares: mergeSettlementLockedShares.up,
+              lockedSettlementDownShares: mergeSettlementLockedShares.down,
+              error: errorMessage,
+            });
+            emitLiveMirror("merge_failed", {
+              marketSlug: market.slug,
+              trigger: "runtime",
+              amount: mergeAmount,
+              mergeGateReason,
+              mergeGateForced,
+              error: errorMessage,
+            });
+            await waitForDecisionPulse();
+            continue;
+          }
+          if (shouldAccountCtfTxResult(mergeResult)) {
             const preMergeState = state;
             state = applyMerge(state, {
               amount: mergeAmount,
@@ -3918,10 +4524,15 @@ export async function runStatefulBotSession(
             const pendingPostMergeFillSnapshot = pendingPairExecution
               ? stateStore.loadPairGroupFillSnapshot(pendingPairExecution.group.groupId)
               : undefined;
-            const postMergeLockedPendingShares = computePendingLockedShares(
+            const postMergePendingLockedShares = computePendingLockedShares(
               pendingPairExecution,
               pendingPostMergeFillSnapshot,
               config,
+            );
+            const postMergeSettlementLockedShares = computeSettlementLockedShares(nowTs);
+            const postMergeLockedPendingShares = combineLockedShares(
+              postMergePendingLockedShares,
+              postMergeSettlementLockedShares,
             );
             const postMergeObserved = config.mergeOnlyConfirmedMatchedUnlockedLots
               ? unlockedMergeableShares(state, postMergeLockedPendingShares)
@@ -3934,23 +4545,30 @@ export async function runStatefulBotSession(
             timestamp: nowTs,
             type: "merge",
             amount: mergeAmount,
-            mergeGateReason: mergeGate.reason,
-            mergeGateForced: mergeGate.forced,
+            mergeGateReason,
+            mergeGateForced,
             result: mergeResult,
           });
           await traceLogger.write("merge_redeem", {
             action: "merge",
             amount: mergeAmount,
-            mergeGateReason: mergeGate.reason,
-            mergeGateForced: mergeGate.forced,
+            mergeGateReason,
+            mergeGateForced,
+            mergeBasketEffectivePair: mergeBasketEffectivePair ?? null,
             mergePendingMatchedQty: mergeGate.pendingMatchedQty,
             mergeCompletedCycles: mergeGate.completedCycles,
             mergeOldestMatchedAgeSec: mergeGate.oldestMatchedAgeSec ?? null,
             txHash: mergeResult.txHash ?? null,
             simulated: mergeResult.simulated,
             skipped: mergeResult.skipped ?? false,
+            confirmed: mergeResult.confirmed ?? null,
+            state: mergeResult.state ?? null,
+            collateralToken: mergeResult.collateralToken ?? null,
+            collateralSource: mergeResult.collateralSource ?? null,
             lockedPendingUpShares: lockedPendingShares.up,
             lockedPendingDownShares: lockedPendingShares.down,
+            lockedSettlementUpShares: mergeSettlementLockedShares.up,
+            lockedSettlementDownShares: mergeSettlementLockedShares.down,
             matchedUpCost: state.mergeHistory.at(-1)?.matchedUpCost ?? null,
             matchedDownCost: state.mergeHistory.at(-1)?.matchedDownCost ?? null,
             mergeReturn: state.mergeHistory.at(-1)?.mergeReturn ?? null,
@@ -3963,13 +4581,18 @@ export async function runStatefulBotSession(
             marketSlug: market.slug,
             trigger: "runtime",
             amount: mergeAmount,
-            mergeGateReason: mergeGate.reason,
-            mergeGateForced: mergeGate.forced,
+            mergeGateReason,
+            mergeGateForced,
+            mergeBasketEffectivePair: mergeBasketEffectivePair ?? null,
             mergePendingMatchedQty: mergeGate.pendingMatchedQty,
             mergeCompletedCycles: mergeGate.completedCycles,
             txHash: mergeResult.txHash ?? null,
             simulated: mergeResult.simulated,
             skipped: mergeResult.skipped ?? false,
+            confirmed: mergeResult.confirmed ?? null,
+            state: mergeResult.state ?? null,
+            collateralToken: mergeResult.collateralToken ?? null,
+            collateralSource: mergeResult.collateralSource ?? null,
             matchedUpCost: state.mergeHistory.at(-1)?.matchedUpCost ?? null,
             matchedDownCost: state.mergeHistory.at(-1)?.matchedDownCost ?? null,
             mergeReturn: state.mergeHistory.at(-1)?.mergeReturn ?? null,
@@ -3980,6 +4603,34 @@ export async function runStatefulBotSession(
           });
           await waitForDecisionPulse();
           continue;
+        }
+        if (
+          mergePlan.shouldMerge &&
+          mergeAmount >= config.mergeMinShares &&
+          nowTs - lastMergeBlockedTraceAt >= DECISION_TRACE_INTERVAL_SEC
+        ) {
+          lastMergeBlockedTraceAt = nowTs;
+          await traceLogger.write("merge_redeem", {
+            action: "merge_blocked",
+            amount: mergeAmount,
+            mergeGateReason: mergeGate.reason,
+            mergeGateForced: mergeGate.forced,
+            mergeFirstForceCandidate: mergeFirstForceReason ?? null,
+            mergeBasketEffectivePair: mergeBasketEffectivePair ?? null,
+            mergeable: mergePlan.mergeable,
+            mergeableUnlocked,
+            lockedSettlementUpShares: mergeSettlementLockedShares.up,
+            lockedSettlementDownShares: mergeSettlementLockedShares.down,
+            pendingPairExecutionActive: pendingPairExecution !== undefined,
+            allowMergeWithPendingGroups: config.allowMergeWithPendingGroups,
+            mergeTxCount,
+            mergeMaxTxPerMarket: config.mergeMaxTxPerMarket,
+            secsFromOpen: nowTs - market.startTs,
+            secsToClose: market.endTs - nowTs,
+            externalActivityDetected,
+            reentryDisabled: state.reentryDisabled,
+            protectedResidualShares: mergeProtectedResidualShares,
+          });
         }
       }
 
@@ -4060,10 +4711,15 @@ export async function runStatefulBotSession(
       const pendingDecisionFillSnapshot = pendingPairExecution
         ? stateStore.loadPairGroupFillSnapshot(pendingPairExecution.group.groupId)
         : undefined;
-      const decisionLockedPendingShares = computePendingLockedShares(
+      const decisionPendingLockedShares = computePendingLockedShares(
         pendingPairExecution,
         pendingDecisionFillSnapshot,
         config,
+      );
+      const decisionSettlementLockedShares = computeSettlementLockedShares(nowTs);
+      const decisionLockedPendingShares = combineLockedShares(
+        decisionPendingLockedShares,
+        decisionSettlementLockedShares,
       );
       const openMatchedQty = Number(Math.min(state.upShares, state.downShares).toFixed(6));
       const unlockedMatchedQty = unlockedMergeableShares(state, decisionLockedPendingShares);
@@ -4549,9 +5205,9 @@ export async function runStatefulBotSession(
         );
         const submittedCompletionOrder = liveOrder ?? decision.completion.order;
         const result = liveOrder
-          ? await completionManager.complete(liveOrder)
+          ? await completeOrderSafely(completionManager, liveOrder)
           : skippedOrderResult("skipped_insufficient_balance", "completion_order_not_affordable");
-        if (liveOrder) {
+        if (liveOrder && shouldRegisterSubmittedIntentForResult(result)) {
           updateCachedUsdcBalanceAfterOrderResult(liveOrder, result);
           rememberSubmittedPrices(
             submittedPrices,
@@ -4568,6 +5224,9 @@ export async function runStatefulBotSession(
             nowTs,
           );
         }
+        if (liveOrder && !shouldRegisterSubmittedIntentForResult(result)) {
+          updateCachedUsdcBalanceAfterOrderResult(liveOrder, result);
+        }
         const accepted = isOrderResultAccepted(result);
         const submittedCompletionShares =
           submittedCompletionOrder.shareTarget ?? decision.completion.missingShares;
@@ -4580,24 +5239,45 @@ export async function runStatefulBotSession(
             }),
             lineage: currentRuntimeFlowLineage(decision.completion.sideToBuy),
           });
-          const immediateCompletion = applyImmediateOrderResultFill({
-            state,
+          const immediateCompletionFill = inferImmediateOrderResultFill({
             result,
             order: submittedCompletionOrder,
             outcome: decision.completion.sideToBuy,
             nowTs,
             mode: decision.completion.mode,
-            flowLineage: currentRuntimeFlowLineage(decision.completion.sideToBuy),
           });
-          state = immediateCompletion.state;
-          if (immediateCompletion.fill) {
+          const immediateCompletion = immediateCompletionFill
+            ? {
+                ...immediateCompletionFill,
+                flowLineage: currentRuntimeFlowLineage(decision.completion.sideToBuy),
+              }
+            : undefined;
+          if (immediateCompletion) {
+            const accounting = markAppliedBotFill(immediateCompletion, {
+              orderId: result.orderId,
+            });
+            if (!accounting.applied) {
+              await traceLogger.write("user_fills", {
+                eventType: "order_result_fill_dedupe",
+                phase: "completion",
+                outcome: immediateCompletion.outcome,
+                side: immediateCompletion.side,
+                size: immediateCompletion.size,
+                price: immediateCompletion.price,
+                executionMode: decision.completion.mode,
+                orderId: result.orderId ?? null,
+                accountingKey: accounting.key ?? null,
+                source: "FILL_ACCOUNTING",
+              });
+            } else {
+              state = applyFill(state, immediateCompletion);
             pendingCompletionSubmission = undefined;
-            stateStore.recordFill(state, immediateCompletion.fill, {
+            stateStore.recordFill(state, immediateCompletion, {
               orderId: result.orderId,
               executionMode: decision.completion.mode,
               source: "ORDER_RESULT",
             });
-            rememberBotOwnedBuyFill(immediateCompletion.fill, {
+            rememberBotOwnedBuyFill(immediateCompletion, {
               orderId: result.orderId,
             });
             runtimeProtectedResidualLock =
@@ -4609,29 +5289,37 @@ export async function runStatefulBotSession(
                     nowTs,
                     mode: decision.completion.mode,
                   });
-            consumeSubmittedIntent(submittedPrices, immediateCompletion.fill.outcome, immediateCompletion.fill.size);
-            rememberOrderResultFillSuppression(immediateCompletion.fill);
+            consumeSubmittedIntent(submittedPrices, immediateCompletion.outcome, immediateCompletion.size);
+            rememberOrderResultFillSuppression(immediateCompletion);
+            await handleOrderResultOverfill({
+              fill: immediateCompletion,
+              order: submittedCompletionOrder,
+              orderId: result.orderId,
+              phase: "completion",
+              mode: decision.completion.mode,
+            });
             pushEvent(events, {
               timestamp: nowTs,
               type: "order_result_fill",
               phase: "completion",
-              outcome: immediateCompletion.fill.outcome,
-              size: immediateCompletion.fill.size,
-              price: immediateCompletion.fill.price,
+              outcome: immediateCompletion.outcome,
+              size: immediateCompletion.size,
+              price: immediateCompletion.price,
               orderId: result.orderId ?? null,
             });
             await traceLogger.write("user_fills", {
               eventType: "order_result_fill",
               phase: "completion",
-              outcome: immediateCompletion.fill.outcome,
-              side: immediateCompletion.fill.side,
-              size: immediateCompletion.fill.size,
-              price: immediateCompletion.fill.price,
+              outcome: immediateCompletion.outcome,
+              side: immediateCompletion.side,
+              size: immediateCompletion.size,
+              price: immediateCompletion.price,
               executionMode: decision.completion.mode,
               orderId: result.orderId ?? null,
               source: "ORDER_RESULT",
               correlationId: result.orderId,
             });
+            }
           } else {
             pendingCompletionSubmission = createPendingCompletionSubmission({
               result,
@@ -4831,34 +5519,36 @@ export async function runStatefulBotSession(
               mode: entryBuy.mode,
             })),
           };
-	          const executedBySide = await executePairOrderPlan({
-	            completionManager,
-	            orderPlanBySide,
-	            orderedEntries,
-	            sequentialPairExecutionActive,
-	            interChildDelayMs: pairChildOrderDelayMs,
-	          });
-	          const upResult = selectRepresentativeResult(executedBySide.UP);
-	          const downResult = selectRepresentativeResult(executedBySide.DOWN);
-	          const allExecutions = [...executedBySide.UP, ...executedBySide.DOWN];
-	          updateCachedUsdcBalanceAfterExecutions(allExecutions);
+          const executedBySide = await executePairOrderPlan({
+            completionManager,
+            orderPlanBySide,
+            orderedEntries,
+            sequentialPairExecutionActive,
+            interChildDelayMs: pairChildOrderDelayMs,
+          });
+          const upResult = selectRepresentativeResult(executedBySide.UP);
+          const downResult = selectRepresentativeResult(executedBySide.DOWN);
+          const allExecutions = [...executedBySide.UP, ...executedBySide.DOWN];
+          updateCachedUsdcBalanceAfterExecutions(allExecutions);
 
-	          rememberSubmittedPrices(
-	            submittedPrices,
-	            market,
-	            allExecutions.map(({ order, result }) => ({
-	              ...order,
-	              side: order.side,
-	              mode:
-	                order.tokenId === market.tokens.UP.tokenId
-	                  ? groupedEntryBySide.UP.mode
-	                  : groupedEntryBySide.DOWN.mode,
-	              groupId: group.groupId,
-	              orderId: result.orderId,
-	              expectedShares: expectedSharesForSubmission(order.shareTarget, result),
-	            })),
-	            submittedAtTs,
-	          );
+          rememberSubmittedPrices(
+            submittedPrices,
+            market,
+            allExecutions
+              .filter(({ result }) => shouldRegisterSubmittedIntentForResult(result))
+              .map(({ order, result }) => ({
+                ...order,
+                side: order.side,
+                mode:
+                  order.tokenId === market.tokens.UP.tokenId
+                    ? groupedEntryBySide.UP.mode
+                    : groupedEntryBySide.DOWN.mode,
+                groupId: group.groupId,
+                orderId: result.orderId,
+                expectedShares: expectedSharesForSubmission(order.shareTarget, result),
+              })),
+            submittedAtTs,
+          );
           const negativeEdgeUsdc = estimateNegativeEdgeUsdc(upEntry.pairCostWithFees ?? 1, group.intendedQty);
           pairGroupCount += 1;
           entrySubmitCount += allExecutions.length;
@@ -4899,7 +5589,7 @@ export async function runStatefulBotSession(
               nowTs,
               mode,
             });
-            return fill ? [{ fill, result, mode }] : [];
+            return fill ? [{ fill, result, order, mode }] : [];
           });
           for (const immediateFill of immediateOrderResultFills) {
             const normalizedImmediateFill: FillRecord = {
@@ -4913,6 +5603,25 @@ export async function runStatefulBotSession(
                     arbitrationCarry?.protectedResidualSide ?? (partialOpenGroupLock ?? runtimeProtectedResidualLock)?.protectedSide,
                 }),
             };
+            const accounting = markAppliedBotFill(normalizedImmediateFill, {
+              orderId: immediateFill.result?.orderId,
+            });
+            if (!accounting.applied) {
+              await traceLogger.write("user_fills", {
+                eventType: "order_result_fill_dedupe",
+                outcome: normalizedImmediateFill.outcome,
+                side: normalizedImmediateFill.side,
+                size: normalizedImmediateFill.size,
+                price: normalizedImmediateFill.price,
+                executionMode: immediateFill.mode,
+                groupId: group.groupId,
+                orderId: immediateFill.result?.orderId ?? null,
+                accountingKey: accounting.key ?? null,
+                source: "FILL_ACCOUNTING",
+                correlationId: group.groupId,
+              });
+              continue;
+            }
             state = applyFill(state, normalizedImmediateFill);
             stateStore.recordFill(state, normalizedImmediateFill, {
               orderId: immediateFill.result?.orderId,
@@ -4926,6 +5635,14 @@ export async function runStatefulBotSession(
             });
             consumeSubmittedIntent(submittedPrices, normalizedImmediateFill.outcome, normalizedImmediateFill.size);
             rememberOrderResultFillSuppression(normalizedImmediateFill);
+            await handleOrderResultOverfill({
+              fill: normalizedImmediateFill,
+              order: immediateFill.order,
+              orderId: immediateFill.result?.orderId,
+              groupId: group.groupId,
+              phase: "pair",
+              mode: immediateFill.mode,
+            });
             pushEvent(events, {
               timestamp: nowTs,
               type: "order_result_fill",
@@ -5059,6 +5776,21 @@ export async function runStatefulBotSession(
           });
           if (immediateFinalizedPairExecution && pendingPairExecution) {
             await persistFinalizedPairGroup(immediateFinalizedPairExecution, pendingPairExecution, nowTs);
+            deactivateSubmittedIntentsForGroup(group.groupId);
+            pendingPairExecution = undefined;
+            activePairSubmission = undefined;
+          } else if (!anyAccepted && pendingPairExecution) {
+            const rejectedFinalized = finalizePairExecutionResult({
+              group,
+              upResult,
+              downResult,
+              state,
+              fillSnapshot: stateStore.loadPairGroupFillSnapshot(group.groupId),
+              reconcileObservedAfterSubmit: false,
+              requireReconcileBeforeNoneFilled: false,
+            });
+            await persistFinalizedPairGroup(rejectedFinalized, pendingPairExecution, nowTs);
+            deactivateSubmittedIntentsForGroup(group.groupId);
             pendingPairExecution = undefined;
             activePairSubmission = undefined;
           }
@@ -5188,14 +5920,16 @@ export async function runStatefulBotSession(
             rememberSubmittedPrices(
               submittedPrices,
               market,
-              executions.map(({ order, result: executionResult }) => ({
-                ...order,
-                side: order.side,
-                mode: entryBuy.mode,
-                groupId: temporalSeedGroup?.groupId,
-                orderId: executionResult.orderId,
-                expectedShares: expectedSharesForSubmission(order.shareTarget, executionResult),
-              })),
+              executions
+                .filter(({ result: executionResult }) => shouldRegisterSubmittedIntentForResult(executionResult))
+                .map(({ order, result: executionResult }) => ({
+                  ...order,
+                  side: order.side,
+                  mode: entryBuy.mode,
+                  groupId: temporalSeedGroup?.groupId,
+                  orderId: executionResult.orderId,
+                  expectedShares: expectedSharesForSubmission(order.shareTarget, executionResult),
+                })),
               submittedAtTs,
             );
           }
@@ -5218,14 +5952,20 @@ export async function runStatefulBotSession(
             });
             let sawImmediateEntryFill = false;
             for (const execution of executions) {
-              const immediateEntry = applyImmediateOrderResultFill({
-                state,
+              const immediateEntryFill = inferImmediateOrderResultFill({
                 result: execution.result,
                 order: execution.order,
                 outcome: entryBuy.side,
                 nowTs,
                 mode: entryBuy.mode,
+              });
+              if (!immediateEntryFill) {
+                continue;
+              }
+              const immediateEntry: FillRecord = {
+                ...immediateEntryFill,
                 flowLineage:
+                  immediateEntryFill.flowLineage ??
                   currentRuntimeFlowLineage(entryBuy.side) ??
                   deriveCarryFlowLineageKey({
                     recommendation: arbitrationCarry?.recommendation,
@@ -5234,19 +5974,34 @@ export async function runStatefulBotSession(
                       arbitrationCarry?.protectedResidualSide ??
                       (partialOpenGroupLock ?? runtimeProtectedResidualLock)?.protectedSide,
                   }),
+              };
+              const accounting = markAppliedBotFill(immediateEntry, {
+                orderId: execution.result.orderId,
               });
-              state = immediateEntry.state;
-              if (!immediateEntry.fill) {
+              if (!accounting.applied) {
+                await traceLogger.write("user_fills", {
+                  eventType: "order_result_fill_dedupe",
+                  phase: "entry",
+                  outcome: immediateEntry.outcome,
+                  side: immediateEntry.side,
+                  size: immediateEntry.size,
+                  price: immediateEntry.price,
+                  executionMode: entryBuy.mode,
+                  orderId: execution.result.orderId ?? null,
+                  accountingKey: accounting.key ?? null,
+                  source: "FILL_ACCOUNTING",
+                });
                 continue;
               }
+              state = applyFill(state, immediateEntry);
               sawImmediateEntryFill = true;
               pendingEntryRepairSubmission = undefined;
-              stateStore.recordFill(state, immediateEntry.fill, {
+              stateStore.recordFill(state, immediateEntry, {
                 orderId: execution.result.orderId,
                 executionMode: entryBuy.mode,
                 source: "ORDER_RESULT",
               });
-              rememberBotOwnedBuyFill(immediateEntry.fill, {
+              rememberBotOwnedBuyFill(immediateEntry, {
                 orderId: execution.result.orderId,
               });
               runtimeProtectedResidualLock =
@@ -5258,24 +6013,31 @@ export async function runStatefulBotSession(
                       nowTs,
                       mode: entryBuy.mode,
                     });
-              consumeSubmittedIntent(submittedPrices, immediateEntry.fill.outcome, immediateEntry.fill.size);
-              rememberOrderResultFillSuppression(immediateEntry.fill);
+              consumeSubmittedIntent(submittedPrices, immediateEntry.outcome, immediateEntry.size);
+              rememberOrderResultFillSuppression(immediateEntry);
+              await handleOrderResultOverfill({
+                fill: immediateEntry,
+                order: execution.order,
+                orderId: execution.result.orderId,
+                phase: "entry",
+                mode: entryBuy.mode,
+              });
               pushEvent(events, {
                 timestamp: nowTs,
                 type: "order_result_fill",
                 phase: "entry",
-                outcome: immediateEntry.fill.outcome,
-                size: immediateEntry.fill.size,
-                price: immediateEntry.fill.price,
+                outcome: immediateEntry.outcome,
+                size: immediateEntry.size,
+                price: immediateEntry.price,
                 orderId: execution.result.orderId ?? null,
               });
               await traceLogger.write("user_fills", {
                 eventType: "order_result_fill",
                 phase: "entry",
-                outcome: immediateEntry.fill.outcome,
-                side: immediateEntry.fill.side,
-                size: immediateEntry.fill.size,
-                price: immediateEntry.fill.price,
+                outcome: immediateEntry.outcome,
+                side: immediateEntry.side,
+                size: immediateEntry.size,
+                price: immediateEntry.price,
                 executionMode: entryBuy.mode,
                 orderId: execution.result.orderId ?? null,
                 source: "ORDER_RESULT",
@@ -5339,6 +6101,25 @@ export async function runStatefulBotSession(
                       arbitrationCarry?.protectedResidualSide ?? (partialOpenGroupLock ?? runtimeProtectedResidualLock)?.protectedSide,
                   }),
               };
+              const accounting = markAppliedBotFill(normalizedImmediateFill, {
+                orderId: execution.result.orderId,
+              });
+              if (!accounting.applied) {
+                await traceLogger.write("user_fills", {
+                  eventType: "order_result_fill_dedupe",
+                  outcome: normalizedImmediateFill.outcome,
+                  side: normalizedImmediateFill.side,
+                  size: normalizedImmediateFill.size,
+                  price: normalizedImmediateFill.price,
+                  executionMode: entryBuy.mode,
+                  groupId: temporalSeedGroup.groupId,
+                  orderId: execution.result.orderId ?? null,
+                  accountingKey: accounting.key ?? null,
+                  source: "FILL_ACCOUNTING",
+                  correlationId: temporalSeedGroup.groupId,
+                });
+                continue;
+              }
               state = applyFill(state, normalizedImmediateFill);
               stateStore.recordFill(state, normalizedImmediateFill, {
                 orderId: execution.result.orderId,
@@ -5361,6 +6142,14 @@ export async function runStatefulBotSession(
                     });
               consumeSubmittedIntent(submittedPrices, immediateFill.outcome, immediateFill.size);
               rememberOrderResultFillSuppression(immediateFill);
+              await handleOrderResultOverfill({
+                fill: normalizedImmediateFill,
+                order: execution.order,
+                orderId: execution.result.orderId,
+                groupId: temporalSeedGroup.groupId,
+                phase: "entry",
+                mode: entryBuy.mode,
+              });
               pushEvent(events, {
                 timestamp: nowTs,
                 type: "order_result_fill",
@@ -5398,6 +6187,7 @@ export async function runStatefulBotSession(
                 status: finalized.status,
               };
               await persistFinalizedPairGroup(finalized, pendingPairExecution, nowTs);
+              deactivateSubmittedIntentsForGroup(temporalSeedGroup.groupId);
               pendingPairExecution = undefined;
               activePairSubmission = undefined;
             }
@@ -5491,7 +6281,7 @@ export async function runStatefulBotSession(
           );
           const submittedUnwindOrder = liveOrder ?? decision.unwind.order;
           const result = liveOrder
-            ? await completionManager.complete(liveOrder)
+            ? await completeOrderSafely(completionManager, liveOrder)
             : skippedOrderResult("skipped_insufficient_balance", "unwind_order_not_affordable");
           if (liveOrder) {
             updateCachedUsdcBalanceAfterOrderResult(liveOrder, result);
@@ -5582,14 +6372,16 @@ export async function runStatefulBotSession(
           postCloseReconcileCount === 0 ||
           nowTs - lastBalanceSyncAt >= Math.floor(resolvedOptions.balanceSyncMs / 1000)
         ) {
-          await performBalanceSync({
+          const synced = await safePerformBalanceSync({
             nowTs,
             books,
             scope: "post_close_reconcile",
             traceLabel: "post_close_reconcile_state",
           });
-          postCloseReconcileCount += 1;
-          await finalizePendingPairExecutionIfReady(nowTs, { forceDeadline: true });
+          if (synced) {
+            postCloseReconcileCount += 1;
+            await finalizePendingPairExecutionIfReady(nowTs, { forceDeadline: true });
+          }
         }
 
         if (postCloseReconcileCount >= 2 && !pendingPairExecution) {
@@ -5610,21 +6402,58 @@ export async function runStatefulBotSession(
         pendingPairGroupId: pendingPairExecution?.group.groupId ?? null,
       });
     }
+  } catch (error) {
+    sessionFatalError = error;
+    const message = error instanceof Error ? error.message : String(error);
+    logger.error({ error, marketSlug: market.slug }, "Stateful live session crashed.");
+    pushEvent(events, {
+      timestamp: clock.now(),
+      type: "session_crashed",
+      message,
+    });
+    await traceLogger.write("market_rollover", {
+      status: "session_crashed",
+      marketSlug: market.slug,
+      endedAt: clock.now(),
+      message,
+      upShares: state.upShares,
+      downShares: state.downShares,
+      pendingPairGroupId: pendingPairExecution?.group.groupId ?? null,
+    });
+    throw error;
   } finally {
     btcPriceFeed.disconnect();
     marketWs.disconnect();
     userWs.disconnect();
+    if (sessionFatalError !== undefined) {
+      for (const signal of shutdownSignals) {
+        process.off(signal, handleShutdownSignal);
+      }
+      await traceLogger.flush();
+      stateStore.close();
+    }
   }
 
   const endedAt = clock.now();
+  const endReason =
+    shutdownRequest !== undefined
+      ? "shutdown_requested"
+      : endedAt >= market.endTs - 1e-9
+        ? "market_end"
+        : "duration_elapsed";
   const closingMergePlan = planMerge(config, state);
   const closingPendingFillSnapshot = pendingPairExecution
     ? stateStore.loadPairGroupFillSnapshot(pendingPairExecution.group.groupId)
     : undefined;
-  const closingLockedPendingShares = computePendingLockedShares(
+  const closingPendingLockedShares = computePendingLockedShares(
     pendingPairExecution,
     closingPendingFillSnapshot,
     config,
+  );
+  const closingSettlementLockedShares = computeSettlementLockedShares(endedAt);
+  const closingLockedPendingShares = combineLockedShares(
+    closingPendingLockedShares,
+    closingSettlementLockedShares,
   );
   const closingMergeableUnlocked = config.mergeOnlyConfirmedMatchedUnlockedLots
     ? unlockedMergeableShares(state, closingLockedPendingShares)
@@ -5637,25 +6466,66 @@ export async function runStatefulBotSession(
     ? Math.min(closingMergeableUnlocked, closingMergeClusterPrior.totalQty)
     : closingMergeableUnlocked;
   const closingMergeAmount = normalizeMergeAmount(closingMergeTargetQty, config.mergeDustLeaveShares);
-  if (
-    config.mergeMode === "AUTO" &&
-    config.mergeOnMarketClose &&
-    endedAt >= market.endTs &&
-    closingMergeAmount >= config.mergeMinShares &&
-    (!pendingPairExecution || config.allowMergeWithPendingGroups) &&
-    mergeTxCount < config.mergeMaxTxPerMarket
-  ) {
-    const closingMergeResult = env.CTF_MERGE_ENABLED
-      ? await ctf.mergePositions(market.conditionId, closingMergeAmount)
-      : {
-          simulated: true,
-          skipped: true,
-          action: "merge" as const,
-          amount: closingMergeAmount,
-          conditionId: market.conditionId,
-          reason: "CTF_MERGE_ENABLED=false",
-        };
-    if (closingMergeResult.simulated || !closingMergeResult.skipped) {
+  const sessionEndMergeDecision = evaluateSessionEndMergeDecision({
+    config,
+    state,
+    endedAt,
+    pendingPairExecutionActive: pendingPairExecution !== undefined,
+    mergeTxCount,
+    mergeableUnlocked: closingMergeableUnlocked,
+    mergeAmount: closingMergeAmount,
+  });
+  if (sessionEndMergeDecision.allow) {
+    let closingMergeResult: Awaited<ReturnType<CtfClient["mergePositions"]>> | undefined;
+    try {
+      closingMergeResult = env.CTF_MERGE_ENABLED
+        ? await ctf.mergePositions(market.conditionId, closingMergeAmount, {
+            positionTokenIds: {
+              upTokenId: market.tokens.UP.tokenId,
+              downTokenId: market.tokens.DOWN.tokenId,
+            },
+          })
+        : {
+            simulated: true,
+            skipped: true,
+            action: "merge" as const,
+            amount: closingMergeAmount,
+            conditionId: market.conditionId,
+            reason: "CTF_MERGE_ENABLED=false",
+          };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      logger.warn({ error, mergeAmount: closingMergeAmount, marketSlug: market.slug }, "Session-end CTF merge failed.");
+      pushEvent(events, {
+        timestamp: endedAt,
+        type: "merge_failed",
+        trigger: sessionEndMergeDecision.trigger,
+        amount: closingMergeAmount,
+        reason: sessionEndMergeDecision.reason,
+        message: errorMessage,
+      });
+      await traceLogger.write("merge_redeem", {
+        action: "merge_failed",
+        trigger: sessionEndMergeDecision.trigger,
+        reason: sessionEndMergeDecision.reason,
+        amount: closingMergeAmount,
+        mergeable: sessionEndMergeDecision.mergeable,
+        basketEffectivePair: sessionEndMergeDecision.basketEffectivePair ?? null,
+        lockedPendingUpShares: closingLockedPendingShares.up,
+        lockedPendingDownShares: closingLockedPendingShares.down,
+        lockedSettlementUpShares: closingSettlementLockedShares.up,
+        lockedSettlementDownShares: closingSettlementLockedShares.down,
+        error: errorMessage,
+      });
+      emitLiveMirror("merge_failed", {
+        marketSlug: market.slug,
+        trigger: sessionEndMergeDecision.trigger,
+        amount: closingMergeAmount,
+        reason: sessionEndMergeDecision.reason,
+        error: errorMessage,
+      });
+    }
+    if (closingMergeResult && shouldAccountCtfTxResult(closingMergeResult)) {
       const preMergeState = state;
       state = applyMerge(state, {
         amount: closingMergeAmount,
@@ -5704,36 +6574,52 @@ export async function runStatefulBotSession(
       });
       persistMarketState(state.reentryDisabled ? "post_merge_completion_only" : undefined);
     }
-    await traceLogger.write("merge_redeem", {
-      action: "merge",
-      amount: closingMergeAmount,
-      trigger: "market_close",
-      txHash: closingMergeResult.txHash ?? null,
-      simulated: closingMergeResult.simulated,
-      skipped: closingMergeResult.skipped ?? false,
-      matchedUpCost: state.mergeHistory.at(-1)?.matchedUpCost ?? null,
-      matchedDownCost: state.mergeHistory.at(-1)?.matchedDownCost ?? null,
-      mergeReturn: state.mergeHistory.at(-1)?.mergeReturn ?? null,
-      realizedPnl: state.mergeHistory.at(-1)?.realizedPnl ?? null,
-      remainingUpShares: state.mergeHistory.at(-1)?.remainingUpShares ?? null,
-      remainingDownShares: state.mergeHistory.at(-1)?.remainingDownShares ?? null,
-      postMergeCompletionOnlyUntil: state.postMergeCompletionOnlyUntil ?? null,
-    });
-    emitLiveMirror("merge_submit", {
-      marketSlug: market.slug,
-      trigger: "market_close",
-      amount: closingMergeAmount,
-      txHash: closingMergeResult.txHash ?? null,
-      simulated: closingMergeResult.simulated,
-      skipped: closingMergeResult.skipped ?? false,
-      matchedUpCost: state.mergeHistory.at(-1)?.matchedUpCost ?? null,
-      matchedDownCost: state.mergeHistory.at(-1)?.matchedDownCost ?? null,
-      mergeReturn: state.mergeHistory.at(-1)?.mergeReturn ?? null,
-      realizedPnl: state.mergeHistory.at(-1)?.realizedPnl ?? null,
-      remainingUpShares: state.mergeHistory.at(-1)?.remainingUpShares ?? null,
-      remainingDownShares: state.mergeHistory.at(-1)?.remainingDownShares ?? null,
-      postMergeCompletionOnlyUntil: state.postMergeCompletionOnlyUntil ?? null,
-    });
+    if (closingMergeResult) {
+      await traceLogger.write("merge_redeem", {
+        action: "merge",
+        amount: closingMergeAmount,
+        trigger: sessionEndMergeDecision.trigger,
+        reason: sessionEndMergeDecision.reason,
+        endReason,
+        basketEffectivePair: sessionEndMergeDecision.basketEffectivePair ?? null,
+        txHash: closingMergeResult.txHash ?? null,
+        simulated: closingMergeResult.simulated,
+        skipped: closingMergeResult.skipped ?? false,
+        confirmed: closingMergeResult.confirmed ?? null,
+        state: closingMergeResult.state ?? null,
+        collateralToken: closingMergeResult.collateralToken ?? null,
+        collateralSource: closingMergeResult.collateralSource ?? null,
+        matchedUpCost: state.mergeHistory.at(-1)?.matchedUpCost ?? null,
+        matchedDownCost: state.mergeHistory.at(-1)?.matchedDownCost ?? null,
+        mergeReturn: state.mergeHistory.at(-1)?.mergeReturn ?? null,
+        realizedPnl: state.mergeHistory.at(-1)?.realizedPnl ?? null,
+        remainingUpShares: state.mergeHistory.at(-1)?.remainingUpShares ?? null,
+        remainingDownShares: state.mergeHistory.at(-1)?.remainingDownShares ?? null,
+        postMergeCompletionOnlyUntil: state.postMergeCompletionOnlyUntil ?? null,
+      });
+      emitLiveMirror("merge_submit", {
+        marketSlug: market.slug,
+        trigger: sessionEndMergeDecision.trigger,
+        reason: sessionEndMergeDecision.reason,
+        endReason,
+        basketEffectivePair: sessionEndMergeDecision.basketEffectivePair ?? null,
+        amount: closingMergeAmount,
+        txHash: closingMergeResult.txHash ?? null,
+        simulated: closingMergeResult.simulated,
+        skipped: closingMergeResult.skipped ?? false,
+        confirmed: closingMergeResult.confirmed ?? null,
+        state: closingMergeResult.state ?? null,
+        collateralToken: closingMergeResult.collateralToken ?? null,
+        collateralSource: closingMergeResult.collateralSource ?? null,
+        matchedUpCost: state.mergeHistory.at(-1)?.matchedUpCost ?? null,
+        matchedDownCost: state.mergeHistory.at(-1)?.matchedDownCost ?? null,
+        mergeReturn: state.mergeHistory.at(-1)?.mergeReturn ?? null,
+        realizedPnl: state.mergeHistory.at(-1)?.realizedPnl ?? null,
+        remainingUpShares: state.mergeHistory.at(-1)?.remainingUpShares ?? null,
+        remainingDownShares: state.mergeHistory.at(-1)?.remainingDownShares ?? null,
+        postMergeCompletionOnlyUntil: state.postMergeCompletionOnlyUntil ?? null,
+      });
+    }
   }
   const finalBooks = buildBooks(marketWs, market);
   const finalPostMergeCompletionOnlyActive =
@@ -5826,6 +6712,8 @@ export async function runStatefulBotSession(
         entrySubmitCount > 0
           ? Number((entryArbitrationActionDeltaCount / entrySubmitCount).toFixed(6))
           : 0,
+      endReason,
+      ...(shutdownRequest ? { shutdownSignal: shutdownRequest.signal } : {}),
     },
     finalState: {
       upShares: state.upShares,
@@ -5851,6 +6739,8 @@ export async function runStatefulBotSession(
   await traceLogger.write("market_rollover", {
     status: "session_end",
     endedAt,
+    endReason,
+    shutdownSignal: shutdownRequest?.signal ?? null,
     upShares: state.upShares,
     downShares: state.downShares,
     mergeCount,
@@ -5865,6 +6755,8 @@ export async function runStatefulBotSession(
     marketSlug: market.slug,
     conditionId: market.conditionId,
     payload: {
+      endReason,
+      shutdownSignal: shutdownRequest?.signal ?? null,
       upShares: state.upShares,
       downShares: state.downShares,
       mergeCount,
@@ -5874,6 +6766,9 @@ export async function runStatefulBotSession(
       ),
     },
   });
+  for (const signal of shutdownSignals) {
+    process.off(signal, handleShutdownSignal);
+  }
   await traceLogger.flush();
   stateStore.close();
 

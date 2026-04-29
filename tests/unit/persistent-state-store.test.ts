@@ -238,6 +238,79 @@ describe("persistent state store", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
+  it("deduplicates BUY lots by accepted order id and filled share size across fill sources", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "xuan-state-"));
+    const dbPath = join(dir, "state.sqlite");
+    const market = { ...buildOfflineMarket(1713696000), feeRate: 1000 };
+    const createdAt = market.startTs + 12;
+
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.65,
+      size: 5.230768,
+      timestamp: createdAt,
+      makerTaker: "taker",
+      executionMode: "PAIRGROUP_COVERED_SEED",
+    });
+
+    const store = new PersistentStateStore(dbPath);
+    store.upsertPairGroup({
+      groupId: "pair-1",
+      marketSlug: market.slug,
+      conditionId: market.conditionId,
+      upTokenId: market.tokens.UP.tokenId,
+      downTokenId: market.tokens.DOWN.tokenId,
+      intendedQty: 5,
+      maxUpPrice: 0.35,
+      maxDownPrice: 0.65,
+      orderType: "FAK",
+      mode: "XUAN",
+      selectedMode: "PAIRGROUP_COVERED_SEED",
+      createdAt,
+      status: "DOWN_ONLY",
+      baselineUpShares: 0,
+      baselineDownShares: 0,
+      rawPair: 1,
+      effectivePair: 1.03,
+      negativeEdgeUsdc: 0.1,
+      marketNegativeSpentBefore: 0,
+      marketNegativeSpentAfter: 0.1,
+    });
+    const first = store.recordFill(state, state.fillHistory[0]!, {
+      source: "ORDER_RESULT",
+      groupId: "pair-1",
+      orderId: "order-dup",
+      executionMode: "PAIRGROUP_COVERED_SEED",
+    });
+    const second = store.recordFill(state, state.fillHistory[0]!, {
+      source: "BALANCE_RECONCILE",
+      groupId: "pair-1",
+      orderId: "order-dup",
+      executionMode: "PAIRGROUP_COVERED_SEED",
+    });
+    store.close();
+
+    const db = new DatabaseSync(dbPath);
+    const lotRows = db
+      .prepare("SELECT qty_open, source, order_id FROM inventory_lots WHERE market_slug = ? AND outcome = 'DOWN'")
+      .all(market.slug) as unknown as Array<{ qty_open: number; source: string; order_id: string }>;
+    db.close();
+
+    expect(first).toBe(true);
+    expect(second).toBe(false);
+    expect(lotRows).toEqual([
+      {
+        qty_open: 5.230768,
+        source: "ORDER_RESULT",
+        order_id: "order-dup",
+      },
+    ]);
+
+    await rm(dir, { recursive: true, force: true });
+  });
+
   it("persists latest open partial pair group and replay validation state", async () => {
     const dir = await mkdtemp(join(tmpdir(), "xuan-state-"));
     const dbPath = join(dir, "state.sqlite");

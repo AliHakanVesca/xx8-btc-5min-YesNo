@@ -45,6 +45,7 @@ export interface RelayerTxResult {
   transactionId: string;
   transactionHash?: string;
   state: string;
+  confirmed: boolean;
   proxyAddress?: string;
 }
 
@@ -173,10 +174,11 @@ export class RelayerApiClient {
     const finalTx = await this.wait(submitted.transactionID);
     return {
       transactionId: submitted.transactionID,
-      transactionHash: finalTx?.transactionHash ?? submitted.transactionHash,
-      state: finalTx?.state ?? submitted.state,
-      ...(finalTx?.proxyAddress || this.configuredFunder
-        ? { proxyAddress: finalTx?.proxyAddress ?? this.configuredFunder }
+      transactionHash: finalTx.transactionHash ?? submitted.transactionHash,
+      state: finalTx.state,
+      confirmed: finalTx.state === RelayerTransactionState.STATE_CONFIRMED,
+      ...(finalTx.proxyAddress || this.configuredFunder
+        ? { proxyAddress: finalTx.proxyAddress ?? this.configuredFunder }
         : {}),
     };
   }
@@ -239,9 +241,10 @@ export class RelayerApiClient {
     const finalTx = await this.wait(submitted.transactionID);
     return {
       transactionId: submitted.transactionID,
-      transactionHash: finalTx?.transactionHash ?? submitted.transactionHash,
-      state: finalTx?.state ?? submitted.state,
-      ...(finalTx?.proxyAddress ? { proxyAddress: finalTx.proxyAddress } : {}),
+      transactionHash: finalTx.transactionHash ?? submitted.transactionHash,
+      state: finalTx.state,
+      confirmed: finalTx.state === RelayerTransactionState.STATE_CONFIRMED,
+      ...(finalTx.proxyAddress ? { proxyAddress: finalTx.proxyAddress } : {}),
     };
   }
 
@@ -253,7 +256,8 @@ export class RelayerApiClient {
     transactionId: string,
     maxPolls = 30,
     pollFrequencyMs = 2000,
-  ): Promise<RelayerTransaction | undefined> {
+  ): Promise<RelayerTransaction> {
+    let lastState: string | undefined;
     for (let index = 0; index < maxPolls; index += 1) {
       const transactions = await this.getTransaction(transactionId);
       const transaction = transactions[0];
@@ -261,6 +265,7 @@ export class RelayerApiClient {
         await sleep(pollFrequencyMs);
         continue;
       }
+      lastState = transaction.state;
       if (transaction.state === RelayerTransactionState.STATE_CONFIRMED) {
         return transaction;
       }
@@ -273,7 +278,7 @@ export class RelayerApiClient {
       }
       await sleep(pollFrequencyMs);
     }
-    return undefined;
+    throw new Error(`Relayer tx ${transactionId} did not confirm before timeout${lastState ? ` (lastState=${lastState})` : ""}`);
   }
 
   private async send<T>(

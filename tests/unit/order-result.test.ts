@@ -53,4 +53,48 @@ describe("orderResult helpers", () => {
       error: "no match",
     });
   });
+
+  it("redacts CLOB auth headers and signed order payloads from raw summaries", () => {
+    const summary = summarizeOrderResult({
+      success: false,
+      simulated: false,
+      orderId: "unknown-order-id",
+      status: "400",
+      raw: {
+        status: 400,
+        error: "invalid amount",
+        config: {
+          headers: {
+            POLY_API_KEY: "api-key-secret",
+            POLY_PASSPHRASE: "passphrase-secret",
+            POLY_SIGNATURE: "signature-secret",
+          },
+          data: JSON.stringify({
+            owner: "api-key-secret",
+            order: {
+              signature: "0xabc123",
+              tokenId: "token-id",
+            },
+          }),
+        },
+      },
+      requestedAt: 0,
+    });
+
+    expect(JSON.stringify(summary)).not.toContain("api-key-secret");
+    expect(JSON.stringify(summary)).not.toContain("passphrase-secret");
+    expect(JSON.stringify(summary)).not.toContain("signature-secret");
+    expect(JSON.stringify(summary)).not.toContain("0xabc123");
+    expect(summary).toMatchObject({
+      raw: {
+        config: {
+          headers: {
+            POLY_API_KEY: "[redacted]",
+            POLY_PASSPHRASE: "[redacted]",
+            POLY_SIGNATURE: "[redacted]",
+          },
+        },
+      },
+    });
+  });
 });

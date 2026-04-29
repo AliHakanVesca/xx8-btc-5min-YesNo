@@ -56,7 +56,7 @@ import { OrderBookState } from "./strategy/xuan5m/orderBookState.js";
 import { Xuan5mBot } from "./strategy/xuan5m/Xuan5mBot.js";
 import { OrderManager } from "./execution/orderManager.js";
 import { TakerCompletionManager } from "./execution/takerCompletionManager.js";
-import { CtfClient } from "./infra/ctf/ctfClient.js";
+import { CtfClient, shouldAccountCtfTxResult } from "./infra/ctf/ctfClient.js";
 import { renderDashboard } from "./observability/dashboard.js";
 import { runLiveCheck } from "./live/liveCheck.js";
 import { runContinuousBotDaemon } from "./live/continuousBotDaemon.js";
@@ -1404,10 +1404,20 @@ async function runBotOnce(mode: "dry" | "live"): Promise<void> {
             conditionId: market.conditionId,
             reason: "CTF_MERGE_ENABLED=false",
           }
-        : await ctf.mergePositions(market.conditionId, decision.mergeShares);
+        : await ctf.mergePositions(market.conditionId, decision.mergeShares, {
+            positionTokenIds: {
+              upTokenId: market.tokens.UP.tokenId,
+              downTokenId: market.tokens.DOWN.tokenId,
+            },
+          });
   const redeem =
-    merge && !merge.skipped && env.CTF_AUTO_REDEEM_ENABLED
-      ? await ctf.redeemPositions(market.conditionId)
+    shouldAccountCtfTxResult(merge ?? undefined) && env.CTF_AUTO_REDEEM_ENABLED
+      ? await ctf.redeemPositions(market.conditionId, {
+          positionTokenIds: {
+            upTokenId: market.tokens.UP.tokenId,
+            downTokenId: market.tokens.DOWN.tokenId,
+          },
+        })
       : null;
 
   const payload = {
@@ -1559,10 +1569,35 @@ async function runInventoryActionCommand(action: "merge" | "redeem" | "manage"):
   const env = loadEnv();
   const config = buildStrategyConfig(env);
   const stateStore = new PersistentStateStore(config.stateStorePath);
+  try {
+    if (action === "manage") {
+      const report = await manageInventory(env, config);
+      for (const item of report.actions) {
+        stateStore.recordMergeRedeemEvent({
+          marketSlug: item.slug,
+          conditionId: item.conditionId,
+          action: item.type,
+          amount: item.amount,
+          timestamp: Math.floor(Date.now() / 1000),
+          simulated: item.result.simulated,
+          reason: item.reason,
+          txHash: item.result.txHash,
+        });
+      }
+      await writeStructuredLog("merge_redeem", { event: "inventory_manage", report });
+      console.log(JSON.stringify(report, null, 2));
+      return;
+    }
 
-  if (action === "manage") {
-    const report = await manageInventory(env, config);
-    for (const item of report.actions) {
+    const snapshot = await fetchInventorySnapshot(env, config);
+    const plan = buildInventoryActionPlan(snapshot, config);
+    const filteredPlan = {
+      ...plan,
+      redeem: action === "redeem" ? plan.redeem : [],
+      merge: action === "merge" ? plan.merge : [],
+    };
+    const actions = await executeInventoryActionPlan(env, filteredPlan, config);
+    for (const item of actions) {
       stateStore.recordMergeRedeemEvent({
         marketSlug: item.slug,
         conditionId: item.conditionId,
@@ -1574,41 +1609,17 @@ async function runInventoryActionCommand(action: "merge" | "redeem" | "manage"):
         txHash: item.result.txHash,
       });
     }
-    await writeStructuredLog("merge_redeem", { event: "inventory_manage", report });
+    const payload = {
+      before: snapshot,
+      plan: filteredPlan,
+      actions,
+      after: await fetchInventorySnapshot(env, config),
+    };
+    await writeStructuredLog("merge_redeem", { event: `inventory_${action}_only`, ...payload });
+    console.log(JSON.stringify(payload, null, 2));
+  } finally {
     stateStore.close();
-    console.log(JSON.stringify(report, null, 2));
-    return;
   }
-
-  const snapshot = await fetchInventorySnapshot(env, config);
-  const plan = buildInventoryActionPlan(snapshot, config);
-  const filteredPlan = {
-    ...plan,
-    redeem: action === "redeem" ? plan.redeem : [],
-    merge: action === "merge" ? plan.merge : [],
-  };
-  const actions = await executeInventoryActionPlan(env, filteredPlan, config);
-  for (const item of actions) {
-    stateStore.recordMergeRedeemEvent({
-      marketSlug: item.slug,
-      conditionId: item.conditionId,
-      action: item.type,
-      amount: item.amount,
-      timestamp: Math.floor(Date.now() / 1000),
-      simulated: item.result.simulated,
-      reason: item.reason,
-      txHash: item.result.txHash,
-    });
-  }
-  const payload = {
-    before: snapshot,
-    plan: filteredPlan,
-    actions,
-    after: await fetchInventorySnapshot(env, config),
-  };
-  await writeStructuredLog("merge_redeem", { event: `inventory_${action}_only`, ...payload });
-  stateStore.close();
-  console.log(JSON.stringify(payload, null, 2));
 }
 
 async function runCollateralApproveCommand(): Promise<void> {

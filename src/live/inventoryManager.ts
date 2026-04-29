@@ -84,6 +84,8 @@ export interface InventoryActionPlanItem {
   conditionId: string;
   slug: string;
   relation: InventoryRelation;
+  upTokenId?: string | undefined;
+  downTokenId?: string | undefined;
   amount?: number;
   reason: string;
 }
@@ -203,6 +205,8 @@ function buildInventoryMarketView(
 ): InventoryMarketView {
   const up = positions.find((position) => position.outcome === "UP");
   const down = positions.find((position) => position.outcome === "DOWN");
+  const upAsset = up?.asset ?? down?.oppositeAsset;
+  const downAsset = down?.asset ?? up?.oppositeAsset;
   const upShares = normalizeNumber(up?.size ?? 0);
   const downShares = normalizeNumber(down?.size ?? 0);
   const mergeable = normalizeNumber(Math.min(upShares, downShares));
@@ -218,8 +222,8 @@ function buildInventoryMarketView(
     ...(timing ?? {}),
     resolved,
     redeemable: positions.some((position) => position.redeemable),
-    ...(up ? { upAsset: up.asset } : {}),
-    ...(down ? { downAsset: down.asset } : {}),
+    ...(upAsset ? { upAsset } : {}),
+    ...(downAsset ? { downAsset } : {}),
     upShares,
     downShares,
     totalShares,
@@ -331,6 +335,8 @@ export function buildInventoryActionPlan(
         conditionId: market.conditionId,
         slug: market.slug,
         relation: market.relation,
+        ...(market.upAsset ? { upTokenId: market.upAsset } : {}),
+        ...(market.downAsset ? { downTokenId: market.downAsset } : {}),
         reason: "resolved_inventory",
       });
       continue;
@@ -347,6 +353,8 @@ export function buildInventoryActionPlan(
         conditionId: market.conditionId,
         slug: market.slug,
         relation: market.relation,
+        ...(market.upAsset ? { upTokenId: market.upAsset } : {}),
+        ...(market.downAsset ? { downTokenId: market.downAsset } : {}),
         amount: market.mergeable,
         reason: "mergeable_inventory",
       });
@@ -369,7 +377,7 @@ export function buildInventoryActionPlan(
 
 async function executeRedeemWithRetry(
   ctf: CtfClient,
-  conditionId: string,
+  item: InventoryActionPlanItem,
   retryEnabled: boolean,
   retryMax: number,
 ): Promise<CtfTxResult> {
@@ -378,7 +386,12 @@ async function executeRedeemWithRetry(
 
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      return await ctf.redeemPositions(conditionId);
+      return await ctf.redeemPositions(item.conditionId, {
+        positionTokenIds: {
+          upTokenId: item.upTokenId,
+          downTokenId: item.downTokenId,
+        },
+      });
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
       if (attempt >= attempts) {
@@ -400,7 +413,7 @@ export async function executeInventoryActionPlan(
   const actions: InventoryActionResult[] = [];
 
   for (const item of plan.redeem) {
-    const result = await executeRedeemWithRetry(ctf, item.conditionId, config.redeemRetryEnabled, config.redeemRetryMax);
+    const result = await executeRedeemWithRetry(ctf, item, config.redeemRetryEnabled, config.redeemRetryMax);
     actions.push({
       ...item,
       result,
@@ -408,7 +421,12 @@ export async function executeInventoryActionPlan(
   }
 
   for (const item of plan.merge) {
-    const result = await ctf.mergePositions(item.conditionId, item.amount ?? 0);
+    const result = await ctf.mergePositions(item.conditionId, item.amount ?? 0, {
+      positionTokenIds: {
+        upTokenId: item.upTokenId,
+        downTokenId: item.downTokenId,
+      },
+    });
     actions.push({
       ...item,
       result,

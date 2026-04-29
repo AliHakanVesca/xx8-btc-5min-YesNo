@@ -101,6 +101,8 @@ describe("inventory manager", () => {
           endTs: 1776845700,
           resolved: false,
           redeemable: false,
+          upAsset: "up-current",
+          downAsset: "down-current",
           upShares: 12,
           downShares: 10,
           totalShares: 22,
@@ -119,6 +121,8 @@ describe("inventory manager", () => {
           endTs: 1776845100,
           resolved: true,
           redeemable: true,
+          upAsset: "up-resolved",
+          downAsset: "down-resolved",
           upShares: 8,
           downShares: 0,
           totalShares: 8,
@@ -143,12 +147,16 @@ describe("inventory manager", () => {
     expect(plan.redeem[0]).toMatchObject({
       conditionId: "0xresolved",
       type: "redeem",
+      upTokenId: "up-resolved",
+      downTokenId: "down-resolved",
     });
     expect(plan.merge).toHaveLength(1);
     expect(plan.merge[0]).toMatchObject({
       conditionId: "0xcurrent",
       type: "merge",
       amount: 10,
+      upTokenId: "up-current",
+      downTokenId: "down-current",
     });
     expect(plan.blockNewEntries).toBe(true);
     expect(plan.blockReasons).toContain("current_market_hard_imbalance:btc-updown-5m-1776845400");

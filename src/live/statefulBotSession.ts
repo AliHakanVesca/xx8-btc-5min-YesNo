@@ -78,6 +78,7 @@ import {
   type InventoryMarketView,
 } from "./inventoryManager.js";
 import { isOrderResultAccepted, summarizeOrderResult } from "../infra/clob/orderResult.js";
+import { normalizeExecutableBuyOrder } from "../infra/clob/orderPrecision.js";
 import {
   PersistentStateStore,
   type PersistedArbitrationCarrySnapshot,
@@ -286,6 +287,15 @@ export interface RecentBotOwnedBuyFill {
   expiresAt: number;
   groupId?: string | undefined;
   orderId?: string | undefined;
+}
+
+export interface RecentBotOwnedBalanceReduction {
+  outcome: OutcomeSide;
+  size: number;
+  timestamp: number;
+  expiresAt: number;
+  reason: "ctf_merge";
+  txHash?: string | undefined;
 }
 
 const DECISION_TRACE_INTERVAL_SEC = 20;
@@ -1179,6 +1189,46 @@ function unlockedMergeableShares(
   );
 }
 
+export function clampMergeAmountToObservedBalances(args: {
+  requestedAmount: number;
+  observed: ObservedTokenBalances;
+  minShares: number;
+}): {
+  requestedAmount: number;
+  observedMergeable: number;
+  executableAmount: number;
+  skipped: boolean;
+  reason?: "observed_balance_below_min" | "clamped_to_observed_balance" | undefined;
+} {
+  const requestedAmount = Number(Math.max(0, args.requestedAmount).toFixed(6));
+  const observedMergeable = Number(Math.max(0, Math.min(args.observed.up, args.observed.down)).toFixed(6));
+  const executableAmount = Number(Math.min(requestedAmount, observedMergeable).toFixed(6));
+  if (executableAmount < args.minShares - 1e-9) {
+    return {
+      requestedAmount,
+      observedMergeable,
+      executableAmount,
+      skipped: true,
+      reason: "observed_balance_below_min",
+    };
+  }
+  if (executableAmount < requestedAmount - 1e-6) {
+    return {
+      requestedAmount,
+      observedMergeable,
+      executableAmount,
+      skipped: false,
+      reason: "clamped_to_observed_balance",
+    };
+  }
+  return {
+    requestedAmount,
+    observedMergeable,
+    executableAmount,
+    skipped: false,
+  };
+}
+
 function combineLockedShares(
   first: { up: number; down: number },
   second: { up: number; down: number },
@@ -1254,6 +1304,41 @@ export function findRecentBotOwnedFillForShortfall(
     aggregateShortfall <= aggregateSize + aggregateTolerance
   ) {
     return activeFills[0];
+  }
+
+  return undefined;
+}
+
+export function findRecentBotOwnedReductionForShortfall(
+  reductions: readonly RecentBotOwnedBalanceReduction[],
+  candidate: Pick<BalanceShortfallCandidate, "outcome" | "fromShares" | "toShares" | "nowTs">,
+  graceSec = BOT_OWNED_SETTLEMENT_GRACE_SEC,
+): RecentBotOwnedBalanceReduction | undefined {
+  const shortfall = Number((candidate.fromShares - candidate.toShares).toFixed(6));
+  if (shortfall <= 1e-6) {
+    return undefined;
+  }
+
+  const activeReductions = [...reductions]
+    .filter((reduction) => reduction.outcome === candidate.outcome && candidate.nowTs - reduction.timestamp <= graceSec)
+    .sort((left, right) => right.timestamp - left.timestamp);
+
+  const directMatch = activeReductions.find((reduction) => {
+    const tolerance = Math.max(0.5, reduction.size * 0.08);
+    return shortfall >= reduction.size - tolerance && shortfall <= reduction.size + tolerance;
+  });
+  if (directMatch) {
+    return directMatch;
+  }
+
+  if (activeReductions.length === 0) {
+    return undefined;
+  }
+
+  const aggregateSize = activeReductions.reduce((sum, reduction) => sum + reduction.size, 0);
+  const aggregateTolerance = Math.max(0.5, aggregateSize * 0.08);
+  if (shortfall >= aggregateSize - aggregateTolerance && shortfall <= aggregateSize + aggregateTolerance) {
+    return activeReductions[0];
   }
 
   return undefined;
@@ -1528,10 +1613,6 @@ function normalizePositiveShares(value: number): number {
   return Number(Math.max(0, value).toFixed(6));
 }
 
-function normalizePositiveAmount(value: number): number {
-  return Number(Math.max(0, value).toFixed(6));
-}
-
 function completionLikeEntrySubmission(mode: StrategyExecutionMode | undefined): boolean {
   return runtimeFlowBudgetReleaseActionForFillMode(mode) === "completion_submit";
 }
@@ -1629,17 +1710,21 @@ function repairTraceQuantityCap(
 function resizeMarketBuyOrderShareTarget(order: MarketOrderArgs, shareTarget: number): MarketOrderArgs {
   const normalizedShareTarget = normalizePositiveShares(shareTarget);
   const price = order.price;
-  const amount =
+  const resized =
     price !== undefined && Number.isFinite(price) && price > 0
-      ? normalizePositiveAmount(normalizedShareTarget * price)
+      ? normalizeExecutableBuyOrder({
+          ...order,
+          shareTarget: normalizedShareTarget,
+          amount: normalizedShareTarget * price,
+        })
       : order.shareTarget !== undefined && order.shareTarget > 0
-        ? normalizePositiveAmount(order.amount * (normalizedShareTarget / order.shareTarget))
-        : order.amount;
-  return {
-    ...order,
-    shareTarget: normalizedShareTarget,
-    amount,
-  };
+        ? normalizeExecutableBuyOrder({
+            ...order,
+            shareTarget: normalizedShareTarget,
+            amount: order.amount * (normalizedShareTarget / order.shareTarget),
+          })
+        : { ...order, shareTarget: normalizedShareTarget };
+  return resized;
 }
 
 export function clampEntryRepairBuyDecision(args: {
@@ -2273,6 +2358,18 @@ export function expectedSharesForSubmission(
   result: OrderResult | undefined,
 ): number | undefined {
   const resultShares = extractExpectedSharesFromOrderResult(result);
+  if (
+    resultShares !== undefined &&
+    shareTarget !== undefined &&
+    Number.isFinite(shareTarget) &&
+    shareTarget > 0
+  ) {
+    const normalizedShareTarget = normalizeShares(shareTarget);
+    const tolerance = Math.max(1e-6, normalizedShareTarget * 0.001);
+    if (resultShares > normalizedShareTarget + tolerance) {
+      return normalizedShareTarget;
+    }
+  }
   return resultShares !== undefined
     ? resultShares
     : shareTarget !== undefined
@@ -2301,6 +2398,33 @@ export function botFillAccountingKey(
     return undefined;
   }
   return ["order", context.orderId, fill.outcome, fill.side].join(":");
+}
+
+export function botFillAccountingFingerprintKey(
+  fill: Pick<FillRecord, "outcome" | "side" | "size" | "price" | "timestamp">,
+): string | undefined {
+  if (fill.side !== "BUY") {
+    return undefined;
+  }
+  const timestampBucket = Math.floor(fill.timestamp / 2);
+  return [
+    "fill",
+    fill.outcome,
+    fill.side,
+    normalizePositiveShares(fill.size).toFixed(4),
+    clampFallbackPrice(fill.price).toFixed(4),
+    timestampBucket,
+  ].join(":");
+}
+
+function botFillAccountingKeys(
+  fill: Pick<FillRecord, "outcome" | "side" | "size" | "price" | "timestamp">,
+  context: { orderId?: string | undefined },
+): string[] {
+  return [
+    botFillAccountingKey(fill, context),
+    botFillAccountingFingerprintKey(fill),
+  ].filter((key): key is string => key !== undefined);
 }
 
 export interface OrderResultShareOverfill {
@@ -2340,6 +2464,48 @@ export function detectOrderResultShareOverfill(args: {
   };
 }
 
+export function orderResultOverfillDustThreshold(args: {
+  config: Pick<
+    XuanStrategyConfig,
+    "maxCompletionOvershootShares" | "botMode" | "xuanCloneMode" | "xuanCloneIntensity"
+  >;
+  minOrderSize: number;
+  shareTarget: number;
+}): number {
+  if (
+    args.config.botMode !== "XUAN" ||
+    args.config.xuanCloneMode !== "PUBLIC_FOOTPRINT" ||
+    args.config.xuanCloneIntensity !== "AGGRESSIVE"
+  ) {
+    return normalizeShares(Math.max(0, args.config.maxCompletionOvershootShares));
+  }
+  return normalizeShares(
+    Math.max(
+      args.config.maxCompletionOvershootShares,
+      Math.max(0, args.minOrderSize) * 0.5,
+      Math.max(0, args.shareTarget) * 0.1,
+    ),
+  );
+}
+
+export function isNonBlockingOrderResultOverfillDust(args: {
+  config: Pick<
+    XuanStrategyConfig,
+    "maxCompletionOvershootShares" | "botMode" | "xuanCloneMode" | "xuanCloneIntensity"
+  >;
+  minOrderSize: number;
+  overfill: Pick<OrderResultShareOverfill, "shareTarget" | "excessShares">;
+}): boolean {
+  return (
+    args.overfill.excessShares <=
+    orderResultOverfillDustThreshold({
+      config: args.config,
+      minOrderSize: args.minOrderSize,
+      shareTarget: args.overfill.shareTarget,
+    }) + 1e-9
+  );
+}
+
 function asOrderRawObject(result: OrderResult | undefined): Record<string, unknown> | undefined {
   if (!result?.raw || typeof result.raw !== "object" || Array.isArray(result.raw)) {
     return undefined;
@@ -2350,20 +2516,32 @@ function asOrderRawObject(result: OrderResult | undefined): Record<string, unkno
 function extractOrderResultExecutionPrice(
   result: OrderResult | undefined,
   fallbackPrice: number | undefined,
-  _ledgerFillSize?: number | undefined,
+  ledgerFillSize?: number | undefined,
 ): number {
   const raw = asOrderRawObject(result);
   const takingAmount = Number(raw?.takingAmount);
   const makingAmount = Number(raw?.makingAmount);
   if (Number.isFinite(takingAmount) && takingAmount > 0 && Number.isFinite(makingAmount) && makingAmount > 0) {
-    return Number(clampFallbackPrice(makingAmount / takingAmount).toFixed(6));
+    const denominator = Number.isFinite(ledgerFillSize) && Number(ledgerFillSize) > 0 ? Number(ledgerFillSize) : takingAmount;
+    return Number(clampFallbackPrice(makingAmount / denominator).toFixed(6));
   }
   return Number(clampFallbackPrice(fallbackPrice).toFixed(6));
 }
 
 function extractLedgerMatchedShares(order: MarketOrderArgs, result: OrderResult | undefined): number {
   const matchedShares = extractMatchedShares(result);
-  void order;
+  if (
+    order.side === "BUY" &&
+    order.shareTarget !== undefined &&
+    Number.isFinite(order.shareTarget) &&
+    order.shareTarget > 0
+  ) {
+    const shareTarget = normalizeShares(order.shareTarget);
+    const tolerance = Math.max(1e-6, shareTarget * 0.001);
+    if (matchedShares > shareTarget + tolerance) {
+      return shareTarget;
+    }
+  }
   return matchedShares;
 }
 
@@ -2443,6 +2621,41 @@ export function shouldBlockCompletionForPendingSubmission(args: {
   return Boolean(args.pending && args.pending.side === args.side && args.nowTs <= args.pending.expiresAt);
 }
 
+function rememberSubmittedPrice(
+  submittedPrices: SubmittedIntentBook,
+  market: MarketInfo,
+  order: {
+    tokenId: string;
+    side: TradeSide;
+    price?: number | undefined;
+    mode?: StrategyExecutionMode | undefined;
+    groupId?: string | undefined;
+    orderId?: string | undefined;
+    expectedShares?: number | undefined;
+  },
+  submittedAt: number,
+): SubmittedIntent | undefined {
+  const outcome = outcomeForAssetId(market, order.tokenId);
+  if (!outcome) {
+    return undefined;
+  }
+  const nextIntent: SubmittedIntent = {
+    side: order.side,
+    price: order.price,
+    submittedAt,
+    mode: order.mode,
+    groupId: order.groupId,
+    orderId: order.orderId,
+    expectedShares: order.expectedShares,
+    attributedShares: 0,
+    active: true,
+  };
+  const bucket = submittedPrices[outcome] ?? [];
+  bucket.push(nextIntent);
+  submittedPrices[outcome] = bucket;
+  return nextIntent;
+}
+
 function rememberSubmittedPrices(
   submittedPrices: SubmittedIntentBook,
   market: MarketInfo,
@@ -2458,24 +2671,7 @@ function rememberSubmittedPrices(
   submittedAt: number,
 ): void {
   for (const order of orders) {
-    const outcome = outcomeForAssetId(market, order.tokenId);
-    if (!outcome) {
-      continue;
-    }
-    const nextIntent: SubmittedIntent = {
-      side: order.side,
-      price: order.price,
-      submittedAt,
-      mode: order.mode,
-      groupId: order.groupId,
-      orderId: order.orderId,
-      expectedShares: order.expectedShares,
-      attributedShares: 0,
-      active: true,
-    };
-    const bucket = submittedPrices[outcome] ?? [];
-    bucket.push(nextIntent);
-    submittedPrices[outcome] = bucket;
+    rememberSubmittedPrice(submittedPrices, market, order, submittedAt);
   }
 }
 
@@ -2575,6 +2771,26 @@ function fitOrderToAvailableUsdcBalance(
     usdcBalance,
     minOrderSize,
     sizeLadder: liveOrderSizeLadder(config, minOrderSize),
+  });
+}
+
+function completionMinNotionalBridgeMaxOvershootShares(config: XuanStrategyConfig, minOrderSize: number): number {
+  const baseLot = Math.max(config.liveSmallLotLadder[0] ?? config.defaultLot, config.defaultLot, minOrderSize);
+  return normalizeShares(Math.max(config.maxCompletionOvershootShares, baseLot * 0.25));
+}
+
+function fitCompletionOrderToAvailableUsdcBalance(
+  order: MarketOrderArgs,
+  usdcBalance: number | undefined,
+  config: XuanStrategyConfig,
+  minOrderSize: number,
+): ReturnType<typeof fitBuyOrderToUsdcBalance> {
+  return fitBuyOrderToUsdcBalance(order, {
+    usdcBalance,
+    minOrderSize,
+    sizeLadder: liveOrderSizeLadder(config, minOrderSize),
+    allowMinMarketBuyAmountBridge: true,
+    maxMinMarketBuyAmountBridgeOvershootShares: completionMinNotionalBridgeMaxOvershootShares(config, minOrderSize),
   });
 }
 
@@ -3083,6 +3299,7 @@ export async function runStatefulBotSession(
   }> = [];
   const appliedBotFillKeys = new Set<string>();
   const recentBotOwnedBuyFills: RecentBotOwnedBuyFill[] = [];
+  const recentBotOwnedBalanceReductions: RecentBotOwnedBalanceReduction[] = [];
   const events: Array<Record<string, unknown>> = [];
   let pendingPairExecution: PendingPairExecution | undefined;
   let pendingCompletionSubmission: PendingCompletionSubmission | undefined;
@@ -3199,15 +3416,18 @@ export async function runStatefulBotSession(
     fill: FillRecord,
     context: { orderId?: string | undefined },
   ): { applied: boolean; key?: string | undefined } => {
-    const key = botFillAccountingKey(fill, context);
-    if (!key) {
+    const keys = botFillAccountingKeys(fill, context);
+    if (keys.length === 0) {
       return { applied: true };
     }
-    if (appliedBotFillKeys.has(key)) {
-      return { applied: false, key };
+    const matchedKey = keys.find((key) => appliedBotFillKeys.has(key));
+    if (matchedKey) {
+      return { applied: false, key: matchedKey };
     }
-    appliedBotFillKeys.add(key);
-    return { applied: true, key };
+    for (const key of keys) {
+      appliedBotFillKeys.add(key);
+    }
+    return { applied: true, key: keys[0] };
   };
 
   const deactivateSubmittedIntents = (predicate: (intent: SubmittedIntent) => boolean): void => {
@@ -3243,22 +3463,41 @@ export async function runStatefulBotSession(
     if (!overfill) {
       return;
     }
-    state = {
-      ...state,
-      reentryDisabled: true,
-      postMergeCompletionOnlyUntil: undefined,
-    };
-    runtimeProtectedResidualLock =
-      partialOpenGroupLock !== undefined
-        ? undefined
-        : refreshRuntimeProtectedResidualLock({
-            lock: runtimeProtectedResidualLock,
-            state,
-            nowTs: args.fill.timestamp,
-            mode: args.mode ?? args.fill.executionMode,
-          });
     const residualSide = dominantResidualSide(state) ?? null;
     const residualShares = normalizeShares(Math.abs(state.upShares - state.downShares));
+    const nonBlockingDust = isNonBlockingOrderResultOverfillDust({
+      config,
+      minOrderSize: state.market.minOrderSize,
+      overfill,
+    });
+    if (nonBlockingDust) {
+      if (
+        runtimeProtectedResidualLock &&
+        residualShares <=
+          orderResultOverfillDustThreshold({
+            config,
+            minOrderSize: state.market.minOrderSize,
+            shareTarget: overfill.shareTarget,
+          }) + 1e-9
+      ) {
+        runtimeProtectedResidualLock = undefined;
+      }
+    } else {
+      state = {
+        ...state,
+        reentryDisabled: true,
+        postMergeCompletionOnlyUntil: undefined,
+      };
+      runtimeProtectedResidualLock =
+        partialOpenGroupLock !== undefined
+          ? undefined
+          : refreshRuntimeProtectedResidualLock({
+              lock: runtimeProtectedResidualLock,
+              state,
+              nowTs: args.fill.timestamp,
+              mode: args.mode ?? args.fill.executionMode,
+            });
+    }
     pushEvent(events, {
       timestamp: args.fill.timestamp,
       type: "order_result_overfill",
@@ -3266,6 +3505,7 @@ export async function runStatefulBotSession(
       ...overfill,
       residualSide,
       residualShares,
+      nonBlockingDust,
     });
     await traceLogger.write("orders", {
       eventType: "order_result_overfill",
@@ -3279,7 +3519,42 @@ export async function runStatefulBotSession(
       excessShares: overfill.excessShares,
       residualSide,
       residualShares,
-      action: "reentry_disabled_until_merge_or_reconcile",
+      nonBlockingDust,
+      action: nonBlockingDust ? "non_blocking_dust_recorded" : "reentry_disabled_until_merge_or_reconcile",
+    });
+  };
+
+  const lockAfterPartialPairChildFailure = async (
+    result: PairExecutionResult,
+    nowTs: number,
+  ): Promise<void> => {
+    if (result.status !== "UP_ONLY" && result.status !== "DOWN_ONLY") {
+      return;
+    }
+    const missingSide: OutcomeSide = result.status === "UP_ONLY" ? "DOWN" : "UP";
+    state = {
+      ...state,
+      reentryDisabled: true,
+      postMergeCompletionOnlyUntil: undefined,
+    };
+    runtimeProtectedResidualLock =
+      partialOpenGroupLock !== undefined
+        ? undefined
+        : refreshRuntimeProtectedResidualLock({
+            lock: runtimeProtectedResidualLock,
+            state,
+            nowTs,
+            mode: result.group.selectedMode,
+          });
+    await traceLogger.write("orders", {
+      eventType: "pair_child_failure_lock",
+      pairGroupId: result.group.groupId,
+      selectedMode: result.group.selectedMode,
+      status: result.status,
+      missingSide,
+      filledUpQty: result.filledUpQty,
+      filledDownQty: result.filledDownQty,
+      action: "completion_or_abort_required_before_new_cycle",
     });
   };
 
@@ -3338,6 +3613,46 @@ export async function runStatefulBotSession(
     }
   };
 
+  const rememberBotOwnedMergeReduction = (args: {
+    amount: number;
+    timestamp: number;
+    txHash?: string | undefined;
+  }): void => {
+    const size = normalizePositiveShares(args.amount);
+    if (size <= 1e-6) {
+      return;
+    }
+    for (const outcome of ["UP", "DOWN"] as const) {
+      recentBotOwnedBalanceReductions.push({
+        outcome,
+        size,
+        timestamp: args.timestamp,
+        expiresAt: args.timestamp + BOT_OWNED_SUBMITTED_INTENT_SETTLEMENT_GRACE_SEC,
+        reason: "ctf_merge",
+        txHash: args.txHash,
+      });
+    }
+  };
+
+  const pruneBotOwnedBalanceReductions = (nowTs: number): void => {
+    for (let index = recentBotOwnedBalanceReductions.length - 1; index >= 0; index -= 1) {
+      if (recentBotOwnedBalanceReductions[index]!.expiresAt < nowTs) {
+        recentBotOwnedBalanceReductions.splice(index, 1);
+      }
+    }
+  };
+
+  const findBotOwnedReductionForShortfall = (
+    candidate: Pick<BalanceShortfallCandidate, "outcome" | "fromShares" | "toShares" | "nowTs">,
+  ): RecentBotOwnedBalanceReduction | undefined => {
+    pruneBotOwnedBalanceReductions(candidate.nowTs);
+    return findRecentBotOwnedReductionForShortfall(
+      recentBotOwnedBalanceReductions,
+      candidate,
+      BOT_OWNED_SUBMITTED_INTENT_SETTLEMENT_GRACE_SEC,
+    );
+  };
+
   const findBotOwnedFillForShortfall = (
     candidate: Pick<BalanceShortfallCandidate, "outcome" | "fromShares" | "toShares" | "nowTs">,
   ): RecentBotOwnedBuyFill | SubmittedIntent | undefined => {
@@ -3363,6 +3678,97 @@ export async function runStatefulBotSession(
       return false;
     }
     return isRecentBotOwnedShortfallMatch(matchedFill, candidate.nowTs);
+  };
+
+  const resolveExecutableMergeAmount = async (
+    requestedAmount: number,
+  ): Promise<
+    ReturnType<typeof clampMergeAmountToObservedBalances> & {
+      observed: ObservedTokenBalances | undefined;
+    }
+  > => {
+    if (!env.CTF_MERGE_ENABLED) {
+      return {
+        requestedAmount,
+        observedMergeable: requestedAmount,
+        executableAmount: requestedAmount,
+        skipped: false,
+        observed: undefined,
+      };
+    }
+    const observed = await readObservedBalances(balanceReader, market, balanceOwnerAddress);
+    return {
+      ...clampMergeAmountToObservedBalances({
+        requestedAmount,
+        observed,
+        minShares: config.mergeMinShares,
+      }),
+      observed,
+    };
+  };
+
+  const applyBotOwnedMergeObservedShortfallCorrections = async (args: {
+    observed: ObservedTokenBalances | undefined;
+    nowTs: number;
+    scope: string;
+  }): Promise<boolean> => {
+    if (!args.observed) {
+      return false;
+    }
+    let corrected = false;
+    for (const outcome of ["UP", "DOWN"] as const) {
+      const sharesKey = outcome === "UP" ? "upShares" : "downShares";
+      const observedShares = normalizePositiveShares(outcome === "UP" ? args.observed.up : args.observed.down);
+      const currentShares = state[sharesKey];
+      if (observedShares >= currentShares - 1e-6) {
+        continue;
+      }
+      const candidate: BalanceShortfallCandidate = {
+        outcome,
+        fromShares: currentShares,
+        toShares: observedShares,
+        nowTs: args.nowTs,
+      };
+      const matchedReduction = findBotOwnedReductionForShortfall(candidate);
+      if (!matchedReduction) {
+        continue;
+      }
+      state = shrinkOutcomeToObservedShares(state, outcome, observedShares);
+      const persistedShrink = stateStore.shrinkOpenLotsToObservedShares(
+        market.slug,
+        outcome,
+        observedShares,
+        args.nowTs,
+      );
+      balanceCorrectionCount += 1;
+      corrected = true;
+      pushEvent(events, {
+        timestamp: args.nowTs,
+        type: "merge_preflight_balance_correction",
+        outcome,
+        fromShares: candidate.fromShares,
+        toShares: candidate.toShares,
+        botOwned: true,
+        source: matchedReduction.reason,
+      });
+      await traceLogger.write("balance_sync", {
+        balanceEvent: "correction",
+        scope: args.scope,
+        outcome,
+        fromShares: candidate.fromShares,
+        toShares: candidate.toShares,
+        botOwned: true,
+        botOwnedReason: matchedReduction.reason,
+        txHash: matchedReduction.txHash ?? null,
+        persistedFromShares: persistedShrink?.fromShares ?? null,
+        persistedToShares: persistedShrink?.toShares ?? null,
+        persistedConsumedQty: persistedShrink?.consumedQty ?? null,
+      });
+    }
+    if (corrected) {
+      persistMarketState(state.reentryDisabled ? "post_merge_completion_only" : undefined);
+    }
+    return corrected;
   };
 
   const matchActivePairSubmission = (fill: FillRecord): ActivePairSubmission["entries"][number] | undefined => {
@@ -3537,6 +3943,7 @@ export async function runStatefulBotSession(
       state = reserveNegativeEdgeBudget(state, actualNegativeEdgeUsdc, "pair");
       persistDailyBudget(state);
     }
+    await lockAfterPartialPairChildFailure(finalized, finalizedAtTs);
     if (finalized.status === "UP_ONLY" || finalized.status === "DOWN_ONLY") {
       partialLegCount += 1;
       const protectedSide: OutcomeSide = finalized.status === "UP_ONLY" ? "UP" : "DOWN";
@@ -4020,7 +4427,7 @@ export async function runStatefulBotSession(
         source: "PERSISTENT_FILL_ACCOUNTING",
       });
     }
-    if (submittedIntent?.groupId || submittedIntent?.orderId) {
+    if (submittedIntent) {
       rememberBotOwnedBuyFill(normalizedFill, {
         groupId: submittedIntent.groupId,
         orderId: submittedIntent.orderId,
@@ -4094,7 +4501,8 @@ export async function runStatefulBotSession(
       observed: observedBalances,
       nowTs: args.nowTs,
       fallbackPrices: buildFallbackPrices(args.books, submittedPrices),
-      shouldIgnoreShortfall: shouldIgnoreTransientBotOwnedShortfall,
+      shouldIgnoreShortfall:
+        args.scope === "post_close_reconcile" ? undefined : shouldIgnoreTransientBotOwnedShortfall,
     });
     state = reconciled.state;
     const balanceSyncNewGap = Math.abs(state.upShares - state.downShares);
@@ -4169,7 +4577,7 @@ export async function runStatefulBotSession(
           source: "PERSISTENT_FILL_ACCOUNTING",
         });
       }
-      if (submittedIntent?.groupId || submittedIntent?.orderId) {
+      if (submittedIntent) {
         rememberBotOwnedBuyFill(normalizedFill, {
           groupId: submittedIntent.groupId,
           orderId: submittedIntent.orderId,
@@ -4199,7 +4607,11 @@ export async function runStatefulBotSession(
         findBotOwnedFillForShortfall({
           ...correction,
           nowTs: args.nowTs,
-        }),
+        }) ??
+          findBotOwnedReductionForShortfall({
+            ...correction,
+            nowTs: args.nowTs,
+          }),
       );
       const persistedShrink = stateStore.shrinkOpenLotsToObservedShares(
         market.slug,
@@ -4593,10 +5005,63 @@ export async function runStatefulBotSession(
           mergeBaseConditionsMet &&
           (mergeGate.allow || mergeFirstForceReason !== undefined);
         if (mergeAllowed) {
+          const mergeExecution = await resolveExecutableMergeAmount(mergeAmount);
+          if (mergeExecution.reason) {
+            await applyBotOwnedMergeObservedShortfallCorrections({
+              observed: mergeExecution.observed,
+              nowTs,
+              scope: "runtime_merge_preflight",
+            });
+          }
+          if (mergeExecution.skipped) {
+            logger.info(
+              {
+                marketSlug: market.slug,
+                requestedMergeAmount: mergeAmount,
+                executableMergeAmount: mergeExecution.executableAmount,
+                observedMergeable: mergeExecution.observedMergeable,
+              },
+              "Skipping merge because observed wallet balance is below CTF minimum.",
+            );
+            lastMergeAtMs = Date.now();
+            actionCooldownUntil = Date.now() + Math.max(config.mergeDebounceMs, 5000);
+            mergeBatchTracker = syncMergeBatchTracker(mergeBatchTracker, mergeExecution.observedMergeable, nowTs);
+            pushEvent(events, {
+              timestamp: nowTs,
+              type: "merge_skipped_observed_balance_below_min",
+              requestedAmount: mergeAmount,
+              executableAmount: mergeExecution.executableAmount,
+              observedMergeable: mergeExecution.observedMergeable,
+              mergeGateReason,
+              mergeGateForced,
+            });
+            await traceLogger.write("merge_redeem", {
+              action: "merge_skipped_observed_balance_below_min",
+              requestedAmount: mergeAmount,
+              executableAmount: mergeExecution.executableAmount,
+              observedMergeable: mergeExecution.observedMergeable,
+              observedUpShares: mergeExecution.observed?.up ?? null,
+              observedDownShares: mergeExecution.observed?.down ?? null,
+              mergeGateReason,
+              mergeGateForced,
+              mergeBasketEffectivePair: mergeBasketEffectivePair ?? null,
+              mergePendingMatchedQty: mergeGate.pendingMatchedQty,
+              mergeCompletedCycles: mergeGate.completedCycles,
+              mergeOldestMatchedAgeSec: mergeGate.oldestMatchedAgeSec ?? null,
+              lockedPendingUpShares: lockedPendingShares.up,
+              lockedPendingDownShares: lockedPendingShares.down,
+              lockedSettlementUpShares: mergeSettlementLockedShares.up,
+              lockedSettlementDownShares: mergeSettlementLockedShares.down,
+              reason: mergeExecution.reason ?? null,
+            });
+            await waitForDecisionPulse();
+            continue;
+          }
+          const executableMergeAmount = mergeExecution.executableAmount;
           let mergeResult: Awaited<ReturnType<CtfClient["mergePositions"]>>;
           try {
             mergeResult = env.CTF_MERGE_ENABLED
-              ? await ctf.mergePositions(market.conditionId, mergeAmount, {
+              ? await ctf.mergePositions(market.conditionId, executableMergeAmount, {
                   positionTokenIds: {
                     upTokenId: market.tokens.UP.tokenId,
                     downTokenId: market.tokens.DOWN.tokenId,
@@ -4606,26 +5071,34 @@ export async function runStatefulBotSession(
                   simulated: true,
                   skipped: true,
                   action: "merge" as const,
-                  amount: mergeAmount,
+                  amount: executableMergeAmount,
                   conditionId: market.conditionId,
                   reason: "CTF_MERGE_ENABLED=false",
                 };
           } catch (error) {
             const errorMessage = error instanceof Error ? error.message : String(error);
-            logger.warn({ error, mergeAmount, marketSlug: market.slug }, "CTF merge failed; session will continue.");
+            logger.warn(
+              { error, mergeAmount: executableMergeAmount, requestedMergeAmount: mergeAmount, marketSlug: market.slug },
+              "CTF merge failed; session will continue.",
+            );
             lastMergeAtMs = Date.now();
             actionCooldownUntil = Date.now() + Math.max(config.mergeDebounceMs, 5000);
             pushEvent(events, {
               timestamp: nowTs,
               type: "merge_failed",
-              amount: mergeAmount,
+              amount: executableMergeAmount,
+              requestedAmount: mergeAmount,
               mergeGateReason,
               mergeGateForced,
               message: errorMessage,
             });
             await traceLogger.write("merge_redeem", {
               action: "merge_failed",
-              amount: mergeAmount,
+              amount: executableMergeAmount,
+              requestedAmount: mergeAmount,
+              observedMergeable: mergeExecution.observedMergeable,
+              observedUpShares: mergeExecution.observed?.up ?? null,
+              observedDownShares: mergeExecution.observed?.down ?? null,
               mergeGateReason,
               mergeGateForced,
               mergeBasketEffectivePair: mergeBasketEffectivePair ?? null,
@@ -4641,7 +5114,8 @@ export async function runStatefulBotSession(
             emitLiveMirror("merge_failed", {
               marketSlug: market.slug,
               trigger: "runtime",
-              amount: mergeAmount,
+              amount: executableMergeAmount,
+              requestedAmount: mergeAmount,
               mergeGateReason,
               mergeGateForced,
               error: errorMessage,
@@ -4652,7 +5126,7 @@ export async function runStatefulBotSession(
           if (shouldAccountCtfTxResult(mergeResult)) {
             const preMergeState = state;
             state = applyMerge(state, {
-              amount: mergeAmount,
+              amount: executableMergeAmount,
               timestamp: nowTs,
               simulated: mergeResult.simulated,
               flowLineage: deriveCarryFlowLineageKey({
@@ -4662,8 +5136,13 @@ export async function runStatefulBotSession(
                   arbitrationCarry?.protectedResidualSide ?? mergeResidualLock?.protectedSide,
               }),
             });
+            rememberBotOwnedMergeReduction({
+              amount: executableMergeAmount,
+              timestamp: nowTs,
+              txHash: mergeResult.txHash,
+            });
             stateStore.recordMerge(preMergeState, state.mergeHistory.at(-1) ?? {
-              amount: mergeAmount,
+              amount: executableMergeAmount,
               timestamp: nowTs,
               simulated: mergeResult.simulated,
             });
@@ -4709,7 +5188,7 @@ export async function runStatefulBotSession(
             mergeTxCount += 1;
             lastMergeAtMs = Date.now();
             applyRuntimeFlowBudgetAction("merge", {
-              quantityShares: mergeAmount,
+              quantityShares: executableMergeAmount,
               lineage: currentRuntimeFlowLineage(),
             });
             const pendingPostMergeFillSnapshot = pendingPairExecution
@@ -4735,14 +5214,20 @@ export async function runStatefulBotSession(
           pushEvent(events, {
             timestamp: nowTs,
             type: "merge",
-            amount: mergeAmount,
+            amount: executableMergeAmount,
+            requestedAmount: mergeAmount,
             mergeGateReason,
             mergeGateForced,
             result: mergeResult,
           });
           await traceLogger.write("merge_redeem", {
             action: "merge",
-            amount: mergeAmount,
+            amount: executableMergeAmount,
+            requestedAmount: mergeAmount,
+            observedMergeable: mergeExecution.observedMergeable,
+            observedUpShares: mergeExecution.observed?.up ?? null,
+            observedDownShares: mergeExecution.observed?.down ?? null,
+            mergeClampReason: mergeExecution.reason ?? null,
             mergeGateReason,
             mergeGateForced,
             mergeBasketEffectivePair: mergeBasketEffectivePair ?? null,
@@ -4771,7 +5256,8 @@ export async function runStatefulBotSession(
           emitLiveMirror("merge_submit", {
             marketSlug: market.slug,
             trigger: "runtime",
-            amount: mergeAmount,
+            amount: executableMergeAmount,
+            requestedAmount: mergeAmount,
             mergeGateReason,
             mergeGateForced,
             mergeBasketEffectivePair: mergeBasketEffectivePair ?? null,
@@ -5385,7 +5871,7 @@ export async function runStatefulBotSession(
         }
         completionSubmittedThisTick = true;
         assertClassifiedBuyMode(decision.completion.mode, config);
-        const completionSizing = fitOrderToAvailableUsdcBalance(
+        const completionSizing = fitCompletionOrderToAvailableUsdcBalance(
           decision.completion.order,
           cachedUsdcBalance,
           config,
@@ -5421,28 +5907,48 @@ export async function runStatefulBotSession(
         }
         lastUnfillableCompletionSizingKey = undefined;
         const submittedCompletionOrder = liveOrder ?? decision.completion.order;
+        if (liveOrder && completionSizing.reason === "bridged_to_min_market_buy_amount") {
+          await traceLogger.write("orders", {
+            eventType: "completion_min_notional_bridge",
+            normalizedMode: `COMPLETION_${decision.completion.sideToBuy}`,
+            outcome: decision.completion.sideToBuy,
+            requestedSize: completionSizing.requestedShares ?? decision.completion.missingShares,
+            bridgedSize: liveOrder.shareTarget ?? null,
+            price: liveOrder.price ?? null,
+            spendAmount: liveOrder.amount,
+            maxBridgeOvershootShares: completionMinNotionalBridgeMaxOvershootShares(config, state.market.minOrderSize),
+            oldGap: decision.completion.oldGap,
+            capUsed: decision.completion.capMode,
+          });
+        }
+        const preSubmitCompletionIntent = liveOrder
+          ? rememberSubmittedPrice(
+              submittedPrices,
+              market,
+              {
+                ...liveOrder,
+                side: liveOrder.side,
+                mode: decision.completion.mode,
+                expectedShares: liveOrder.shareTarget,
+              },
+              nowTs,
+            )
+          : undefined;
         const result = liveOrder
           ? await completeOrderSafely(completionManager, liveOrder)
           : skippedOrderResult("skipped_insufficient_balance", "completion_order_not_affordable");
         if (liveOrder && shouldRegisterSubmittedIntentForResult(result)) {
           updateCachedUsdcBalanceAfterOrderResult(liveOrder, result);
-          rememberSubmittedPrices(
-            submittedPrices,
-            market,
-            [
-              {
-                ...decision.completion.order,
-                side: decision.completion.order.side,
-                mode: decision.completion.mode,
-                orderId: result.orderId,
-                expectedShares: expectedSharesForSubmission(liveOrder.shareTarget, result),
-              },
-            ],
-            nowTs,
-          );
+          if (preSubmitCompletionIntent) {
+            preSubmitCompletionIntent.orderId = result.orderId;
+            preSubmitCompletionIntent.expectedShares = expectedSharesForSubmission(liveOrder.shareTarget, result);
+          }
         }
         if (liveOrder && !shouldRegisterSubmittedIntentForResult(result)) {
           updateCachedUsdcBalanceAfterOrderResult(liveOrder, result);
+          if (preSubmitCompletionIntent) {
+            preSubmitCompletionIntent.active = false;
+          }
         }
         const accepted = isOrderResultAccepted(result);
         const submittedCompletionShares =
@@ -5992,11 +6498,11 @@ export async function runStatefulBotSession(
               status: downResult?.status ?? null,
               accepted: downResult ? isOrderResultAccepted(downResult) : false,
             },
-          });
-          if (immediateFinalizedPairExecution && pendingPairExecution) {
-            await persistFinalizedPairGroup(immediateFinalizedPairExecution, pendingPairExecution, nowTs);
-            deactivateSubmittedIntentsForGroup(group.groupId);
-            pendingPairExecution = undefined;
+	          });
+	          if (immediateFinalizedPairExecution && pendingPairExecution) {
+	            await persistFinalizedPairGroup(immediateFinalizedPairExecution, pendingPairExecution, nowTs);
+	            deactivateSubmittedIntentsForGroup(group.groupId);
+	            pendingPairExecution = undefined;
             activePairSubmission = undefined;
           } else if (!anyAccepted && pendingPairExecution) {
             const rejectedFinalized = finalizePairExecutionResult({
@@ -6698,59 +7204,110 @@ export async function runStatefulBotSession(
     mergeAmount: closingMergeAmount,
   });
   if (sessionEndMergeDecision.allow) {
+    const closingMergeExecution = await resolveExecutableMergeAmount(closingMergeAmount);
+    if (closingMergeExecution.reason) {
+      await applyBotOwnedMergeObservedShortfallCorrections({
+        observed: closingMergeExecution.observed,
+        nowTs: endedAt,
+        scope: "session_end_merge_preflight",
+      });
+    }
     let closingMergeResult: Awaited<ReturnType<CtfClient["mergePositions"]>> | undefined;
-    try {
-      closingMergeResult = env.CTF_MERGE_ENABLED
-        ? await ctf.mergePositions(market.conditionId, closingMergeAmount, {
-            positionTokenIds: {
-              upTokenId: market.tokens.UP.tokenId,
-              downTokenId: market.tokens.DOWN.tokenId,
-            },
-          })
-        : {
-            simulated: true,
-            skipped: true,
-            action: "merge" as const,
-            amount: closingMergeAmount,
-            conditionId: market.conditionId,
-            reason: "CTF_MERGE_ENABLED=false",
-          };
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      logger.warn({ error, mergeAmount: closingMergeAmount, marketSlug: market.slug }, "Session-end CTF merge failed.");
+    if (closingMergeExecution.skipped) {
       pushEvent(events, {
         timestamp: endedAt,
-        type: "merge_failed",
+        type: "merge_skipped_observed_balance_below_min",
         trigger: sessionEndMergeDecision.trigger,
-        amount: closingMergeAmount,
+        requestedAmount: closingMergeAmount,
+        executableAmount: closingMergeExecution.executableAmount,
+        observedMergeable: closingMergeExecution.observedMergeable,
         reason: sessionEndMergeDecision.reason,
-        message: errorMessage,
       });
       await traceLogger.write("merge_redeem", {
-        action: "merge_failed",
+        action: "merge_skipped_observed_balance_below_min",
         trigger: sessionEndMergeDecision.trigger,
         reason: sessionEndMergeDecision.reason,
-        amount: closingMergeAmount,
+        requestedAmount: closingMergeAmount,
+        executableAmount: closingMergeExecution.executableAmount,
+        observedMergeable: closingMergeExecution.observedMergeable,
+        observedUpShares: closingMergeExecution.observed?.up ?? null,
+        observedDownShares: closingMergeExecution.observed?.down ?? null,
         mergeable: sessionEndMergeDecision.mergeable,
         basketEffectivePair: sessionEndMergeDecision.basketEffectivePair ?? null,
         lockedPendingUpShares: closingLockedPendingShares.up,
         lockedPendingDownShares: closingLockedPendingShares.down,
         lockedSettlementUpShares: closingSettlementLockedShares.up,
         lockedSettlementDownShares: closingSettlementLockedShares.down,
-        error: errorMessage,
+        skipReason: closingMergeExecution.reason ?? null,
       });
-      emitLiveMirror("merge_failed", {
-        marketSlug: market.slug,
-        trigger: sessionEndMergeDecision.trigger,
-        amount: closingMergeAmount,
-        reason: sessionEndMergeDecision.reason,
-        error: errorMessage,
-      });
+    } else {
+      try {
+        closingMergeResult = env.CTF_MERGE_ENABLED
+          ? await ctf.mergePositions(market.conditionId, closingMergeExecution.executableAmount, {
+              positionTokenIds: {
+                upTokenId: market.tokens.UP.tokenId,
+                downTokenId: market.tokens.DOWN.tokenId,
+              },
+            })
+          : {
+              simulated: true,
+              skipped: true,
+              action: "merge" as const,
+              amount: closingMergeExecution.executableAmount,
+              conditionId: market.conditionId,
+              reason: "CTF_MERGE_ENABLED=false",
+            };
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        logger.warn(
+          {
+            error,
+            mergeAmount: closingMergeExecution.executableAmount,
+            requestedMergeAmount: closingMergeAmount,
+            marketSlug: market.slug,
+          },
+          "Session-end CTF merge failed.",
+        );
+        pushEvent(events, {
+          timestamp: endedAt,
+          type: "merge_failed",
+          trigger: sessionEndMergeDecision.trigger,
+          amount: closingMergeExecution.executableAmount,
+          requestedAmount: closingMergeAmount,
+          reason: sessionEndMergeDecision.reason,
+          message: errorMessage,
+        });
+        await traceLogger.write("merge_redeem", {
+          action: "merge_failed",
+          trigger: sessionEndMergeDecision.trigger,
+          reason: sessionEndMergeDecision.reason,
+          amount: closingMergeExecution.executableAmount,
+          requestedAmount: closingMergeAmount,
+          observedMergeable: closingMergeExecution.observedMergeable,
+          observedUpShares: closingMergeExecution.observed?.up ?? null,
+          observedDownShares: closingMergeExecution.observed?.down ?? null,
+          mergeable: sessionEndMergeDecision.mergeable,
+          basketEffectivePair: sessionEndMergeDecision.basketEffectivePair ?? null,
+          lockedPendingUpShares: closingLockedPendingShares.up,
+          lockedPendingDownShares: closingLockedPendingShares.down,
+          lockedSettlementUpShares: closingSettlementLockedShares.up,
+          lockedSettlementDownShares: closingSettlementLockedShares.down,
+          error: errorMessage,
+        });
+        emitLiveMirror("merge_failed", {
+          marketSlug: market.slug,
+          trigger: sessionEndMergeDecision.trigger,
+          amount: closingMergeExecution.executableAmount,
+          requestedAmount: closingMergeAmount,
+          reason: sessionEndMergeDecision.reason,
+          error: errorMessage,
+        });
+      }
     }
     if (closingMergeResult && shouldAccountCtfTxResult(closingMergeResult)) {
       const preMergeState = state;
       state = applyMerge(state, {
-        amount: closingMergeAmount,
+        amount: closingMergeExecution.executableAmount,
         timestamp: endedAt,
         simulated: closingMergeResult.simulated,
         flowLineage: deriveCarryFlowLineageKey({
@@ -6760,8 +7317,13 @@ export async function runStatefulBotSession(
             arbitrationCarry?.protectedResidualSide ?? (partialOpenGroupLock ?? runtimeProtectedResidualLock)?.protectedSide,
         }),
       });
+      rememberBotOwnedMergeReduction({
+        amount: closingMergeExecution.executableAmount,
+        timestamp: endedAt,
+        txHash: closingMergeResult.txHash,
+      });
       stateStore.recordMerge(preMergeState, state.mergeHistory.at(-1) ?? {
-        amount: closingMergeAmount,
+        amount: closingMergeExecution.executableAmount,
         timestamp: endedAt,
         simulated: closingMergeResult.simulated,
       });
@@ -6804,7 +7366,7 @@ export async function runStatefulBotSession(
       }
       mergeCount += 1;
       applyRuntimeFlowBudgetAction("merge", {
-        quantityShares: closingMergeAmount,
+        quantityShares: closingMergeExecution.executableAmount,
         lineage: currentRuntimeFlowLineage(),
       });
       persistMarketState(state.reentryDisabled ? "post_merge_completion_only" : undefined);
@@ -6812,7 +7374,12 @@ export async function runStatefulBotSession(
     if (closingMergeResult) {
       await traceLogger.write("merge_redeem", {
         action: "merge",
-        amount: closingMergeAmount,
+        amount: closingMergeExecution.executableAmount,
+        requestedAmount: closingMergeAmount,
+        observedMergeable: closingMergeExecution.observedMergeable,
+        observedUpShares: closingMergeExecution.observed?.up ?? null,
+        observedDownShares: closingMergeExecution.observed?.down ?? null,
+        mergeClampReason: closingMergeExecution.reason ?? null,
         trigger: sessionEndMergeDecision.trigger,
         reason: sessionEndMergeDecision.reason,
         endReason,
@@ -6838,7 +7405,8 @@ export async function runStatefulBotSession(
         reason: sessionEndMergeDecision.reason,
         endReason,
         basketEffectivePair: sessionEndMergeDecision.basketEffectivePair ?? null,
-        amount: closingMergeAmount,
+        amount: closingMergeExecution.executableAmount,
+        requestedAmount: closingMergeAmount,
         txHash: closingMergeResult.txHash ?? null,
         simulated: closingMergeResult.simulated,
         skipped: closingMergeResult.skipped ?? false,

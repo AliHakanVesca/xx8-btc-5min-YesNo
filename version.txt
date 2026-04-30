@@ -1,6 +1,17 @@
 
 ##############################################
 
+Version : V.0.0.72
+Date    : 30.04.2026
+Author  : Ali Hakan Çakır
+Changes : - Merge miktari observed balance ile clamp edilip bot-owned reduction shortfall eslesmesi eklendi.
+          - Order-result overfill dust ve fill fingerprint accounting guardlari guncellendi.
+          - Entry repair resize ve submitted intent expected share davranisi netlestirildi.
+
+##############################################
+
+##############################################
+
 Version : V.0.0.71
 Date    : 30.04.2026
 Author  : Ali Hakan Çakır

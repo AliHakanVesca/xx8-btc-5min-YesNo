@@ -9,6 +9,7 @@ import {
   applyRuntimeFlowBudgetLedgerAction,
   applyRuntimeFlowBudgetLineageLedgerAction,
   clampEntryRepairBuyDecision,
+  clampMergeAmountToObservedBalances,
   botFillAccountingKey,
   deriveRuntimeFlowCalibrationBias,
   deriveRuntimeFlowBudgetState,
@@ -23,12 +24,15 @@ import {
   createPendingCompletionSubmission,
   evaluateSessionEndMergeDecision,
   findRecentBotOwnedFillForShortfall,
+  findRecentBotOwnedReductionForShortfall,
   findRecentSubmittedIntentForShortfall,
   isRecentBotOwnedShortfallMatch,
   restorePersistedArbitrationCarry,
   refreshRuntimeProtectedResidualLock,
   inferImmediateOrderResultFill,
   inferUserTradeFill,
+  isNonBlockingOrderResultOverfillDust,
+  orderResultOverfillDustThreshold,
   postMergeReentryResidualThreshold,
   postMergeResidualBlocksReentry,
   reconcileStateWithBalances,
@@ -596,7 +600,7 @@ describe("stateful bot session helpers", () => {
     });
   });
 
-  it("accounts order-result overfill at the actual matched share size", () => {
+  it("caps order-result overfill in the strategy ledger and records the excess separately", () => {
     const market = buildOfflineMarket(1713696000);
     const order = {
       tokenId: market.tokens.UP.tokenId,
@@ -626,12 +630,12 @@ describe("stateful bot session helpers", () => {
       result,
     });
 
-    expect(expectedSharesForSubmission(order.shareTarget, result)).toBe(17.857141);
+    expect(expectedSharesForSubmission(order.shareTarget, result)).toBe(15);
     expect(fill).toMatchObject({
       outcome: "UP",
       side: "BUY",
-      price: 0.42,
-      size: 17.857141,
+      price: 0.5,
+      size: 15,
     });
     expect(
       detectOrderResultShareOverfill({
@@ -652,6 +656,90 @@ describe("stateful bot session helpers", () => {
     expect(botFillAccountingKey(fill!, { orderId: "overfill-order-1" })).toBe(
       "order:overfill-order-1:UP:BUY",
     );
+  });
+
+  it("does not let a cheap raw takingAmount spike become normal ledger inventory", () => {
+    const market = buildOfflineMarket(1713696000);
+    const order = {
+      tokenId: market.tokens.DOWN.tokenId,
+      side: "BUY" as const,
+      price: 0.5,
+      amount: 7.5,
+      shareTarget: 15,
+      orderType: "FAK" as const,
+    };
+    const result = {
+      success: true,
+      simulated: false,
+      orderId: "cheap-spike-order",
+      status: "matched",
+      requestedAt: 1713696015,
+      raw: {
+        takingAmount: "750",
+        makingAmount: "7.5",
+      },
+    };
+
+    const fill = inferImmediateOrderResultFill({
+      outcome: "DOWN",
+      nowTs: 1713696015,
+      mode: "POST_MERGE_RESIDUAL_COMPLETION",
+      order,
+      result,
+    });
+
+    expect(expectedSharesForSubmission(order.shareTarget, result)).toBe(15);
+    expect(fill).toMatchObject({
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.5,
+      size: 15,
+    });
+    expect(
+      detectOrderResultShareOverfill({
+        order,
+        fill: fill!,
+        result,
+        orderId: "cheap-spike-order",
+      }),
+    ).toMatchObject({
+      outcome: "DOWN",
+      shareTarget: 15,
+      filledShares: 750,
+      excessShares: 735,
+    });
+  });
+
+  it("classifies sub-minimum Xuan overfill as non-blocking dust but keeps material overfill protected", () => {
+    const config = buildConfig({
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+      XUAN_BASE_LOT_LADDER: "15",
+      LIVE_SMALL_LOT_LADDER: "15",
+      MAX_COMPLETION_OVERSHOOT_SHARES: "0.25",
+    });
+
+    expect(orderResultOverfillDustThreshold({ config, minOrderSize: 5, shareTarget: 15 })).toBe(2.5);
+    expect(
+      isNonBlockingOrderResultOverfillDust({
+        config,
+        minOrderSize: 5,
+        overfill: {
+          shareTarget: 15,
+          excessShares: 0.692305,
+        },
+      }),
+    ).toBe(true);
+    expect(
+      isNonBlockingOrderResultOverfillDust({
+        config,
+        minOrderSize: 5,
+        overfill: {
+          shareTarget: 15,
+          excessShares: 2.857141,
+        },
+      }),
+    ).toBe(false);
   });
 
   it("treats post-merge overfill dust below the CLOB minimum as non-blocking for Xuan recycle", () => {
@@ -1095,6 +1183,79 @@ describe("stateful bot session helpers", () => {
         fromShares: 30,
         toShares: 0,
         nowTs: 1777491016 + BOT_OWNED_SETTLEMENT_GRACE_SEC + 1,
+      }),
+    ).toBeUndefined();
+  });
+
+  it("clamps merge execution to observed wallet mergeable and skips dust below CTF minimum", () => {
+    expect(
+      clampMergeAmountToObservedBalances({
+        requestedAmount: 5,
+        observed: { up: 0.218332, down: 5.01 },
+        minShares: 5,
+      }),
+    ).toEqual({
+      requestedAmount: 5,
+      observedMergeable: 0.218332,
+      executableAmount: 0.218332,
+      skipped: true,
+      reason: "observed_balance_below_min",
+    });
+
+    expect(
+      clampMergeAmountToObservedBalances({
+        requestedAmount: 5,
+        observed: { up: 4.75, down: 10 },
+        minShares: 1,
+      }),
+    ).toEqual({
+      requestedAmount: 5,
+      observedMergeable: 4.75,
+      executableAmount: 4.75,
+      skipped: false,
+      reason: "clamped_to_observed_balance",
+    });
+  });
+
+  it("marks confirmed CTF merge balance reductions as bot-owned reconcile corrections", () => {
+    const reductions = [
+      {
+        outcome: "UP" as const,
+        size: 5,
+        timestamp: 1777569755,
+        expiresAt: 1777569800,
+        reason: "ctf_merge" as const,
+        txHash: "0xmerge",
+      },
+      {
+        outcome: "DOWN" as const,
+        size: 5,
+        timestamp: 1777569755,
+        expiresAt: 1777569800,
+        reason: "ctf_merge" as const,
+        txHash: "0xmerge",
+      },
+    ];
+
+    expect(
+      findRecentBotOwnedReductionForShortfall(reductions, {
+        outcome: "UP",
+        fromShares: 5.218332,
+        toShares: 0.218332,
+        nowTs: 1777569768,
+      }),
+    ).toMatchObject({
+      outcome: "UP",
+      size: 5,
+      reason: "ctf_merge",
+      txHash: "0xmerge",
+    });
+    expect(
+      findRecentBotOwnedReductionForShortfall(reductions, {
+        outcome: "UP",
+        fromShares: 5.218332,
+        toShares: 0.218332,
+        nowTs: 1777569801,
       }),
     ).toBeUndefined();
   });

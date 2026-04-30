@@ -1,6 +1,16 @@
 
 ##############################################
 
+Version : V.0.0.74
+Date    : 30.04.2026
+Author  : Ali Hakan Çakır
+Changes : - Persistent fill fuzzy duplicate korumasi geri eklendi.
+          - Mergeable basket varken fresh entry submit merge-first guard ile engellendi.
+
+##############################################
+
+##############################################
+
 Version : V.0.0.73
 Date    : 30.04.2026
 Author  : Ali Hakan Çakır

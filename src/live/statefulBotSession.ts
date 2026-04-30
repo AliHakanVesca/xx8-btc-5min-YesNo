@@ -1696,6 +1696,16 @@ function shouldHoldRuntimeEntryForMergeFirstAfterCompletion(
   return matchedEffectivePairCost(state, config.cryptoTakerFeeRate) <= config.marketBasketMergeEffectivePairCap + 1e-9;
 }
 
+function shouldHoldFreshEntryForMergeableBasket(
+  config: XuanStrategyConfig,
+  state: XuanMarketState,
+): boolean {
+  if (config.botMode !== "XUAN" || config.mergeMode !== "AUTO") {
+    return false;
+  }
+  return mergeableShares(state) >= config.mergeMinShares - 1e-9;
+}
+
 function repairTraceQuantityCap(
   entryTrace: Pick<EntryDecisionTrace, "repairFinalQty" | "repairSize" | "repairRequestedQty">,
 ): number | undefined {
@@ -6170,6 +6180,20 @@ export async function runStatefulBotSession(
       }
 
       if (decision.entryBuys.length > 0) {
+        const hasFreshEntry = decision.entryBuys.some((entryBuy) => !completionLikeEntrySubmission(entryBuy.mode));
+        if (hasFreshEntry && shouldHoldFreshEntryForMergeableBasket(config, state)) {
+          await traceLogger.write("orders", {
+            eventType: "entry_submit_blocked",
+            selectedMode: decision.entryBuys[0]?.mode ?? null,
+            side: decision.entryBuys[0]?.side ?? null,
+            requestedSize: decision.entryBuys[0]?.size ?? null,
+            reason: "xuan_mergeable_basket_first",
+            mergeableShares: mergeableShares(state),
+            basketEffectivePair: matchedEffectivePairCost(state, config.cryptoTakerFeeRate),
+          });
+          await waitForDecisionPulse();
+          continue;
+        }
         const submittedAtTs = nowTs;
         const submittedAtMs = Date.now();
         for (const entryBuy of decision.entryBuys) {

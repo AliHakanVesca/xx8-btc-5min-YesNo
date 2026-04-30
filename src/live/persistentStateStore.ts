@@ -529,6 +529,33 @@ export class PersistentStateStore {
           return false;
         }
       }
+      const fuzzyDuplicate = this.db
+        .prepare(`
+          SELECT lot_id
+          FROM inventory_lots
+          WHERE market_slug = @marketSlug
+            AND condition_id = @conditionId
+            AND outcome = @outcome
+            AND side = 'BUY'
+            AND ABS(qty_original - @qtyOriginal) <= @qtyTolerance
+            AND ABS(price - @price) <= @priceTolerance
+            AND ABS(timestamp - @timestamp) <= @timestampTolerance
+          LIMIT 1
+        `)
+        .get({
+          marketSlug: state.market.slug,
+          conditionId: state.market.conditionId,
+          outcome: fill.outcome,
+          qtyOriginal,
+          qtyTolerance: Math.max(0.0001, qtyOriginal * 0.001),
+          price: fill.price,
+          priceTolerance: 0.005,
+          timestamp: fill.timestamp,
+          timestampTolerance: 3,
+        }) as { lot_id: string } | undefined;
+      if (fuzzyDuplicate) {
+        return false;
+      }
       const feePerShare = takerFeePerShare(fill.price, normalizeFeeRate(state.market.feeRate));
       this.db
         .prepare(`

@@ -895,12 +895,13 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     ? config.maxMatchedAgeBeforeForcedMergeSec
     : Math.max(config.maxMatchedAgeBeforeForcedMergeSec, 180);
   const customSmallLadderMaxLot = customAggressiveLadder && maxLadderLot < 23.4 ? maxLadderLot : undefined;
+  const fixedSmallShareProfile = customAggressiveLadder && maxLadderLot <= 15 + 1e-9;
   const fixedFiveShareProfile = customAggressiveLadder && maxLadderLot <= 5 + 1e-9;
-  const fixedFiveQty = fixedFiveShareProfile ? Math.max(5, maxLadderLot) : undefined;
+  const fixedFiveQty = fixedSmallShareProfile ? Math.max(5, maxLadderLot) : undefined;
   const capFixedFiveQty = (configured: number): number =>
     fixedFiveQty !== undefined ? fixedFiveQty : Math.max(configured, maxLadderLot);
   const fixedFiveMergeTargetMaxShares = fixedFiveQty ?? publicFootprintMergeTargetMaxShares;
-  const fixedFiveMergeTargetMultiplier = fixedFiveShareProfile ? 1 : Math.max(config.marketBasketMergeTargetMultiplier, 2.5);
+  const fixedFiveMergeTargetMultiplier = fixedSmallShareProfile ? 1 : Math.max(config.marketBasketMergeTargetMultiplier, 2.5);
   const publicFootprintMicroPairMaxQty =
     customSmallLadderMaxLot !== undefined
       ? Math.max(config.xuanMicroPairMaxQty, customSmallLadderMaxLot)
@@ -1157,18 +1158,18 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     highSideCompletionRequiresFairValue: aggressive ? false : config.highSideCompletionRequiresFairValue,
     highSideCompletionRequiresHardImbalance: aggressive ? false : config.highSideCompletionRequiresHardImbalance,
     xuanBehaviorCap: elevatedBehaviorCap,
-    campaignLaunchVwapTiers: fixedFiveShareProfile ? [fixedFiveQty ?? 5] : config.campaignLaunchVwapTiers,
+    campaignLaunchVwapTiers: fixedSmallShareProfile ? [fixedFiveQty ?? 5] : config.campaignLaunchVwapTiers,
     xuanBasketCampaignCompletionClipMaxQty: capFixedFiveQty(config.xuanBasketCampaignCompletionClipMaxQty),
     cloneChildPreferredShares: aggressive
       ? fixedFiveQty ?? Math.max(config.cloneChildPreferredShares, ladder[0] ?? 80, customAggressiveLadder ? 1 : 80)
       : Math.min(config.cloneChildPreferredShares, 20),
     cloneChildOrderDelayMs: Math.max(config.cloneChildOrderDelayMs, 120),
     cloneStaleCheapOppositeQuoteMinAgeSec: Math.min(config.cloneStaleCheapOppositeQuoteMinAgeSec, 75),
-    mergeBatchMode: fixedFiveShareProfile ? "IMMEDIATE" : "HYBRID_DELAYED",
-    minCompletedCyclesBeforeFirstMerge: fixedFiveShareProfile ? 1 : config.minCompletedCyclesBeforeFirstMerge,
-    minFirstMatchedAgeBeforeMergeSec: fixedFiveShareProfile ? 0 : config.minFirstMatchedAgeBeforeMergeSec,
-    maxMatchedAgeBeforeForcedMergeSec: fixedFiveShareProfile ? Math.min(config.maxMatchedAgeBeforeForcedMergeSec, 5) : publicFootprintForcedMergeAgeSec,
-    requireMinAgeForCycleTargetMerge: fixedFiveShareProfile ? false : config.requireMinAgeForCycleTargetMerge,
+    mergeBatchMode: fixedSmallShareProfile ? "IMMEDIATE" : "HYBRID_DELAYED",
+    minCompletedCyclesBeforeFirstMerge: fixedSmallShareProfile ? 1 : config.minCompletedCyclesBeforeFirstMerge,
+    minFirstMatchedAgeBeforeMergeSec: fixedSmallShareProfile ? 0 : config.minFirstMatchedAgeBeforeMergeSec,
+    maxMatchedAgeBeforeForcedMergeSec: fixedSmallShareProfile ? Math.min(config.maxMatchedAgeBeforeForcedMergeSec, 5) : publicFootprintForcedMergeAgeSec,
+    requireMinAgeForCycleTargetMerge: fixedSmallShareProfile ? false : config.requireMinAgeForCycleTargetMerge,
     mergeShieldSecFromOpen: config.mergeShieldSecFromOpen,
     forceMergeInLast30S: true,
     forceMergeOnHardImbalance: true,

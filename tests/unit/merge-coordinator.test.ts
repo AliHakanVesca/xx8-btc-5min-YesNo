@@ -176,6 +176,132 @@ describe("merge coordinator", () => {
     expect(gate.basketEffectivePair).toBeGreaterThan(1);
   });
 
+  it("releases a fixed 5/5 negative basket after the Xuan recycle wait instead of holding until close", () => {
+    const config = buildConfig({
+      BOT_MODE: "XUAN",
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+      XUAN_BASE_LOT_LADDER: "5",
+      LIVE_SMALL_LOT_LADDER: "5",
+      MARKET_BASKET_MIN_MERGE_SHARES: "40",
+      MARKET_BASKET_MERGE_TARGET_MULTIPLIER: "3",
+      MARKET_BASKET_MERGE_TARGET_MAX_SHARES: "900",
+      MERGE_BATCH_MODE: "HYBRID_DELAYED",
+    });
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      price: 0.41,
+      size: 5,
+      timestamp: market.startTs + 9,
+      makerTaker: "taker",
+      executionMode: "XUAN_HARD_PAIR_SWEEP",
+    });
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.6,
+      size: 5,
+      timestamp: market.startTs + 16,
+      makerTaker: "taker",
+      executionMode: "XUAN_HARD_PAIR_SWEEP",
+    });
+    let tracker = createMergeBatchTracker();
+    tracker = syncMergeBatchTracker(tracker, 5, market.startTs + 16);
+
+    const gate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 37,
+      secsFromOpen: 37,
+      secsToClose: 263,
+      usdcBalance: 100,
+      tracker,
+    });
+
+    expect(config.mergeBatchMode).toBe("IMMEDIATE");
+    expect(gate.allow).toBe(true);
+    expect(gate.reason).toBe("cycle_target");
+    expect(gate.basketEffectivePair).toBeGreaterThan(1);
+  });
+
+  it("releases a fixed 15/15 post-merge recycle after the Xuan wait instead of holding until final window", () => {
+    const config = buildConfig({
+      BOT_MODE: "XUAN",
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+      XUAN_BASE_LOT_LADDER: "15",
+      LIVE_SMALL_LOT_LADDER: "15",
+      DEFAULT_LOT: "15",
+      MARKET_BASKET_MIN_MERGE_SHARES: "40",
+      MARKET_BASKET_MERGE_TARGET_MULTIPLIER: "3",
+      MARKET_BASKET_MERGE_TARGET_MAX_SHARES: "900",
+      MERGE_BATCH_MODE: "HYBRID_DELAYED",
+      MARKET_BASKET_MERGE_EFFECTIVE_PAIR_CAP: "1",
+    });
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      price: 0.48,
+      size: 15,
+      timestamp: market.startTs + 20,
+      makerTaker: "taker",
+      executionMode: "XUAN_HARD_PAIR_SWEEP",
+    });
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.49,
+      size: 15,
+      timestamp: market.startTs + 32,
+      makerTaker: "taker",
+      executionMode: "XUAN_HARD_PAIR_SWEEP",
+    });
+    state = applyMerge(state, {
+      amount: 15,
+      timestamp: market.startTs + 170,
+      simulated: true,
+    });
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      price: 0.51,
+      size: 15,
+      timestamp: market.startTs + 190,
+      makerTaker: "taker",
+      executionMode: "XUAN_HARD_PAIR_SWEEP",
+    });
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.5,
+      size: 15,
+      timestamp: market.startTs + 198,
+      makerTaker: "taker",
+      executionMode: "XUAN_HARD_PAIR_SWEEP",
+    });
+    let tracker = createMergeBatchTracker();
+    tracker = syncMergeBatchTracker(tracker, 15, market.startTs + 198);
+
+    const gate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 212,
+      secsFromOpen: 212,
+      secsToClose: 88,
+      usdcBalance: 100,
+      tracker,
+    });
+
+    expect(config.mergeBatchMode).toBe("IMMEDIATE");
+    expect(config.marketBasketMinMergeShares).toBe(15);
+    expect(config.marketBasketMergeTargetMaxShares).toBe(15);
+    expect(gate.allow).toBe(true);
+    expect(gate.reason).toBe("cycle_target");
+    expect(gate.pendingMatchedQty).toBe(15);
+    expect(gate.basketEffectivePair).toBeGreaterThan(1);
+  });
+
   it("holds age-target merge while a material temporal planned opposite remains open", () => {
     const config = buildConfig({
       BOT_MODE: "XUAN",
@@ -380,7 +506,7 @@ describe("merge coordinator", () => {
     expect(gate.oldestMatchedAgeSec).toBe(76);
   });
 
-  it("forces small explicit aggressive public-footprint baskets once the first family window opens", () => {
+  it("releases small explicit aggressive public-footprint baskets immediately for fixed 15/15 recycle", () => {
     const config = buildConfig({
       BOT_MODE: "XUAN",
       XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
@@ -412,28 +538,21 @@ describe("merge coordinator", () => {
     let tracker = createMergeBatchTracker();
     tracker = syncMergeBatchTracker(tracker, 15, market.startTs + 63);
 
-    const earlyGate = evaluateDelayedMergeGate(config, state, {
+    const gate = evaluateDelayedMergeGate(config, state, {
       nowTs: market.startTs + 159,
       secsFromOpen: 159,
       secsToClose: 141,
       usdcBalance: 100,
       tracker,
     });
-    const releasedGate = evaluateDelayedMergeGate(config, state, {
-      nowTs: market.startTs + 160,
-      secsFromOpen: 160,
-      secsToClose: 140,
-      usdcBalance: 100,
-      tracker,
-    });
 
     expect(config.marketBasketMinMergeShares).toBe(15);
-    expect(config.maxMatchedAgeBeforeForcedMergeSec).toBe(75);
-    expect(earlyGate.allow).toBe(false);
-    expect(earlyGate.reason).toBe("not_ready");
-    expect(releasedGate.allow).toBe(true);
-    expect(releasedGate.forced).toBe(true);
-    expect(releasedGate.reason).toBe("forced_age");
+    expect(config.marketBasketMergeTargetMaxShares).toBe(15);
+    expect(config.maxMatchedAgeBeforeForcedMergeSec).toBe(5);
+    expect(config.mergeBatchMode).toBe("IMMEDIATE");
+    expect(gate.allow).toBe(true);
+    expect(gate.forced).toBe(false);
+    expect(gate.reason).toBe("cycle_target");
   });
 
   it("releases a large high-quality matched basket before the generic age target", () => {

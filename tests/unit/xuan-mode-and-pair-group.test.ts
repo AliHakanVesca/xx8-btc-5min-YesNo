@@ -8552,7 +8552,75 @@ describe("xuan mode and pair order groups", () => {
     expect(evaluation.trace.skipReason).toBe("xuan_post_merge_reentry_cooldown");
   });
 
-  it("blocks post-merge fixed-five re-entry when the opposite completion cannot be topped up to 5 shares", () => {
+  it("ignores fixed-five post-merge dust when reopening a closeable recycle cycle", () => {
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = {
+      ...state,
+      upShares: 0.01,
+      downShares: 0.161562,
+      mergeHistory: [
+        {
+          amount: 5.084338,
+          timestamp: market.startTs + 166,
+          simulated: false,
+        },
+      ],
+      reentryDisabled: false,
+      postMergeCompletionOnlyUntil: market.startTs + 260,
+    };
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.74, size: 200 }], [{ price: 0.75, size: 200 }]),
+      buildBook(
+        market.tokens.DOWN.tokenId,
+        market.conditionId,
+        [{ price: 0.24, size: 200 }],
+        [{ price: 0.25, size: 200 }],
+      ),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+        XUAN_BASE_LOT_LADDER: "5",
+        LIVE_SMALL_LOT_LADDER: "5",
+        DEFAULT_LOT: "5",
+        ALLOW_TEMPORAL_SINGLE_LEG_SEED: "true",
+        ALLOW_XUAN_COVERED_SEED: "true",
+        MARKET_BASKET_BOOTSTRAP_ENABLED: "false",
+        SINGLE_LEG_FAIR_VALUE_VETO: "false",
+        COVERED_SEED_REQUIRES_FAIR_VALUE: "false",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 170,
+        secsToClose: 130,
+        lot: 5,
+        fairValueSnapshot: {
+          status: "valid",
+          estimatedThreshold: false,
+          fairUp: 0.9,
+          fairDown: 0.1,
+        },
+      },
+    );
+
+    expect(evaluation.trace.skipReason).not.toBe("xuan_post_merge_reentry_cooldown");
+    expect(evaluation.trace.seedCandidates?.map((candidate) => candidate.skipReason)).not.toEqual(
+      expect.arrayContaining([
+        "xuan_post_merge_reentry_uncloseable_min_size",
+        "xuan_post_merge_reentry_uncloseable_fixed_clip",
+      ]),
+    );
+    expect(evaluation.decisions).toHaveLength(1);
+    expect(evaluation.decisions[0]?.size).toBe(5);
+  });
+
+  it("does not treat post-merge fixed-five dust as an uncloseable min-size blocker", () => {
     const market = buildOfflineMarket(1777557600);
     let state = createMarketState(market);
     state = {
@@ -8615,7 +8683,7 @@ describe("xuan mode and pair order groups", () => {
     );
 
     expect(evaluation.decisions).toHaveLength(0);
-    expect(evaluation.trace.seedCandidates?.map((candidate) => candidate.skipReason)).toEqual(
+    expect(evaluation.trace.seedCandidates?.map((candidate) => candidate.skipReason)).not.toEqual(
       expect.arrayContaining([
         "xuan_post_merge_reentry_uncloseable_min_size",
         "xuan_post_merge_reentry_uncloseable_fixed_clip",

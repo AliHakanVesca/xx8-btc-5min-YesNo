@@ -284,8 +284,10 @@ describe("lot ladder and risk windows", () => {
     expect(xuanConfiguredMicroLot(xuanConfig)).toBe(15);
     expect(xuanConfiguredFreshStagedSeedMinLot(xuanConfig)).toBe(15);
     expect(xuanConfig.marketBasketMinMergeShares).toBe(15);
-    expect(xuanConfig.marketBasketMergeTargetMaxShares).toBe(45);
-    expect(xuanConfig.maxMatchedAgeBeforeForcedMergeSec).toBe(75);
+    expect(xuanConfig.marketBasketMergeTargetMaxShares).toBe(15);
+    expect(xuanConfig.mergeBatchMode).toBe("IMMEDIATE");
+    expect(xuanConfig.maxMatchedAgeBeforeForcedMergeSec).toBe(5);
+    expect(xuanConfig.campaignLaunchVwapTiers).toEqual([15]);
   });
 
   it("uses a fixed five-share aggressive profile with immediate 5/5 merge targets", () => {

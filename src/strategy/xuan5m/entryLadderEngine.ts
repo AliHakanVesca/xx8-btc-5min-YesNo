@@ -907,6 +907,9 @@ function postMergeReentryHoldReason(
   ) {
     return undefined;
   }
+  if (fixedFiveDustNeutralAfterMerge(config, state)) {
+    return undefined;
+  }
   const flatDust = Math.max(config.postMergeFlatDustShares, state.market.minOrderSize * 0.01, 1e-6);
   if (Math.abs(state.upShares - state.downShares) > flatDust + 1e-9) {
     return undefined;
@@ -1142,13 +1145,29 @@ function xuanFreshCycleFlatDustThreshold(config: XuanStrategyConfig, state: Xuan
   return baseThreshold;
 }
 
+function fixedFiveDustNeutralAfterMerge(config: XuanStrategyConfig, state: XuanMarketState): boolean {
+  return (
+    fixedFiveEntryClipMax(config) !== undefined &&
+    state.mergeHistory.length > 0 &&
+    state.upShares + state.downShares <= xuanFreshCycleFlatDustThreshold(config, state) + 1e-9
+  );
+}
+
+function fixedSmallDustNeutralAfterMerge(config: XuanStrategyConfig, state: XuanMarketState): boolean {
+  return (
+    fixedSmallEntryClipMax(config) !== undefined &&
+    state.mergeHistory.length > 0 &&
+    state.upShares + state.downShares <= xuanFreshCycleFlatDustThreshold(config, state) + 1e-9
+  );
+}
+
 function fixedFivePostMergeReentryCompletionBlockReason(args: {
   config: XuanStrategyConfig;
   state: XuanMarketState;
   side: OutcomeSide;
   seedSize: number;
 }): string | undefined {
-  const fixedFiveClip = fixedFiveEntryClipMax(args.config);
+  const fixedFiveClip = fixedSmallEntryClipMax(args.config);
   if (
     fixedFiveClip === undefined ||
     !isAggressivePublicFootprint(args.config) ||
@@ -1158,8 +1177,9 @@ function fixedFivePostMergeReentryCompletionBlockReason(args: {
     return undefined;
   }
 
-  const currentSideShares = args.side === "UP" ? args.state.upShares : args.state.downShares;
-  const oppositeShares = args.side === "UP" ? args.state.downShares : args.state.upShares;
+  const dustNeutral = fixedSmallDustNeutralAfterMerge(args.config, args.state);
+  const currentSideShares = dustNeutral ? 0 : args.side === "UP" ? args.state.upShares : args.state.downShares;
+  const oppositeShares = dustNeutral ? 0 : args.side === "UP" ? args.state.downShares : args.state.upShares;
   const projectedMissingOpposite = Math.abs(currentSideShares + args.seedSize - oppositeShares);
   const minCompletionShares = Math.max(args.state.market.minOrderSize, args.config.completionMinQty);
 
@@ -1611,8 +1631,24 @@ function fixedFiveEntryClipMax(config: XuanStrategyConfig): number | undefined {
   return configuredMaxLot > 0 && configuredMaxLot <= 5 + 1e-9 ? configuredMaxLot : undefined;
 }
 
+function fixedSmallEntryClipMax(config: XuanStrategyConfig): number | undefined {
+  if (!isAggressivePublicFootprint(config)) {
+    return undefined;
+  }
+  const configuredMaxLot = Math.max(
+    0,
+    ...config.xuanBaseLotLadder,
+    ...config.liveSmallLotLadder,
+    config.defaultLot,
+  );
+  const fixedSmallClipMax = Math.min(15, Math.max(5, xuanConfiguredMicroLot(config)));
+  return configuredMaxLot > 0 && configuredMaxLot <= fixedSmallClipMax + 1e-9
+    ? configuredMaxLot
+    : undefined;
+}
+
 function fixedFiveResidualRepairClipMax(config: XuanStrategyConfig, shareGap: number): number | undefined {
-  const fixedMax = fixedFiveEntryClipMax(config);
+  const fixedMax = fixedSmallEntryClipMax(config);
   if (fixedMax === undefined) {
     return undefined;
   }
@@ -3149,6 +3185,7 @@ export function evaluateEntryBuys(
   const currentBasketState = marketBasketStateTrace(config, state);
   const mergeFirstAfterCompletion = shouldHoldEntryForMergeFirstAfterCompletion(config, state, ctx, currentBasketState);
   const postMergeHoldReason = postMergeReentryHoldReason(config, state, state.market.startTs + ctx.secsFromOpen);
+  const fixedFiveDustNeutralRecycle = fixedSmallDustNeutralAfterMerge(config, state);
   const sequencePriorDustRecycleActive =
     config.botMode === "XUAN" &&
     config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
@@ -3157,6 +3194,7 @@ export function evaluateEntryBuys(
     resolveBundledSeedSequencePrior(state.market.slug, ctx.secsFromOpen) !== undefined;
   const useBalancedPairPath =
     shareGap === 0 ||
+    fixedFiveDustNeutralRecycle ||
     currentBasketState.balancedButDebted ||
     (sequencePriorDustRecycleActive && shareGap <= xuanFreshCycleFlatDustThreshold(config, state));
 

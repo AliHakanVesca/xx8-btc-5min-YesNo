@@ -348,6 +348,26 @@ export function evaluateDelayedMergeGate(
     !basketRawEconomicsPositive &&
     args.secsToClose > config.finalWindowCompletionOnlySec &&
     !finalResidualMergeWindow;
+  const fixedFiveProfileMaxLot = Math.max(0, config.defaultLot, ...config.liveSmallLotLadder);
+  const fixedFiveQuickRecycleProfile =
+    aggressivePublicFootprint &&
+    fixedFiveProfileMaxLot > 0 &&
+    fixedFiveProfileMaxLot <= 15 + 1e-9;
+  const fixedFiveQuickRecycleLossRelease =
+    fixedFiveQuickRecycleProfile &&
+    !exactMergePriorActive &&
+    basketEffectivePair !== undefined &&
+    basketEffectivePair <= Math.min(1.25, config.marketBasketMergeEffectivePairCap + 0.25) + 1e-9 &&
+    metrics.completedCycles >= 1 &&
+    metrics.pendingMatchedQty >= state.market.minOrderSize - 1e-9 &&
+    metrics.pendingMatchedQty <= fixedFiveProfileMaxLot + Math.max(0.5, state.market.minOrderSize * 0.1) + 1e-9 &&
+    metrics.oldestMatchedAgeSec !== undefined &&
+    metrics.oldestMatchedAgeSec >= Math.max(1, config.xuanRhythmMaxWaitSec) - 1e-9 &&
+    Math.max(0, basketEffectivePair - 1) * metrics.pendingMatchedQty <=
+      Math.max(0.75, fixedFiveProfileMaxLot * 0.05) + 1e-9 &&
+    args.secsToClose > Math.max(config.finalWindowCompletionOnlySec, 20);
+  const shouldHoldNegativeEconomics =
+    aggressiveNormalRecycleNegativeEconomicsHold && !fixedFiveQuickRecycleLossRelease;
   const negativeEconomicsHoldDecision = (): MergeGateDecision => ({
     allow: false,
     forced: false,
@@ -361,7 +381,8 @@ export function evaluateDelayedMergeGate(
     const immediateMergeEconomicsSafe =
       basketEffectivePair === undefined ||
       basketEffectivePair <= config.marketBasketMergeEffectivePairCap + 1e-9 ||
-      basketRawEconomicsPositive;
+      basketRawEconomicsPositive ||
+      fixedFiveQuickRecycleLossRelease;
     if (!immediateMergeEconomicsSafe && !finalResidualMergeWindow) {
       return negativeEconomicsHoldDecision();
     }
@@ -456,7 +477,7 @@ export function evaluateDelayedMergeGate(
         ...metrics,
       };
     }
-    if (aggressiveNormalRecycleNegativeEconomicsHold) {
+    if (shouldHoldNegativeEconomics) {
       return negativeEconomicsHoldDecision();
     }
     return {
@@ -513,7 +534,8 @@ export function evaluateDelayedMergeGate(
     Math.abs(state.upShares - state.downShares) <= Math.max(state.market.minOrderSize, config.completionMinQty) + 1e-9;
   const aggressivePostMergeCycleEconomicsSafe =
     basketEffectivePair === undefined ||
-    basketEffectivePair <= config.marketBasketMergeEffectivePairCap + 1e-9;
+    basketEffectivePair <= config.marketBasketMergeEffectivePairCap + 1e-9 ||
+    fixedFiveQuickRecycleLossRelease;
   if (aggressivePostMergeCycleReleaseCandidate && !aggressivePostMergeCycleEconomicsSafe) {
     return negativeEconomicsHoldDecision();
   }
@@ -612,7 +634,7 @@ export function evaluateDelayedMergeGate(
         ...metrics,
       };
     }
-    if (aggressiveNormalRecycleNegativeEconomicsHold) {
+    if (shouldHoldNegativeEconomics) {
       return negativeEconomicsHoldDecision();
     }
     return {
@@ -718,7 +740,7 @@ export function evaluateDelayedMergeGate(
         ...metrics,
       };
     }
-    if (aggressiveNormalRecycleNegativeEconomicsHold) {
+    if (shouldHoldNegativeEconomics) {
       return negativeEconomicsHoldDecision();
     }
     return {
@@ -787,7 +809,7 @@ export function evaluateDelayedMergeGate(
         ...metrics,
       };
     }
-    if (aggressiveNormalRecycleNegativeEconomicsHold) {
+    if (shouldHoldNegativeEconomics) {
       return negativeEconomicsHoldDecision();
     }
     return {
@@ -830,7 +852,7 @@ export function evaluateDelayedMergeGate(
         ...metrics,
       };
     }
-    if (aggressiveNormalRecycleNegativeEconomicsHold) {
+    if (shouldHoldNegativeEconomics) {
       return negativeEconomicsHoldDecision();
     }
     return {

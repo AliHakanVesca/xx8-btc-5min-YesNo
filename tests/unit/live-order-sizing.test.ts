@@ -66,7 +66,7 @@ describe("live order sizing", () => {
     expect(result.reason).toBe("below_min_market_buy_amount");
   });
 
-  it("allows exact-share FAK buys at the market minimum even when the notional is below one dollar", () => {
+  it("keeps very cheap exact-share FAK buys on the capped limit path", () => {
     const result = fitBuyOrderToUsdcBalance(
       buyOrder({
         price: 0.004,
@@ -82,8 +82,55 @@ describe("live order sizing", () => {
 
     expect(result.skipped).toBe(false);
     expect(result.reason).toBe("fits_balance");
-    expect(result.order?.shareTarget).toBe(5);
     expect(result.order?.amount).toBe(0.02);
+    expect(result.order?.shareTarget).toBe(5);
+  });
+
+  it("keeps share-targeted completion buys exact-size instead of bridging through market-buy notional", () => {
+    const result = fitBuyOrderToUsdcBalance(
+      buyOrder({
+        price: 0.06,
+        amount: 0.9,
+        shareTarget: 15,
+      }),
+      {
+        usdcBalance: 10,
+        minOrderSize: 5,
+        sizeLadder: [15],
+        allowMinMarketBuyAmountBridge: true,
+        maxMinMarketBuyAmountBridgeOvershootShares: 3.75,
+      },
+    );
+
+    expect(result.skipped).toBe(false);
+    expect(result.adjusted).toBe(false);
+    expect(result.reason).toBe("fits_balance");
+    expect(result.requestedShares).toBe(15);
+    expect(result.order?.amount).toBe(0.9);
+    expect(result.order?.shareTarget).toBe(15);
+  });
+
+  it("does not bridge very cheap exact-size completion buys into oversized market-buy exposure", () => {
+    const result = fitBuyOrderToUsdcBalance(
+      buyOrder({
+        price: 0.01,
+        amount: 0.15,
+        shareTarget: 15,
+      }),
+      {
+        usdcBalance: 10,
+        minOrderSize: 5,
+        sizeLadder: [15],
+        allowMinMarketBuyAmountBridge: true,
+        maxMinMarketBuyAmountBridgeOvershootShares: 3.75,
+      },
+    );
+
+    expect(result.skipped).toBe(false);
+    expect(result.adjusted).toBe(false);
+    expect(result.reason).toBe("fits_balance");
+    expect(result.order?.amount).toBe(0.15);
+    expect(result.order?.shareTarget).toBe(15);
   });
 
   it("skips residual BUY orders below the market minimum share size before submit", () => {

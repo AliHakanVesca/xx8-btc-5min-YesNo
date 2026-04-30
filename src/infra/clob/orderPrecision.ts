@@ -13,12 +13,49 @@ function floorToDecimals(value: number, decimals: number): number {
   return Number((Math.floor((value + EPSILON) * factor) / factor).toFixed(decimals));
 }
 
+function gcd(left: number, right: number): number {
+  let a = Math.abs(Math.trunc(left));
+  let b = Math.abs(Math.trunc(right));
+  while (b !== 0) {
+    const next = a % b;
+    a = b;
+    b = next;
+  }
+  return a || 1;
+}
+
 export function normalizePositiveAmount(value: number): number {
   return Number(Math.max(0, value).toFixed(DEFAULT_DECIMALS));
 }
 
 export function normalizePositiveShares(value: number): number {
   return Number(Math.max(0, value).toFixed(DEFAULT_DECIMALS));
+}
+
+export function normalizeLimitBuyShareTarget(args: {
+  shareTarget: number;
+  price: number;
+}): number {
+  if (
+    !Number.isFinite(args.shareTarget) ||
+    !Number.isFinite(args.price) ||
+    args.shareTarget <= 0 ||
+    args.price <= 0
+  ) {
+    return 0;
+  }
+
+  const priceCents = Math.round(args.price * 10 ** MARKET_BUY_MAKER_DECIMALS);
+  const priceIsCentTick = Math.abs(priceCents / 10 ** MARKET_BUY_MAKER_DECIMALS - args.price) <= 1e-9;
+  if (!priceIsCentTick || priceCents <= 0) {
+    return floorToDecimals(args.shareTarget, MARKET_BUY_TAKER_DECIMALS);
+  }
+
+  const takerScale = 10 ** MARKET_BUY_TAKER_DECIMALS;
+  const units = Math.floor((args.shareTarget + EPSILON) * takerScale);
+  const stepUnits = takerScale / gcd(priceCents, takerScale);
+  const normalizedUnits = Math.floor(units / stepUnits) * stepUnits;
+  return Number((Math.max(0, normalizedUnits) / takerScale).toFixed(MARKET_BUY_TAKER_DECIMALS));
 }
 
 export function normalizeClobMarketBuy(args: {
@@ -34,8 +71,12 @@ export function normalizeClobMarketBuy(args: {
     return { amount: 0, shareTarget: 0 };
   }
 
-  const amount = floorToDecimals(args.shareTarget * args.price, MARKET_BUY_MAKER_DECIMALS);
-  const shareTarget = floorToDecimals(Math.min(args.shareTarget, amount / args.price), MARKET_BUY_TAKER_DECIMALS);
+  const maxAmount = floorToDecimals(args.shareTarget * args.price, MARKET_BUY_MAKER_DECIMALS);
+  const shareTarget = normalizeLimitBuyShareTarget({
+    shareTarget: Math.min(args.shareTarget, maxAmount / args.price),
+    price: args.price,
+  });
+  const amount = floorToDecimals(shareTarget * args.price, MARKET_BUY_MAKER_DECIMALS);
   return { amount, shareTarget };
 }
 

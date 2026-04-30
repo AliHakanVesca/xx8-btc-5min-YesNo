@@ -12,6 +12,8 @@ export interface AffordableBuyOrderOptions {
   minMarketBuyAmount?: number | undefined;
   sizeLadder?: number[] | undefined;
   feeCushionRatio?: number | undefined;
+  allowMinMarketBuyAmountBridge?: boolean | undefined;
+  maxMinMarketBuyAmountBridgeOvershootShares?: number | undefined;
 }
 
 export interface AffordableBuyOrderResult {
@@ -28,6 +30,7 @@ export interface AffordableBuyOrderResult {
     | "below_min_order_size"
     | "below_min_market_buy_amount"
     | "fits_balance"
+    | "bridged_to_min_market_buy_amount"
     | "downshifted_to_affordable_ladder"
     | "insufficient_balance";
 }
@@ -42,6 +45,14 @@ function normalizeAmount(value: number): number {
 
 function normalizeShares(value: number): number {
   return Number(Math.max(0, value).toFixed(6));
+}
+
+function ceilToDecimals(value: number, decimals: number): number {
+  if (!Number.isFinite(value) || value <= 0) {
+    return 0;
+  }
+  const factor = 10 ** decimals;
+  return Number((Math.ceil((value + EPSILON) * factor) / factor).toFixed(decimals));
 }
 
 function normalizeCandidateSizes(sizes: number[], minOrderSize: number): number[] {
@@ -91,6 +102,25 @@ function resizedBuyOrder(order: MarketOrderArgs, shareTarget: number, price: num
     }),
     usdcBalance,
   );
+}
+
+function minSharesForMarketBuyAmount(price: number, minMarketBuyAmount: number): number {
+  let shareTarget = ceilToDecimals(minMarketBuyAmount / price, 4);
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const normalized = normalizeExecutableBuyOrder({
+      tokenId: "sizing-probe",
+      side: "BUY",
+      amount: normalizeAmount(shareTarget * price),
+      shareTarget,
+      price,
+      orderType: "FAK",
+    });
+    if (normalized.amount + EPSILON >= minMarketBuyAmount && normalized.shareTarget !== undefined) {
+      return normalizeShares(shareTarget);
+    }
+    shareTarget = ceilToDecimals(shareTarget + 0.0001, 4);
+  }
+  return normalizeShares(shareTarget);
 }
 
 export function fitBuyOrderToUsdcBalance(
@@ -152,12 +182,15 @@ export function fitBuyOrderToUsdcBalance(
   const feeCushionRatio = options.feeCushionRatio ?? DEFAULT_FEE_CUSHION_RATIO;
   const minOrderSize = Math.max(0, options.minOrderSize);
   const exactShareLimitRoutedBuy = isExactShareLimitRoutedBuy(order, minOrderSize);
-  const requestedCost = orderCostWithCushion(order.amount, feeCushionRatio);
+  const normalizedRequestedOrder = normalizeExecutableBuyOrder(order);
+  const normalizedRequestedAmount = normalizedRequestedOrder.amount;
+  const normalizedRequestedShares = normalizeShares(normalizedRequestedOrder.shareTarget ?? requestedShares);
+  const requestedCost = orderCostWithCushion(normalizedRequestedAmount, feeCushionRatio);
   const maxAffordableShares = normalizeShares(usdcBalance / (price * (1 + Math.max(0, feeCushionRatio))));
 
-  if (requestedShares + EPSILON < minOrderSize) {
+  if (normalizedRequestedShares + EPSILON < minOrderSize) {
     return {
-      requestedShares: normalizeShares(requestedShares),
+      requestedShares: normalizedRequestedShares,
       maxAffordableShares,
       adjusted: false,
       skipped: true,
@@ -165,9 +198,36 @@ export function fitBuyOrderToUsdcBalance(
     };
   }
 
-  if (!exactShareLimitRoutedBuy && order.amount + EPSILON < minMarketBuyAmount) {
+  if (!exactShareLimitRoutedBuy && normalizedRequestedAmount + EPSILON < minMarketBuyAmount) {
+    const bridgedShares = minSharesForMarketBuyAmount(price, minMarketBuyAmount);
+    const bridgeOvershootShares = normalizeShares(bridgedShares - normalizedRequestedShares);
+    const maxBridgeOvershootShares = Math.max(0, options.maxMinMarketBuyAmountBridgeOvershootShares ?? 0);
+    if (
+      options.allowMinMarketBuyAmountBridge === true &&
+      bridgedShares >= minOrderSize - EPSILON &&
+      bridgedShares <= maxAffordableShares + EPSILON &&
+      bridgeOvershootShares <= maxBridgeOvershootShares + EPSILON
+    ) {
+      const bridgedOrder = withUserUsdcBalance(
+        normalizeExecutableBuyOrder({
+          ...order,
+          amount: normalizeAmount(bridgedShares * price),
+          shareTarget: bridgedShares,
+        }),
+        usdcBalance,
+      );
+      return {
+        order: bridgedOrder,
+        requestedShares: normalizedRequestedShares,
+        finalShares: normalizeShares(bridgedOrder.shareTarget ?? bridgedShares),
+        maxAffordableShares,
+        adjusted: true,
+        skipped: false,
+        reason: "bridged_to_min_market_buy_amount",
+      };
+    }
     return {
-      ...(requestedShares !== undefined ? { requestedShares: normalizeShares(requestedShares) } : {}),
+      requestedShares: normalizedRequestedShares,
       maxAffordableShares,
       adjusted: false,
       skipped: true,
@@ -176,18 +236,10 @@ export function fitBuyOrderToUsdcBalance(
   }
 
   if (requestedCost <= usdcBalance + EPSILON) {
-    const normalizedOrder =
-      exactShareLimitRoutedBuy && order.amount + EPSILON < minMarketBuyAmount
-        ? {
-            ...order,
-            amount: normalizeAmount(requestedShares * price),
-            shareTarget: normalizeShares(requestedShares),
-          }
-        : normalizeExecutableBuyOrder(order);
     return {
-      order: withUserUsdcBalance(normalizedOrder, usdcBalance),
-      requestedShares: normalizeShares(requestedShares),
-      finalShares: normalizeShares(normalizedOrder.shareTarget ?? requestedShares),
+      order: withUserUsdcBalance(normalizedRequestedOrder, usdcBalance),
+      requestedShares: normalizedRequestedShares,
+      finalShares: normalizeShares(normalizedRequestedOrder.shareTarget ?? normalizedRequestedShares),
       maxAffordableShares,
       adjusted: false,
       skipped: false,

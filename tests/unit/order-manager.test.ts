@@ -93,4 +93,30 @@ describe("order manager exact-size taker buys", () => {
     expect(captures.limit).toHaveLength(0);
     expect(captures.market).toEqual([order]);
   });
+
+  it("normalizes share-targeted BUY requests before routing them to exact-size limit FAK", async () => {
+    const captures = { limit: [] as LimitOrderArgs[], market: [] as MarketOrderArgs[] };
+    const manager = new OrderManager(adapter(captures));
+
+    await manager.placeMarketOrder({
+      tokenId: "token-down",
+      side: "BUY",
+      price: 0.51,
+      amount: 7.899951,
+      shareTarget: 15.4901,
+      orderType: "FAK",
+    });
+
+    expect(captures.market).toHaveLength(0);
+    expect(captures.limit).toMatchObject([
+      {
+        tokenId: "token-down",
+        side: "BUY",
+        price: 0.51,
+        size: 15,
+        orderType: "FAK",
+        postOnly: false,
+      },
+    ]);
+  });
 });

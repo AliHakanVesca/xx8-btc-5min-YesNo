@@ -1,4 +1,5 @@
 import type { ClobAdapter, LimitOrderArgs, MarketOrderArgs, OrderResult } from "../infra/clob/types.js";
+import { normalizeExecutableBuyOrder } from "../infra/clob/orderPrecision.js";
 import { RateLimiter } from "./rateLimiter.js";
 
 export class OrderManager {
@@ -29,26 +30,27 @@ export class OrderManager {
         requestedAt: Date.now(),
       };
     }
+    const executableOrder = normalizeExecutableBuyOrder(order);
     if (
-      order.side === "BUY" &&
-      order.price !== undefined &&
-      order.shareTarget !== undefined &&
-      Number.isFinite(order.price) &&
-      Number.isFinite(order.shareTarget) &&
-      order.price > 0 &&
-      order.shareTarget > 0
+      executableOrder.side === "BUY" &&
+      executableOrder.price !== undefined &&
+      executableOrder.shareTarget !== undefined &&
+      Number.isFinite(executableOrder.price) &&
+      Number.isFinite(executableOrder.shareTarget) &&
+      executableOrder.price > 0 &&
+      executableOrder.shareTarget > 0
     ) {
       return this.clob.postLimitOrder({
-        tokenId: order.tokenId,
-        price: order.price,
-        size: order.shareTarget,
-        side: order.side,
-        orderType: order.orderType,
+        tokenId: executableOrder.tokenId,
+        price: executableOrder.price,
+        size: executableOrder.shareTarget,
+        side: executableOrder.side,
+        orderType: executableOrder.orderType,
         postOnly: false,
-        ...(order.metadata !== undefined ? { metadata: order.metadata } : {}),
-        ...(order.builderCode !== undefined ? { builderCode: order.builderCode } : {}),
+        ...(executableOrder.metadata !== undefined ? { metadata: executableOrder.metadata } : {}),
+        ...(executableOrder.builderCode !== undefined ? { builderCode: executableOrder.builderCode } : {}),
       });
     }
-    return this.clob.postMarketOrder(order);
+    return this.clob.postMarketOrder(executableOrder);
   }
 }

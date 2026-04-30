@@ -841,7 +841,7 @@ export function buildStrategyConfig(env: AppEnv): XuanStrategyConfig {
 }
 
 const DEFAULT_XUAN_BASE_LOT_LADDER = [30, 60, 90, 120];
-const DEFAULT_LIVE_SMALL_LOT_LADDER = [5, 10, 15];
+const DEFAULT_LIVE_SMALL_LOT_LADDER = [5, 8, 12, 15];
 
 function sameNumberList(a: readonly number[], b: readonly number[]): boolean {
   return a.length === b.length && a.every((value, index) => Math.abs(value - (b[index] ?? Number.NaN)) <= 1e-9);
@@ -895,6 +895,12 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     ? config.maxMatchedAgeBeforeForcedMergeSec
     : Math.max(config.maxMatchedAgeBeforeForcedMergeSec, 180);
   const customSmallLadderMaxLot = customAggressiveLadder && maxLadderLot < 23.4 ? maxLadderLot : undefined;
+  const fixedFiveShareProfile = customAggressiveLadder && maxLadderLot <= 5 + 1e-9;
+  const fixedFiveQty = fixedFiveShareProfile ? Math.max(5, maxLadderLot) : undefined;
+  const capFixedFiveQty = (configured: number): number =>
+    fixedFiveQty !== undefined ? fixedFiveQty : Math.max(configured, maxLadderLot);
+  const fixedFiveMergeTargetMaxShares = fixedFiveQty ?? publicFootprintMergeTargetMaxShares;
+  const fixedFiveMergeTargetMultiplier = fixedFiveShareProfile ? 1 : Math.max(config.marketBasketMergeTargetMultiplier, 2.5);
   const publicFootprintMicroPairMaxQty =
     customSmallLadderMaxLot !== undefined
       ? Math.max(config.xuanMicroPairMaxQty, customSmallLadderMaxLot)
@@ -905,6 +911,22 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
   const aggressiveRhythmMin = Math.max(4, Math.min(config.xuanRhythmMinWaitSec, 8));
   const aggressiveRhythmBase = Math.max(aggressiveRhythmMin, Math.min(config.xuanRhythmBaseWaitSec, 10));
   const aggressiveRhythmMax = Math.max(aggressiveRhythmBase, Math.min(config.xuanRhythmMaxWaitSec, 12));
+  const customSmallLadderPostMergeCooldownMs = Math.max(
+    3000,
+    Math.min(
+      Math.max(config.postMergePairReopenCooldownMs, config.postMergeNewSeedCooldownMs),
+      aggressiveRhythmMin * 1000,
+    ),
+  );
+  const fixedFivePostMergeCooldownMs = fixedFiveShareProfile
+    ? Math.min(
+        Math.max(config.postMergePairReopenCooldownMs, config.postMergeNewSeedCooldownMs),
+        1000,
+      )
+    : customSmallLadderPostMergeCooldownMs;
+  const fixedFiveCheapCycleEffectiveCap = fixedFiveShareProfile
+    ? Math.min(config.pairSweepStrictCap, 1.006)
+    : undefined;
 
   return {
     ...config,
@@ -937,11 +959,11 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     liveSmallLots: ladder,
     lotLadder: ladder,
     defaultLot: ladder[0] ?? config.defaultLot,
-    xuanSoftSweepMaxQty: Math.max(config.xuanSoftSweepMaxQty, maxLadderLot),
-    xuanHardSweepMaxQty: Math.max(config.xuanHardSweepMaxQty, maxLadderLot),
-    coveredSeedMaxQty: Math.max(config.coveredSeedMaxQty, maxLadderLot),
-    singleLegSeedMaxQty: Math.max(config.singleLegSeedMaxQty, maxLadderLot),
-    maxSingleOrphanQty: Math.max(config.maxSingleOrphanQty, maxLadderLot),
+    xuanSoftSweepMaxQty: capFixedFiveQty(config.xuanSoftSweepMaxQty),
+    xuanHardSweepMaxQty: capFixedFiveQty(config.xuanHardSweepMaxQty),
+    coveredSeedMaxQty: capFixedFiveQty(config.coveredSeedMaxQty),
+    singleLegSeedMaxQty: capFixedFiveQty(config.singleLegSeedMaxQty),
+    maxSingleOrphanQty: capFixedFiveQty(config.maxSingleOrphanQty),
     singleLegOrphanCap: Math.max(config.singleLegOrphanCap, aggressive ? 0.97 : 0.78),
     orphanLegMaxNotionalUsdc: aggressiveFloor(
       config.orphanLegMaxNotionalUsdc,
@@ -979,8 +1001,9 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
       Math.max(8, maxLadderLot * 0.14),
       customAggressiveLadder,
     ),
-    marketBasketBootstrapMaxQty: Math.max(config.marketBasketBootstrapMaxQty, maxLadderLot),
-    marketBasketBootstrapMaxEffectivePair: Math.max(config.marketBasketBootstrapMaxEffectivePair, 1.055),
+    marketBasketBootstrapMaxQty: capFixedFiveQty(config.marketBasketBootstrapMaxQty),
+    marketBasketBootstrapMaxEffectivePair:
+      fixedFiveCheapCycleEffectiveCap ?? Math.max(config.marketBasketBootstrapMaxEffectivePair, 1.055),
     freshSeedHardCutoffSec: aggressive ? Math.max(config.freshSeedHardCutoffSec, 290) : config.freshSeedHardCutoffSec,
     campaignLaunchXuanProbePct: Math.max(
       config.campaignLaunchXuanProbePct,
@@ -994,7 +1017,7 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
       config.campaignLaunchXuanProbeMaxAgeSec,
       aggressive ? 285 : config.campaignLaunchXuanProbeMaxAgeSec,
     ),
-    marketBasketContinuationMaxQty: Math.max(config.marketBasketContinuationMaxQty, maxLadderLot),
+    marketBasketContinuationMaxQty: capFixedFiveQty(config.marketBasketContinuationMaxQty),
     marketBasketContinuationMinMatchedShares: Math.min(config.marketBasketContinuationMinMatchedShares, 30),
     marketBasketContinuationMaxEffectivePair: Math.max(config.marketBasketContinuationMaxEffectivePair, 1.2),
     marketBasketContinuationProjectedEffectivePairCap: Math.max(
@@ -1003,10 +1026,14 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     ),
     marketBasketBorderlineAvgCap: Math.max(config.marketBasketBorderlineAvgCap, 1.02),
     marketBasketMinMergeShares: customMarketBasketMinMergeShares,
-    marketBasketMergeTargetMultiplier: Math.max(config.marketBasketMergeTargetMultiplier, 2.5),
-    marketBasketMergeTargetMaxShares: publicFootprintMergeTargetMaxShares,
-    xuanPairSweepSoftCap: Math.max(config.xuanPairSweepSoftCap, aggressive ? 1.08 : config.xuanPairSweepSoftCap),
-    xuanPairSweepHardCap: Math.max(config.xuanPairSweepHardCap, aggressive ? 1.12 : config.xuanPairSweepHardCap),
+    marketBasketMergeTargetMultiplier: fixedFiveMergeTargetMultiplier,
+    marketBasketMergeTargetMaxShares: fixedFiveMergeTargetMaxShares,
+    xuanPairSweepSoftCap:
+      fixedFiveCheapCycleEffectiveCap ??
+      Math.max(config.xuanPairSweepSoftCap, aggressive ? 1.08 : config.xuanPairSweepSoftCap),
+    xuanPairSweepHardCap:
+      fixedFiveCheapCycleEffectiveCap ??
+      Math.max(config.xuanPairSweepHardCap, aggressive ? 1.12 : config.xuanPairSweepHardCap),
     xuanMinTimeLeftForSoftSweep: aggressive ? Math.min(config.xuanMinTimeLeftForSoftSweep, 5) : config.xuanMinTimeLeftForSoftSweep,
     xuanMinTimeLeftForHardSweep: aggressive ? Math.min(config.xuanMinTimeLeftForHardSweep, 5) : config.xuanMinTimeLeftForHardSweep,
     maxMarketExposureShares: aggressiveFloor(
@@ -1044,19 +1071,25 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     allowOverlapOnlyWhenCompletionEngineActive: aggressive ? false : config.allowOverlapOnlyWhenCompletionEngineActive,
     requireMatchedInventoryBeforeSecondGroup: aggressive ? false : config.requireMatchedInventoryBeforeSecondGroup,
     worstCaseAmplificationToleranceShares: config.worstCaseAmplificationToleranceShares,
-    postMergeNewSeedCooldownMs: aggressive ? Math.max(config.postMergeNewSeedCooldownMs, 20000) : config.postMergeNewSeedCooldownMs,
+    postMergeNewSeedCooldownMs: aggressive
+      ? customAggressiveLadder
+        ? fixedFivePostMergeCooldownMs
+        : Math.max(config.postMergeNewSeedCooldownMs, 20000)
+      : config.postMergeNewSeedCooldownMs,
     postMergePairReopenCooldownMs: aggressive
-      ? Math.max(config.postMergePairReopenCooldownMs, 20000)
+      ? customAggressiveLadder
+        ? fixedFivePostMergeCooldownMs
+        : Math.max(config.postMergePairReopenCooldownMs, 20000)
       : config.postMergePairReopenCooldownMs,
     postMergeOnlyCompletion: aggressive ? true : config.postMergeOnlyCompletion,
     postMergeOnlyCompletionWhileResidual: aggressive ? true : config.postMergeOnlyCompletionWhileResidual,
     postMergeAllowNewPairIfFlat: aggressive ? true : config.postMergeAllowNewPairIfFlat,
     allowHighSideEmergencyChase: true,
-    highSideEmergencyMaxQty: Math.max(config.highSideEmergencyMaxQty, maxLadderLot),
+    highSideEmergencyMaxQty: capFixedFiveQty(config.highSideEmergencyMaxQty),
     highSideEmergencyRequiresFairValue: false,
     highSideEmergencyRequiresHardImbalance: false,
     highSideEmergencyCap: Math.max(config.highSideEmergencyCap, elevatedBehaviorCap),
-    emergencyCompletionMaxQty: Math.max(config.emergencyCompletionMaxQty, maxLadderLot),
+    emergencyCompletionMaxQty: capFixedFiveQty(config.emergencyCompletionMaxQty),
     emergencyCompletionHardCap: Math.max(config.emergencyCompletionHardCap, elevatedBehaviorCap),
     temporalRepairFastCap: Math.max(config.temporalRepairFastCap, aggressive ? 1.095 : 1.065),
     temporalRepairSoftCap: Math.max(config.temporalRepairSoftCap, aggressive ? 1.14 : 1.105),
@@ -1069,12 +1102,12 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
       1.11,
     ),
     partialSoftMaxQty: aggressive
-      ? Math.max(config.partialSoftMaxQty, maxLadderLot)
+      ? capFixedFiveQty(config.partialSoftMaxQty)
       : Math.min(Math.max(config.partialSoftMaxQty, maxLadderLot), config.residualStateSoftCompletionMaxQty),
     partialHardMaxQty: aggressive
-      ? Math.max(config.partialHardMaxQty, maxLadderLot)
+      ? capFixedFiveQty(config.partialHardMaxQty)
       : Math.min(Math.max(config.partialHardMaxQty, maxLadderLot), config.residualStateSoftCompletionMaxQty),
-    partialEmergencyMaxQty: Math.max(config.partialEmergencyMaxQty, maxLadderLot),
+    partialEmergencyMaxQty: capFixedFiveQty(config.partialEmergencyMaxQty),
     partialEmergencyRequiresFairValue: false,
     temporalSeedOwnDiscountWeight: 11,
     temporalSeedRepairDiscountWeight: 6,
@@ -1083,7 +1116,7 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     temporalSeedDepthWeight: 1,
     temporalSeedSequenceBiasWeight: 2.75,
     temporalSeedOrphanPenaltyWeight: 0.03,
-    finalHardCompletionMaxQty: Math.max(config.finalHardCompletionMaxQty, maxLadderLot),
+    finalHardCompletionMaxQty: capFixedFiveQty(config.finalHardCompletionMaxQty),
     normalEntryCutoffSecToClose: aggressive ? 30 : config.normalEntryCutoffSecToClose,
     completionOnlyCutoffSecToClose: aggressive ? 10 : config.completionOnlyCutoffSecToClose,
     hardCancelSecToClose: aggressive ? 5 : config.hardCancelSecToClose,
@@ -1124,15 +1157,18 @@ function applyPublicFootprintClone(config: XuanStrategyConfig): XuanStrategyConf
     highSideCompletionRequiresFairValue: aggressive ? false : config.highSideCompletionRequiresFairValue,
     highSideCompletionRequiresHardImbalance: aggressive ? false : config.highSideCompletionRequiresHardImbalance,
     xuanBehaviorCap: elevatedBehaviorCap,
+    campaignLaunchVwapTiers: fixedFiveShareProfile ? [fixedFiveQty ?? 5] : config.campaignLaunchVwapTiers,
+    xuanBasketCampaignCompletionClipMaxQty: capFixedFiveQty(config.xuanBasketCampaignCompletionClipMaxQty),
     cloneChildPreferredShares: aggressive
-      ? Math.max(config.cloneChildPreferredShares, ladder[0] ?? 80, customAggressiveLadder ? 1 : 80)
+      ? fixedFiveQty ?? Math.max(config.cloneChildPreferredShares, ladder[0] ?? 80, customAggressiveLadder ? 1 : 80)
       : Math.min(config.cloneChildPreferredShares, 20),
     cloneChildOrderDelayMs: Math.max(config.cloneChildOrderDelayMs, 120),
     cloneStaleCheapOppositeQuoteMinAgeSec: Math.min(config.cloneStaleCheapOppositeQuoteMinAgeSec, 75),
-    mergeBatchMode: "HYBRID_DELAYED",
-    minCompletedCyclesBeforeFirstMerge: config.minCompletedCyclesBeforeFirstMerge,
-    minFirstMatchedAgeBeforeMergeSec: config.minFirstMatchedAgeBeforeMergeSec,
-    maxMatchedAgeBeforeForcedMergeSec: publicFootprintForcedMergeAgeSec,
+    mergeBatchMode: fixedFiveShareProfile ? "IMMEDIATE" : "HYBRID_DELAYED",
+    minCompletedCyclesBeforeFirstMerge: fixedFiveShareProfile ? 1 : config.minCompletedCyclesBeforeFirstMerge,
+    minFirstMatchedAgeBeforeMergeSec: fixedFiveShareProfile ? 0 : config.minFirstMatchedAgeBeforeMergeSec,
+    maxMatchedAgeBeforeForcedMergeSec: fixedFiveShareProfile ? Math.min(config.maxMatchedAgeBeforeForcedMergeSec, 5) : publicFootprintForcedMergeAgeSec,
+    requireMinAgeForCycleTargetMerge: fixedFiveShareProfile ? false : config.requireMinAgeForCycleTargetMerge,
     mergeShieldSecFromOpen: config.mergeShieldSecFromOpen,
     forceMergeInLast30S: true,
     forceMergeOnHardImbalance: true,

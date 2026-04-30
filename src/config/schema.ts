@@ -477,7 +477,7 @@ export const envSchema = z.object({
   STATE_RECONCILE_TOLERANCE_SHARES: numberString.default(0.5),
   LOT_SCALING_MODE: z.enum(["FIXED", "BANKROLL_ADJUSTED"]).default("BANKROLL_ADJUSTED"),
   XUAN_BASE_LOT_LADDER: numberList.default([30, 60, 90, 120]),
-  LIVE_SMALL_LOT_LADDER: numberList.default([5, 10, 15]),
+  LIVE_SMALL_LOT_LADDER: numberList.default([5, 8, 12, 15]),
   MAX_MARKET_NOTIONAL_PCT: numberString.default(0.25),
   MAX_SINGLE_ORDER_NOTIONAL_PCT: numberString.default(0.05),
   REJECT_UNCLASSIFIED_BUY: booleanString.default(true),

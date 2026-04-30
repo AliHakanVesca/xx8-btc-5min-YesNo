@@ -5,7 +5,7 @@ import { chooseLot } from "../../src/strategy/xuan5m/lotLadder.js";
 import { evaluateRisk } from "../../src/strategy/xuan5m/riskEngine.js";
 import { buildOfflineMarket } from "../../src/infra/gamma/marketDiscovery.js";
 import { createMarketState } from "../../src/strategy/xuan5m/marketState.js";
-import { applyFill } from "../../src/strategy/xuan5m/inventoryState.js";
+import { applyFill, applyMerge } from "../../src/strategy/xuan5m/inventoryState.js";
 import {
   xuanConfiguredFreshStagedSeedMinLot,
   xuanConfiguredMicroLot,
@@ -50,7 +50,7 @@ describe("lot ladder and risk windows", () => {
         marketVolumeHigh: true,
         pnlTodayPositive: false,
       }),
-    ).toBe(10);
+    ).toBe(8);
   });
 
   it("moves to completion-only late in the window", () => {
@@ -85,6 +85,62 @@ describe("lot ladder and risk windows", () => {
     expect(risk.allowNewEntries).toBe(false);
     expect(risk.completionOnly).toBe(true);
     expect(risk.reasons).toContain("low_usdc_no_new_entry");
+  });
+
+  it("keeps post-merge xuan recycle open when low collateral still funds the smallest pair", () => {
+    const xuanConfig = buildStrategyConfig(
+      parseEnv({
+        DRY_RUN: "true",
+        POLY_STACK_MODE: "current-prod-v1",
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+        XUAN_BASE_LOT_LADDER: "5,8,12,15",
+        LIVE_SMALL_LOT_LADDER: "5,8,12,15",
+        MIN_USDC_BALANCE_FOR_NEW_ENTRY: "12",
+      }),
+    );
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 15,
+      price: 0.48,
+      timestamp: market.startTs + 4,
+      makerTaker: "taker",
+      executionMode: "PAIRGROUP_COVERED_SEED",
+    });
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      size: 15,
+      price: 0.48,
+      timestamp: market.startTs + 8,
+      makerTaker: "taker",
+      executionMode: "PARTIAL_FAST_COMPLETION",
+    });
+    state = applyMerge(state, {
+      amount: 14.99,
+      timestamp: market.startTs + 35,
+      simulated: true,
+    });
+
+    const risk = evaluateRisk(xuanConfig, state, {
+      secsToClose: 120,
+      staleBookMs: 100,
+      balanceStaleMs: 100,
+      bookIsCrossed: false,
+      dailyLossUsdc: 0,
+      marketLossUsdc: 0,
+      usdcBalance: 8,
+    });
+
+    expect(risk.tradable).toBe(true);
+    expect(risk.allowNewEntries).toBe(true);
+    expect(risk.completionOnly).toBe(false);
+    expect(risk.reasons).toContain("low_usdc_post_merge_recycle_allowed");
+    expect(risk.reasons).not.toContain("low_usdc_no_new_entry");
   });
 
   it("keeps new entries open for balanced debt campaign repair after normal entry cutoff", () => {
@@ -230,6 +286,76 @@ describe("lot ladder and risk windows", () => {
     expect(xuanConfig.marketBasketMinMergeShares).toBe(15);
     expect(xuanConfig.marketBasketMergeTargetMaxShares).toBe(45);
     expect(xuanConfig.maxMatchedAgeBeforeForcedMergeSec).toBe(75);
+  });
+
+  it("uses a fixed five-share aggressive profile with immediate 5/5 merge targets", () => {
+    const xuanConfig = buildStrategyConfig(
+      parseEnv({
+        DRY_RUN: "true",
+        POLY_STACK_MODE: "current-prod-v1",
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+        XUAN_BASE_LOT_LADDER: "5",
+        LIVE_SMALL_LOT_LADDER: "5",
+        DEFAULT_LOT: "5",
+        MARKET_BASKET_MIN_MERGE_SHARES: "40",
+        MARKET_BASKET_MERGE_TARGET_MULTIPLIER: "3",
+        MARKET_BASKET_MERGE_TARGET_MAX_SHARES: "900",
+        MIN_COMPLETED_CYCLES_BEFORE_FIRST_MERGE: "2",
+        MIN_FIRST_MATCHED_AGE_BEFORE_MERGE_SEC: "45",
+        MAX_MATCHED_AGE_BEFORE_FORCED_MERGE_SEC: "75",
+      }),
+    );
+
+    expect(xuanConfig.xuanBaseLotLadder).toEqual([5]);
+    expect(xuanConfig.liveSmallLotLadder).toEqual([5]);
+    expect(xuanConfig.lotLadder).toEqual([5]);
+    expect(xuanConfig.xuanMicroPairMaxQty).toBe(5);
+    expect(xuanConfiguredMicroLot(xuanConfig)).toBe(5);
+    expect(xuanConfiguredFreshStagedSeedMinLot(xuanConfig)).toBe(5);
+    expect(xuanConfig.xuanSoftSweepMaxQty).toBe(5);
+    expect(xuanConfig.xuanHardSweepMaxQty).toBe(5);
+    expect(xuanConfig.xuanPairSweepSoftCap).toBeCloseTo(1.006, 6);
+    expect(xuanConfig.xuanPairSweepHardCap).toBeCloseTo(1.006, 6);
+    expect(xuanConfig.marketBasketBootstrapMaxEffectivePair).toBeCloseTo(1.006, 6);
+    expect(xuanConfig.coveredSeedMaxQty).toBe(5);
+    expect(xuanConfig.singleLegSeedMaxQty).toBe(5);
+    expect(xuanConfig.emergencyCompletionMaxQty).toBe(5);
+    expect(xuanConfig.highSideEmergencyMaxQty).toBe(5);
+    expect(xuanConfig.finalHardCompletionMaxQty).toBe(5);
+    expect(xuanConfig.xuanBasketCampaignCompletionClipMaxQty).toBe(5);
+    expect(xuanConfig.cloneChildPreferredShares).toBe(5);
+    expect(xuanConfig.campaignLaunchVwapTiers).toEqual([5]);
+    expect(xuanConfig.marketBasketMinMergeShares).toBe(5);
+    expect(xuanConfig.marketBasketMergeTargetMultiplier).toBe(1);
+    expect(xuanConfig.marketBasketMergeTargetMaxShares).toBe(5);
+    expect(xuanConfig.mergeBatchMode).toBe("IMMEDIATE");
+    expect(xuanConfig.minCompletedCyclesBeforeFirstMerge).toBe(1);
+    expect(xuanConfig.minFirstMatchedAgeBeforeMergeSec).toBe(0);
+    expect(xuanConfig.maxMatchedAgeBeforeForcedMergeSec).toBe(5);
+
+    const lot = chooseLot(xuanConfig, {
+      marketSlug: "btc-updown-5m-1777464000",
+      dryRunOrSmallLive: false,
+      secsFromOpen: 13,
+      imbalance: 0,
+      bookDepthGood: true,
+      bestAskUp: 0.5,
+      bestAskDown: 0.5,
+      topTwoAskDepthMin: 1000,
+      flatPosition: true,
+      postMergeCount: 0,
+      totalShares: 0,
+      pairCostWithinCap: true,
+      pairCostComfortable: true,
+      inventoryBalanced: true,
+      recentBothSidesFilled: false,
+      marketVolumeHigh: true,
+      pnlTodayPositive: false,
+    });
+
+    expect(lot).toBe(5);
   });
 
   it("caps public-footprint family lots to the configured ladder max", () => {

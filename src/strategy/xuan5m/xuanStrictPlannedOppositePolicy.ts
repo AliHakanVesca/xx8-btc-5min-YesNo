@@ -30,6 +30,25 @@ export function strictXuanCloseablePairCostCap(config: XuanStrategyConfig): numb
     : strictXuanPairCostTargetCap(config);
 }
 
+export function plannedOppositeStrictPairReleaseReady(
+  config: XuanStrategyConfig,
+  costWithFees: number,
+  missingSidePrice?: number | undefined,
+): boolean {
+  if (!isAggressivePublicFootprint(config) || !Number.isFinite(costWithFees)) {
+    return false;
+  }
+  if (
+    missingSidePrice !== undefined &&
+    Number.isFinite(missingSidePrice) &&
+    missingSidePrice > config.highSidePriceThreshold + 1e-9
+  ) {
+    return false;
+  }
+  const strictPairCap = Math.max(config.strictPairEffectiveCap, strictXuanCloseablePairCostCap(config));
+  return costWithFees <= strictPairCap + 1e-9;
+}
+
 export function xuanPairCostImprovesOrMeetsTarget(
   config: XuanStrategyConfig,
   currentEffectivePair: number,
@@ -91,7 +110,11 @@ export function plannedOppositeTargetReleaseReady(args: {
   ageSec: number;
   costWithFees: number;
   currentMatchedEffectivePair: number;
+  missingSidePrice?: number | undefined;
 }): boolean {
+  if (plannedOppositeStrictPairReleaseReady(args.config, args.costWithFees, args.missingSidePrice)) {
+    return true;
+  }
   return (
     args.ageSec >= plannedOppositeMinWaitSec(args.config) - 1e-9 &&
     xuanPairCostImprovesOrMeetsTarget(args.config, args.currentMatchedEffectivePair, args.costWithFees)
@@ -104,9 +127,16 @@ export function plannedOppositeProtectiveReleaseReady(args: {
   costWithFees: number;
   executableSize: number;
   minOrderSize: number;
+  missingSidePrice?: number | undefined;
 }): boolean {
   if (!isAggressivePublicFootprint(args.config)) {
     return false;
+  }
+  if (
+    args.executableSize >= args.minOrderSize - 1e-9 &&
+    plannedOppositeStrictPairReleaseReady(args.config, args.costWithFees, args.missingSidePrice)
+  ) {
+    return true;
   }
   const protectiveMinWaitSec = Math.min(
     plannedOppositeMinWaitSec(args.config),

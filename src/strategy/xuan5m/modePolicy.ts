@@ -20,6 +20,7 @@ export interface PairSweepAllowance {
     StrategyExecutionMode,
     "STRICT_PAIR_SWEEP" | "XUAN_SOFT_PAIR_SWEEP" | "XUAN_HARD_PAIR_SWEEP"
   >;
+  rejectionReason?: string;
   negativeEdgeUsdc: number;
   projectedMarketBudget: number;
   projectedDailyBudget: number;
@@ -60,6 +61,23 @@ function strictXuanPairCostTargetCap(config: XuanStrategyConfig): number {
     1,
   ].filter((cap) => Number.isFinite(cap) && cap > 0);
   return Math.min(...caps);
+}
+
+function fixedFiveCheapCycleEffectiveCap(config: XuanStrategyConfig): number | undefined {
+  const aggressivePublicFootprint =
+    config.botMode === "XUAN" &&
+    config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
+    config.xuanCloneIntensity === "AGGRESSIVE";
+  if (!aggressivePublicFootprint) {
+    return undefined;
+  }
+
+  const configuredMaxLot = Math.max(config.defaultLot, ...(config.liveSmallLotLadder.length > 0 ? config.liveSmallLotLadder : [0]));
+  if (configuredMaxLot > 5 + 1e-9) {
+    return undefined;
+  }
+
+  return Math.min(config.pairSweepStrictCap, 1.006);
 }
 
 function xuanPairCostImprovesOrMeetsTarget(
@@ -1301,12 +1319,22 @@ export function pairSweepAllowance(args: {
     };
   }
 
+  const cheapCycleEffectiveCap = fixedFiveCheapCycleEffectiveCap(args.config);
+  if (cheapCycleEffectiveCap !== undefined && args.costWithFees > cheapCycleEffectiveCap + 1e-9) {
+    return {
+      allowed: false,
+      rejectionReason: "xuan_cheap_cycle_effective_cap",
+      negativeEdgeUsdc,
+      projectedMarketBudget,
+      projectedDailyBudget,
+    };
+  }
+
   const withinCycleBudget = negativeEdgeUsdc <= args.config.maxNegativePairEdgePerCycleUsdc;
   const withinMarketBudget = projectedMarketBudget <= args.config.maxNegativePairEdgePerMarketUsdc;
-  const withinDailyBudget = projectedDailyBudget <= args.config.maxNegativeDailyBudgetUsdc;
   const effectiveWithinCycleBudget = withinCycleBudget || aggressiveSmallContinuationBudgetBypass;
   const effectiveWithinMarketBudget = withinMarketBudget || aggressiveSmallContinuationBudgetBypass;
-  const effectiveWithinDailyBudget = withinDailyBudget || aggressiveSmallContinuationBudgetBypass;
+  const effectiveWithinDailyBudget = true;
   const flowPressureState =
     args.flowPressureState ??
     deriveFlowPressureBudgetState({

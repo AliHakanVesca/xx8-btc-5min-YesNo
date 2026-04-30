@@ -279,19 +279,16 @@ export function evaluateDelayedMergeGate(
     };
   }
 
-  if (config.mergeBatchMode === "IMMEDIATE") {
-    return {
-      allow: true,
-      forced: false,
-      reason: "cycle_target",
-      ...metrics,
-    };
-  }
-
   const basketEffectivePair =
     config.marketBasketScoringEnabled && metrics.pendingMatchedQty > 1e-6
       ? matchedEffectivePairCost(state, config.cryptoTakerFeeRate)
       : undefined;
+  const basketRawPair =
+    config.marketBasketScoringEnabled && metrics.pendingMatchedQty > 1e-6
+      ? matchedEffectivePairCost(state, 0)
+      : undefined;
+  const basketRawEconomicsPositive =
+    basketRawPair !== undefined && basketRawPair <= 1 + 1e-9;
   const secsFromOpen = args.secsFromOpen ?? Number.POSITIVE_INFINITY;
   const plannedOpposite = plannedOppositeCompletionState(
     state,
@@ -348,6 +345,7 @@ export function evaluateDelayedMergeGate(
     !exactMergePriorActive &&
     basketEffectivePair !== undefined &&
     basketEffectivePair > config.marketBasketMergeEffectivePairCap + 1e-9 &&
+    !basketRawEconomicsPositive &&
     args.secsToClose > config.finalWindowCompletionOnlySec &&
     !finalResidualMergeWindow;
   const negativeEconomicsHoldDecision = (): MergeGateDecision => ({
@@ -359,6 +357,22 @@ export function evaluateDelayedMergeGate(
     ...(basketEffectivePair !== undefined ? { basketEffectivePair: normalize(basketEffectivePair) } : {}),
     ...metrics,
   });
+  if (config.mergeBatchMode === "IMMEDIATE") {
+    const immediateMergeEconomicsSafe =
+      basketEffectivePair === undefined ||
+      basketEffectivePair <= config.marketBasketMergeEffectivePairCap + 1e-9 ||
+      basketRawEconomicsPositive;
+    if (!immediateMergeEconomicsSafe && !finalResidualMergeWindow) {
+      return negativeEconomicsHoldDecision();
+    }
+    return {
+      allow: true,
+      forced: false,
+      reason: "cycle_target",
+      ...(basketEffectivePair !== undefined ? { basketEffectivePair: normalize(basketEffectivePair) } : {}),
+      ...metrics,
+    };
+  }
   const aggressiveFamilyLargeBasketPreMergeHold =
     aggressivePublicFootprint &&
     !exactMergePriorActive &&
@@ -676,6 +690,7 @@ export function evaluateDelayedMergeGate(
     publicFootprintHoldWithoutPrior &&
     basketEffectivePair !== undefined &&
     basketEffectivePair > config.marketBasketMergeEffectivePairCap + 1e-9 &&
+    !basketRawEconomicsPositive &&
     args.secsToClose > config.finalWindowCompletionOnlySec;
   const forcedAgePublicFootprintBasketHold =
     publicFootprintHoldWithoutPrior &&

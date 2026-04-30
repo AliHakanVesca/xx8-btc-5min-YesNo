@@ -23,10 +23,14 @@ import {
   createPendingCompletionSubmission,
   evaluateSessionEndMergeDecision,
   findRecentBotOwnedFillForShortfall,
+  findRecentSubmittedIntentForShortfall,
+  isRecentBotOwnedShortfallMatch,
   restorePersistedArbitrationCarry,
   refreshRuntimeProtectedResidualLock,
   inferImmediateOrderResultFill,
   inferUserTradeFill,
+  postMergeReentryResidualThreshold,
+  postMergeResidualBlocksReentry,
   reconcileStateWithBalances,
   resolveSessionTradingDeadline,
   runtimeFlowBudgetReleaseQuantityForResidualChange,
@@ -592,7 +596,7 @@ describe("stateful bot session helpers", () => {
     });
   });
 
-  it("keeps submitted intent capped to shareTarget and reports order-result overfill separately", () => {
+  it("accounts order-result overfill at the actual matched share size", () => {
     const market = buildOfflineMarket(1713696000);
     const order = {
       tokenId: market.tokens.UP.tokenId,
@@ -622,7 +626,7 @@ describe("stateful bot session helpers", () => {
       result,
     });
 
-    expect(expectedSharesForSubmission(order.shareTarget, result)).toBe(15);
+    expect(expectedSharesForSubmission(order.shareTarget, result)).toBe(17.857141);
     expect(fill).toMatchObject({
       outcome: "UP",
       side: "BUY",
@@ -633,6 +637,7 @@ describe("stateful bot session helpers", () => {
       detectOrderResultShareOverfill({
         order,
         fill: fill!,
+        result,
         orderId: "overfill-order-1",
         groupId: "pair-1",
       }),
@@ -645,8 +650,75 @@ describe("stateful bot session helpers", () => {
       excessShares: 2.857141,
     });
     expect(botFillAccountingKey(fill!, { orderId: "overfill-order-1" })).toBe(
-      "order:overfill-order-1:UP:BUY:17.857141:0.42:1713696015",
+      "order:overfill-order-1:UP:BUY",
     );
+  });
+
+  it("treats post-merge overfill dust below the CLOB minimum as non-blocking for Xuan recycle", () => {
+    const config = buildConfig({
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+      POST_MERGE_FLAT_DUST_SHARES: "0.05",
+      POST_MERGE_ALLOW_NEW_PAIR_IF_FLAT: "true",
+      POST_MERGE_ONLY_COMPLETION_WHILE_RESIDUAL: "true",
+    });
+    let state = createMarketState(buildOfflineMarket(1713696000));
+    state = {
+      ...state,
+      upShares: 0,
+      downShares: 1.43857,
+      reentryDisabled: true,
+    };
+
+    expect(postMergeReentryResidualThreshold(config, state)).toBe(5);
+    expect(postMergeResidualBlocksReentry(config, state)).toBe(false);
+
+    state = {
+      ...state,
+      downShares: 5.01,
+    };
+    expect(postMergeResidualBlocksReentry(config, state)).toBe(true);
+  });
+
+  it("keeps strict post-merge residual blocking tied to configured dust", () => {
+    const config = buildConfig({
+      BOT_MODE: "STRICT",
+      POST_MERGE_FLAT_DUST_SHARES: "0.05",
+      POST_MERGE_ALLOW_NEW_PAIR_IF_FLAT: "true",
+      POST_MERGE_ONLY_COMPLETION_WHILE_RESIDUAL: "true",
+    });
+    const state = {
+      ...createMarketState(buildOfflineMarket(1713696000)),
+      upShares: 0,
+      downShares: 1.43857,
+      reentryDisabled: true,
+    };
+
+    expect(postMergeReentryResidualThreshold(config, state)).toBe(0.05);
+    expect(postMergeResidualBlocksReentry(config, state)).toBe(true);
+  });
+
+  it("dedupes repeated bot fill accounting by order id instead of timestamp or price drift", () => {
+    const fill = {
+      outcome: "UP" as const,
+      side: "BUY" as const,
+      price: 0.42,
+      size: 15,
+      timestamp: 1713696015,
+    };
+
+    expect(botFillAccountingKey(fill, { orderId: "same-order" })).toBe("order:same-order:UP:BUY");
+    expect(
+      botFillAccountingKey(
+        {
+          ...fill,
+          price: 0.421,
+          size: 14.9999,
+          timestamp: 1713696017,
+        },
+        { orderId: "same-order" },
+      ),
+    ).toBe("order:same-order:UP:BUY");
   });
 
   it("does not register submitted fill intents for rejected child orders", () => {
@@ -759,6 +831,42 @@ describe("stateful bot session helpers", () => {
     expect(clamped.entryBuy.size).toBe(15);
     expect(clamped.entryBuy.order.shareTarget).toBe(15);
     expect(clamped.entryBuy.order.amount).toBe(7.2);
+  });
+
+  it("tops up near-minimum entry repair gaps instead of sending a zero-sized skipped order", () => {
+    const market = buildOfflineMarket(1713696000);
+    const clamped = clampEntryRepairBuyDecision({
+      minOrderSize: 5,
+      maxCompletionOvershootShares: 0.25,
+      entryTrace: {
+        repairRequestedQty: 5,
+        repairSize: 4.953805,
+        repairFinalQty: 4.953805,
+      },
+      entryBuy: {
+        side: "UP",
+        size: 4.953805,
+        reason: "lagging_rebalance",
+        mode: "PARTIAL_SOFT_COMPLETION",
+        expectedAveragePrice: 0.24,
+        effectivePricePerShare: 0.24,
+        order: {
+          tokenId: market.tokens.UP.tokenId,
+          side: "BUY",
+          price: 0.24,
+          amount: 1.188913,
+          shareTarget: 4.953805,
+          orderType: "FAK",
+        },
+      },
+    });
+
+    expect(clamped.clamped).toBe(true);
+    expect(clamped.originalShares).toBe(4.953805);
+    expect(clamped.capShares).toBe(5);
+    expect(clamped.entryBuy.size).toBe(5);
+    expect(clamped.entryBuy.order.shareTarget).toBe(5);
+    expect(clamped.entryBuy.order.amount).toBe(1.2);
   });
 
   it("applies matched entry repair order results to state immediately", () => {
@@ -989,6 +1097,70 @@ describe("stateful bot session helpers", () => {
         nowTs: 1777491016 + BOT_OWNED_SETTLEMENT_GRACE_SEC + 1,
       }),
     ).toBeUndefined();
+  });
+
+  it("keeps inactive submitted intents owned during balance settlement lag", () => {
+    const intents = [
+      {
+        side: "BUY" as const,
+        price: 0.37,
+        submittedAt: 1777565712,
+        mode: "POST_MERGE_RESIDUAL_COMPLETION" as const,
+        orderId: "completion-1",
+        expectedShares: 5.138887,
+        attributedShares: 5.138887,
+        active: false,
+      },
+    ];
+
+    const nowTs = 1777565745;
+    const submittedIntentSettlementGraceSec = 45;
+    const candidate = {
+      outcome: "UP",
+      fromShares: 5.138887,
+      toShares: 0,
+      nowTs,
+    } as const;
+    const matchedIntent = findRecentSubmittedIntentForShortfall(
+      intents,
+      candidate,
+      submittedIntentSettlementGraceSec,
+    );
+    expect(matchedIntent).toMatchObject({ orderId: "completion-1" });
+    expect(matchedIntent && isRecentBotOwnedShortfallMatch(matchedIntent, nowTs)).toBe(true);
+
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      price: 0.37,
+      size: 5.138887,
+      timestamp: 1777565712,
+      makerTaker: "taker",
+      executionMode: "POST_MERGE_RESIDUAL_COMPLETION",
+    });
+
+    const reconciled = reconcileStateWithBalances({
+      state,
+      observed: { up: 0, down: 0 },
+      nowTs,
+      fallbackPrices: { UP: 0.37, DOWN: 0.6 },
+      shouldIgnoreShortfall: (shortfall) => {
+        if (shortfall.outcome !== "UP") {
+          return false;
+        }
+        const matched = findRecentSubmittedIntentForShortfall(
+          intents,
+          shortfall,
+          submittedIntentSettlementGraceSec,
+        );
+        return matched !== undefined && isRecentBotOwnedShortfallMatch(matched, shortfall.nowTs);
+      },
+    });
+
+    expect(reconciled.corrections).toEqual([]);
+    expect(reconciled.state.upShares).toBe(5.138887);
   });
 
   it("shrinks a bot-owned order-result fill to the settled on-chain share quantity without adding a duplicate buy", () => {

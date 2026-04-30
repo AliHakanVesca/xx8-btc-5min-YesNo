@@ -284,7 +284,12 @@ describe("persistent state store", () => {
       orderId: "order-dup",
       executionMode: "PAIRGROUP_COVERED_SEED",
     });
-    const second = store.recordFill(state, state.fillHistory[0]!, {
+    const second = store.recordFill(state, {
+      ...state.fillHistory[0]!,
+      size: 5.0001,
+      price: 0.651,
+      timestamp: createdAt + 2,
+    }, {
       source: "BALANCE_RECONCILE",
       groupId: "pair-1",
       orderId: "order-dup",

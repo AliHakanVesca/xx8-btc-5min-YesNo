@@ -290,6 +290,7 @@ export interface RecentBotOwnedBuyFill {
 
 const DECISION_TRACE_INTERVAL_SEC = 20;
 export const BOT_OWNED_SETTLEMENT_GRACE_SEC = 20;
+const BOT_OWNED_SUBMITTED_INTENT_SETTLEMENT_GRACE_SEC = 45;
 
 interface DecisionTraceContext {
   eventSeq: number;
@@ -1258,6 +1259,77 @@ export function findRecentBotOwnedFillForShortfall(
   return undefined;
 }
 
+export function findRecentSubmittedIntentForShortfall(
+  intents: readonly SubmittedIntent[],
+  candidate: Pick<BalanceShortfallCandidate, "outcome" | "fromShares" | "toShares" | "nowTs">,
+  graceSec = BOT_OWNED_SETTLEMENT_GRACE_SEC,
+): SubmittedIntent | undefined {
+  const recentIntents = [...intents]
+    .filter((intent) => intent.side === "BUY" && candidate.nowTs - intent.submittedAt <= graceSec)
+    .sort((left, right) => right.submittedAt - left.submittedAt);
+
+  const shortfall = candidate.fromShares - candidate.toShares;
+  if (shortfall <= 0) {
+    return undefined;
+  }
+
+  const intentSize = (intent: SubmittedIntent): number | undefined => {
+    const expected = intent.expectedShares;
+    if (expected !== undefined && Number.isFinite(expected) && expected > 0) {
+      return normalizeShares(expected);
+    }
+    if (Number.isFinite(intent.attributedShares) && intent.attributedShares > 0) {
+      return normalizeShares(intent.attributedShares);
+    }
+    return undefined;
+  };
+
+  const directMatch = recentIntents.find((intent) => {
+    const expected = intentSize(intent);
+    if (expected === undefined) {
+      return false;
+    }
+    const tolerance = Math.max(0.5, expected * 0.08);
+    if (candidate.toShares <= 1e-6) {
+      return Math.abs(candidate.fromShares - expected) <= tolerance;
+    }
+    return candidate.fromShares >= expected - tolerance && shortfall <= expected + tolerance;
+  });
+  if (directMatch) {
+    return directMatch;
+  }
+
+  const aggregateSize = recentIntents.reduce((sum, intent) => sum + (intentSize(intent) ?? 0), 0);
+  if (aggregateSize <= 1e-6) {
+    return undefined;
+  }
+  const aggregateTolerance = Math.max(0.5, aggregateSize * 0.08);
+  if (
+    candidate.fromShares <= aggregateSize + aggregateTolerance &&
+    candidate.fromShares >= aggregateSize - aggregateTolerance
+  ) {
+    return recentIntents[0];
+  }
+  if (
+    candidate.fromShares >= aggregateSize - aggregateTolerance &&
+    shortfall <= aggregateSize + aggregateTolerance
+  ) {
+    return recentIntents[0];
+  }
+
+  return undefined;
+}
+
+export function isRecentBotOwnedShortfallMatch(
+  match: RecentBotOwnedBuyFill | SubmittedIntent,
+  nowTs: number,
+): boolean {
+  if ("timestamp" in match) {
+    return nowTs - match.timestamp <= BOT_OWNED_SETTLEMENT_GRACE_SEC;
+  }
+  return nowTs - match.submittedAt <= BOT_OWNED_SUBMITTED_INTENT_SETTLEMENT_GRACE_SEC;
+}
+
 export function shouldAllowControlledOverlap(args: {
   config: Pick<
     XuanStrategyConfig,
@@ -1480,6 +1552,40 @@ function runtimeMergeFirstTarget(config: XuanStrategyConfig): number {
   return config.mergeMinShares;
 }
 
+export function postMergeReentryResidualThreshold(config: XuanStrategyConfig, state: XuanMarketState): number {
+  const baseThreshold = Math.max(config.postMergeFlatDustShares, 1e-6);
+  if (config.botMode === "XUAN" && config.xuanCloneMode === "PUBLIC_FOOTPRINT") {
+    return Math.max(baseThreshold, state.market.minOrderSize);
+  }
+  return baseThreshold;
+}
+
+export function postMergeResidualBlocksReentry(
+  config: XuanStrategyConfig,
+  state: XuanMarketState,
+  residualShares = Math.abs(state.upShares - state.downShares),
+): boolean {
+  return residualShares > postMergeReentryResidualThreshold(config, state) + 1e-9;
+}
+
+function postMergeCompletionOnlyActive(
+  config: XuanStrategyConfig,
+  state: XuanMarketState,
+  nowTs: number,
+): boolean {
+  if (!config.postMergeOnlyCompletion) {
+    return false;
+  }
+  const residualBlocksReentry = postMergeResidualBlocksReentry(config, state);
+  const reentryDisabledActive =
+    state.reentryDisabled &&
+    (!config.postMergeAllowNewPairIfFlat || residualBlocksReentry);
+  return (
+    reentryDisabledActive ||
+    (state.postMergeCompletionOnlyUntil !== undefined && nowTs < state.postMergeCompletionOnlyUntil)
+  );
+}
+
 function shouldHoldRuntimeEntryForMergeFirstAfterCompletion(
   config: XuanStrategyConfig,
   state: XuanMarketState,
@@ -1540,15 +1646,35 @@ export function clampEntryRepairBuyDecision(args: {
   entryBuy: EntryBuyDecision;
   entryTrace: Pick<EntryDecisionTrace, "repairFinalQty" | "repairSize" | "repairRequestedQty">;
   minOrderSize: number;
+  maxCompletionOvershootShares?: number | undefined;
 }): { entryBuy: EntryBuyDecision; clamped: boolean; capShares?: number | undefined; originalShares?: number | undefined } {
   if (!completionLikeEntrySubmission(args.entryBuy.mode)) {
     return { entryBuy: args.entryBuy, clamped: false };
   }
   const capShares = repairTraceQuantityCap(args.entryTrace);
-  if (capShares === undefined || capShares + 1e-9 < args.minOrderSize) {
+  if (capShares === undefined) {
     return { entryBuy: args.entryBuy, clamped: false };
   }
   const originalShares = args.entryBuy.order.shareTarget ?? args.entryBuy.size;
+
+  if (capShares + 1e-9 < args.minOrderSize) {
+    const missingToMinimum = normalizePositiveShares(args.minOrderSize - capShares);
+    const maxOvershoot = Math.max(0, args.maxCompletionOvershootShares ?? 0);
+    if (missingToMinimum > maxOvershoot + 1e-9) {
+      return { entryBuy: args.entryBuy, clamped: false };
+    }
+    return {
+      entryBuy: {
+        ...args.entryBuy,
+        size: normalizePositiveShares(Math.max(args.entryBuy.size, args.minOrderSize)),
+        order: resizeMarketBuyOrderShareTarget(args.entryBuy.order, args.minOrderSize),
+      },
+      clamped: true,
+      capShares: normalizePositiveShares(args.minOrderSize),
+      originalShares: normalizePositiveShares(originalShares),
+    };
+  }
+
   if (!Number.isFinite(originalShares) || originalShares <= capShares + 1e-9) {
     return { entryBuy: args.entryBuy, clamped: false, capShares, originalShares };
   }
@@ -2146,7 +2272,12 @@ export function expectedSharesForSubmission(
   shareTarget: number | undefined,
   result: OrderResult | undefined,
 ): number | undefined {
-  return shareTarget !== undefined ? normalizeShares(shareTarget) : extractExpectedSharesFromOrderResult(result);
+  const resultShares = extractExpectedSharesFromOrderResult(result);
+  return resultShares !== undefined
+    ? resultShares
+    : shareTarget !== undefined
+      ? normalizeShares(shareTarget)
+      : undefined;
 }
 
 export function shouldRegisterSubmittedIntentForResult(result: OrderResult | undefined): boolean {
@@ -2169,15 +2300,7 @@ export function botFillAccountingKey(
   if (fill.side !== "BUY" || !isUsableBotFillOrderId(context.orderId)) {
     return undefined;
   }
-  return [
-    "order",
-    context.orderId,
-    fill.outcome,
-    fill.side,
-    normalizeShares(fill.size),
-    Number(fill.price.toFixed(6)),
-    fill.timestamp,
-  ].join(":");
+  return ["order", context.orderId, fill.outcome, fill.side].join(":");
 }
 
 export interface OrderResultShareOverfill {
@@ -2192,6 +2315,7 @@ export interface OrderResultShareOverfill {
 export function detectOrderResultShareOverfill(args: {
   order: MarketOrderArgs;
   fill: Pick<FillRecord, "outcome" | "side" | "size">;
+  result?: OrderResult | undefined;
   orderId?: string | undefined;
   groupId?: string | undefined;
 }): OrderResultShareOverfill | undefined {
@@ -2199,7 +2323,9 @@ export function detectOrderResultShareOverfill(args: {
     return undefined;
   }
   const shareTarget = normalizeShares(args.order.shareTarget);
-  const filledShares = normalizeShares(args.fill.size);
+  const filledShares = normalizeShares(
+    args.result !== undefined ? Math.max(args.fill.size, extractMatchedShares(args.result)) : args.fill.size,
+  );
   const tolerance = Math.max(1e-6, shareTarget * 0.001);
   if (filledShares <= shareTarget + tolerance) {
     return undefined;
@@ -2224,6 +2350,7 @@ function asOrderRawObject(result: OrderResult | undefined): Record<string, unkno
 function extractOrderResultExecutionPrice(
   result: OrderResult | undefined,
   fallbackPrice: number | undefined,
+  _ledgerFillSize?: number | undefined,
 ): number {
   const raw = asOrderRawObject(result);
   const takingAmount = Number(raw?.takingAmount);
@@ -2232,6 +2359,12 @@ function extractOrderResultExecutionPrice(
     return Number(clampFallbackPrice(makingAmount / takingAmount).toFixed(6));
   }
   return Number(clampFallbackPrice(fallbackPrice).toFixed(6));
+}
+
+function extractLedgerMatchedShares(order: MarketOrderArgs, result: OrderResult | undefined): number {
+  const matchedShares = extractMatchedShares(result);
+  void order;
+  return matchedShares;
 }
 
 export function inferImmediateOrderResultFill(args: {
@@ -2244,14 +2377,14 @@ export function inferImmediateOrderResultFill(args: {
   if (!args.result || !isOrderResultAccepted(args.result)) {
     return undefined;
   }
-  const size = extractMatchedShares(args.result);
+  const size = extractLedgerMatchedShares(args.order, args.result);
   if (size <= 1e-6) {
     return undefined;
   }
   return {
     outcome: args.outcome,
     side: args.order.side,
-    price: extractOrderResultExecutionPrice(args.result, args.order.price),
+    price: extractOrderResultExecutionPrice(args.result, args.order.price, size),
     size,
     timestamp: args.nowTs,
     makerTaker: "taker",
@@ -2673,6 +2806,16 @@ function orderPairEntriesForPublicFootprint(args: {
       args.config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
       Math.abs(args.state.upShares - args.state.downShares) > 1e-6);
   if (!shouldPrioritizeSide) {
+    if (args.config.botMode === "XUAN" && args.config.xuanCloneMode === "PUBLIC_FOOTPRINT") {
+      return [...args.groupedEntries].sort((left, right) => {
+        const leftPrice = left.order.price ?? Number.POSITIVE_INFINITY;
+        const rightPrice = right.order.price ?? Number.POSITIVE_INFINITY;
+        if (Math.abs(leftPrice - rightPrice) <= 1e-9) {
+          return 0;
+        }
+        return leftPrice - rightPrice;
+      });
+    }
     return args.groupedEntries;
   }
   return [...args.groupedEntries].sort((left, right) => {
@@ -3084,6 +3227,7 @@ export async function runStatefulBotSession(
   const handleOrderResultOverfill = async (args: {
     fill: FillRecord;
     order: MarketOrderArgs;
+    result?: OrderResult | undefined;
     orderId?: string | undefined;
     groupId?: string | undefined;
     phase: "entry" | "completion" | "pair";
@@ -3092,6 +3236,7 @@ export async function runStatefulBotSession(
     const overfill = detectOrderResultShareOverfill({
       order: args.order,
       fill: args.fill,
+      result: args.result,
       orderId: args.orderId,
       groupId: args.groupId,
     });
@@ -3195,9 +3340,16 @@ export async function runStatefulBotSession(
 
   const findBotOwnedFillForShortfall = (
     candidate: Pick<BalanceShortfallCandidate, "outcome" | "fromShares" | "toShares" | "nowTs">,
-  ): RecentBotOwnedBuyFill | undefined => {
+  ): RecentBotOwnedBuyFill | SubmittedIntent | undefined => {
     pruneBotOwnedBuyFills(candidate.nowTs);
-    return findRecentBotOwnedFillForShortfall(recentBotOwnedBuyFills, candidate);
+    return (
+      findRecentBotOwnedFillForShortfall(recentBotOwnedBuyFills, candidate) ??
+      findRecentSubmittedIntentForShortfall(
+        submittedPrices[candidate.outcome] ?? [],
+        candidate,
+        BOT_OWNED_SUBMITTED_INTENT_SETTLEMENT_GRACE_SEC,
+      )
+    );
   };
 
   const computeSettlementLockedShares = (nowTs: number): { up: number; down: number } => {
@@ -3210,7 +3362,7 @@ export async function runStatefulBotSession(
     if (!matchedFill) {
       return false;
     }
-    return candidate.nowTs - matchedFill.timestamp <= BOT_OWNED_SETTLEMENT_GRACE_SEC;
+    return isRecentBotOwnedShortfallMatch(matchedFill, candidate.nowTs);
   };
 
   const matchActivePairSubmission = (fill: FillRecord): ActivePairSubmission["entries"][number] | undefined => {
@@ -4517,7 +4669,21 @@ export async function runStatefulBotSession(
             });
             const residualAfterMerge = Math.abs(state.upShares - state.downShares);
             if (config.postMergeOnlyCompletion) {
-              if (config.postMergeOnlyCompletionWhileResidual && residualAfterMerge > config.postMergeFlatDustShares) {
+              const postMergeSecsToClose = market.endTs - nowTs;
+              const finalWindowPostMergeLock =
+                mergeGateReason === "final_window" ||
+                mergeGateReason === "merge_first_final_window" ||
+                postMergeSecsToClose <= Math.max(config.finalWindowCompletionOnlySec, 30) + 1e-9;
+              if (finalWindowPostMergeLock) {
+                state = {
+                  ...state,
+                  reentryDisabled: true,
+                  postMergeCompletionOnlyUntil: market.endTs + 1,
+                };
+              } else if (
+                config.postMergeOnlyCompletionWhileResidual &&
+                postMergeResidualBlocksReentry(config, state, residualAfterMerge)
+              ) {
                 state = {
                   ...state,
                   reentryDisabled: true,
@@ -4692,7 +4858,7 @@ export async function runStatefulBotSession(
       }
       if (
         state.reentryDisabled &&
-        Math.abs(state.upShares - state.downShares) <= config.postMergeFlatDustShares &&
+        !postMergeResidualBlocksReentry(config, state) &&
         config.postMergeAllowNewPairIfFlat
       ) {
         state = {
@@ -4920,10 +5086,7 @@ export async function runStatefulBotSession(
         overlapAgeEligible &&
         (config.allowOverlapInLast30S || nowTs < market.endTs - config.finalWindowCompletionOnlySec) ||
         carryPreservedOverlapAllowed;
-      const postMergeCompletionOnlyActive =
-        config.postMergeOnlyCompletion &&
-        (state.reentryDisabled ||
-          (state.postMergeCompletionOnlyUntil !== undefined && nowTs < state.postMergeCompletionOnlyUntil));
+      const postMergeCompletionOnlyActiveNow = postMergeCompletionOnlyActive(config, state, nowTs);
       const partialOpenCompletionOnlyActive =
         config.blockNewPairWhilePartialOpen &&
         partialOpenGroupLock !== undefined &&
@@ -4948,13 +5111,13 @@ export async function runStatefulBotSession(
           marketLossUsdc: 0,
           usdcBalance: cachedUsdcBalance,
           forceNoNewEntries:
-            startupBlockNewEntries || postMergeCompletionOnlyActive || partialOpenCompletionOnlyActive,
+            startupBlockNewEntries || postMergeCompletionOnlyActiveNow || partialOpenCompletionOnlyActive,
           forceCompletionOnly:
-            startupCompletionOnly || postMergeCompletionOnlyActive || partialOpenCompletionOnlyActive,
+            startupCompletionOnly || postMergeCompletionOnlyActiveNow || partialOpenCompletionOnlyActive,
           forceSafeHalt: startupSafeHalt,
           externalReasons: [
             ...startupExternalReasons,
-            ...(postMergeCompletionOnlyActive ? ["post_merge_completion_only"] : []),
+            ...(postMergeCompletionOnlyActiveNow ? ["post_merge_completion_only"] : []),
             ...(partialOpenCompletionOnlyActive ? ["partial_group_open"] : []),
           ],
         },
@@ -5348,6 +5511,7 @@ export async function runStatefulBotSession(
             await handleOrderResultOverfill({
               fill: immediateCompletion,
               order: submittedCompletionOrder,
+              result,
               orderId: result.orderId,
               phase: "completion",
               mode: decision.completion.mode,
@@ -5692,6 +5856,7 @@ export async function runStatefulBotSession(
             await handleOrderResultOverfill({
               fill: normalizedImmediateFill,
               order: immediateFill.order,
+              result: immediateFill.result,
               orderId: immediateFill.result?.orderId,
               groupId: group.groupId,
               phase: "pair",
@@ -5860,6 +6025,7 @@ export async function runStatefulBotSession(
             entryBuy: rawEntryBuy,
             entryTrace: decision.trace.entry,
             minOrderSize: state.market.minOrderSize,
+            maxCompletionOvershootShares: config.maxCompletionOvershootShares,
           });
           const entryBuy = clampedEntryRepair.entryBuy;
           if (clampedEntryRepair.clamped) {
@@ -6072,6 +6238,7 @@ export async function runStatefulBotSession(
               await handleOrderResultOverfill({
                 fill: immediateEntry,
                 order: execution.order,
+                result: execution.result,
                 orderId: execution.result.orderId,
                 phase: "entry",
                 mode: entryBuy.mode,
@@ -6199,6 +6366,7 @@ export async function runStatefulBotSession(
               await handleOrderResultOverfill({
                 fill: normalizedImmediateFill,
                 order: execution.order,
+                result: execution.result,
                 orderId: execution.result.orderId,
                 groupId: temporalSeedGroup.groupId,
                 phase: "entry",
@@ -6599,7 +6767,20 @@ export async function runStatefulBotSession(
       });
       if (config.postMergeOnlyCompletion) {
         const residualAfterMerge = Math.abs(state.upShares - state.downShares);
-        if (config.postMergeOnlyCompletionWhileResidual && residualAfterMerge > config.postMergeFlatDustShares) {
+        const finalWindowPostMergeLock =
+          sessionEndMergeDecision.reason === "final_window" ||
+          sessionEndMergeDecision.reason === "market_close" ||
+          market.endTs - endedAt <= Math.max(config.finalWindowCompletionOnlySec, 30) + 1e-9;
+        if (finalWindowPostMergeLock) {
+          state = {
+            ...state,
+            reentryDisabled: true,
+            postMergeCompletionOnlyUntil: market.endTs + 1,
+          };
+        } else if (
+          config.postMergeOnlyCompletionWhileResidual &&
+          postMergeResidualBlocksReentry(config, state, residualAfterMerge)
+        ) {
           state = {
             ...state,
             reentryDisabled: true,
@@ -6676,10 +6857,7 @@ export async function runStatefulBotSession(
     }
   }
   const finalBooks = buildBooks(marketWs, market);
-  const finalPostMergeCompletionOnlyActive =
-    config.postMergeOnlyCompletion &&
-    (state.reentryDisabled ||
-      (state.postMergeCompletionOnlyUntil !== undefined && endedAt < state.postMergeCompletionOnlyUntil));
+  const finalPostMergeCompletionOnlyActive = postMergeCompletionOnlyActive(config, state, endedAt);
   const finalDecision = bot.evaluateTick({
     config,
     state,

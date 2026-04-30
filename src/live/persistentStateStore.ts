@@ -508,9 +508,6 @@ export class PersistentStateStore {
     if (fill.side === "BUY") {
       const qtyOriginal = normalize(fill.size);
       if (isUsableFillOrderId(context.orderId)) {
-        const qtyTolerance = Math.max(1e-6, Math.abs(qtyOriginal) * 0.001);
-        const priceTolerance = 0.005;
-        const timestampToleranceSec = 3;
         const existing = this.db
           .prepare(`
             SELECT lot_id
@@ -520,9 +517,6 @@ export class PersistentStateStore {
               AND outcome = @outcome
               AND side = 'BUY'
               AND order_id = @orderId
-              AND ABS(qty_original - @qtyOriginal) <= @qtyTolerance
-              AND ABS(price - @price) <= @priceTolerance
-              AND ABS(timestamp - @timestamp) <= @timestampToleranceSec
             LIMIT 1
           `)
           .get({
@@ -530,12 +524,6 @@ export class PersistentStateStore {
             conditionId: state.market.conditionId,
             outcome: fill.outcome,
             orderId: context.orderId,
-            qtyOriginal,
-            price: fill.price,
-            timestamp: fill.timestamp,
-            qtyTolerance,
-            priceTolerance,
-            timestampToleranceSec,
           }) as { lot_id: string } | undefined;
         if (existing) {
           return false;

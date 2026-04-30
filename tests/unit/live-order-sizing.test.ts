@@ -66,6 +66,26 @@ describe("live order sizing", () => {
     expect(result.reason).toBe("below_min_market_buy_amount");
   });
 
+  it("allows exact-share FAK buys at the market minimum even when the notional is below one dollar", () => {
+    const result = fitBuyOrderToUsdcBalance(
+      buyOrder({
+        price: 0.004,
+        amount: 0.02,
+        shareTarget: 5,
+      }),
+      {
+        usdcBalance: 10,
+        minOrderSize: 5,
+        sizeLadder: [5],
+      },
+    );
+
+    expect(result.skipped).toBe(false);
+    expect(result.reason).toBe("fits_balance");
+    expect(result.order?.shareTarget).toBe(5);
+    expect(result.order?.amount).toBe(0.02);
+  });
+
   it("skips residual BUY orders below the market minimum share size before submit", () => {
     const result = fitBuyOrderToUsdcBalance(
       buyOrder({
@@ -84,6 +104,26 @@ describe("live order sizing", () => {
     expect(result.order).toBeUndefined();
     expect(result.reason).toBe("below_min_order_size");
     expect(isNonExecutableResidualBuySizingReason(result.reason)).toBe(true);
+  });
+
+  it("normalizes executable BUY orders to CLOB market-buy precision before submit", () => {
+    const result = fitBuyOrderToUsdcBalance(
+      buyOrder({
+        price: 0.31,
+        amount: 4.6506,
+        shareTarget: 15.001934,
+      }),
+      {
+        usdcBalance: 10,
+        minOrderSize: 5,
+        sizeLadder: [15, 12, 8, 5],
+      },
+    );
+
+    expect(result.skipped).toBe(false);
+    expect(result.order?.amount).toBe(4.65);
+    expect(result.order?.shareTarget).toBe(15);
+    expect(result.finalShares).toBe(15);
   });
 
   it("debits accepted buys with the same fee cushion used for affordability", () => {

@@ -1,9 +1,6 @@
 import type { MarketOrderArgs, OutcomeSide, TakerOrderType } from "../../infra/clob/types.js";
+import { normalizeClobMarketBuy, normalizePositiveAmount, normalizePositiveShares } from "../../infra/clob/orderPrecision.js";
 import type { XuanMarketState } from "./marketState.js";
-
-function normalizeAmount(value: number): number {
-  return Number(Math.max(0, value).toFixed(6));
-}
 
 export function buildTakerBuyOrder(args: {
   state: XuanMarketState;
@@ -13,12 +10,15 @@ export function buildTakerBuyOrder(args: {
   orderType?: TakerOrderType;
   metadata?: string;
 }): MarketOrderArgs {
-  const spendAmount = normalizeAmount(args.shareTarget * args.limitPrice);
+  const normalized = normalizeClobMarketBuy({
+    shareTarget: args.shareTarget,
+    price: args.limitPrice,
+  });
   return {
     tokenId: args.state.market.tokens[args.side].tokenId,
     side: "BUY",
-    amount: spendAmount,
-    shareTarget: normalizeAmount(args.shareTarget),
+    amount: normalized.amount,
+    shareTarget: normalized.shareTarget,
     price: args.limitPrice,
     orderType: args.orderType ?? "FAK",
     ...(args.metadata !== undefined ? { metadata: args.metadata } : {}),
@@ -36,8 +36,8 @@ export function buildTakerSellOrder(args: {
   return {
     tokenId: args.state.market.tokens[args.side].tokenId,
     side: "SELL",
-    amount: normalizeAmount(args.shareTarget),
-    shareTarget: normalizeAmount(args.shareTarget),
+    amount: normalizePositiveAmount(args.shareTarget),
+    shareTarget: normalizePositiveShares(args.shareTarget),
     price: args.limitPrice,
     orderType: args.orderType ?? "FAK",
     ...(args.metadata !== undefined ? { metadata: args.metadata } : {}),

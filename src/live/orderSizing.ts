@@ -1,4 +1,5 @@
 import type { MarketOrderArgs, OrderResult } from "../infra/clob/types.js";
+import { normalizeExecutableBuyOrder } from "../infra/clob/orderPrecision.js";
 
 const DEFAULT_FEE_CUSHION_RATIO = 0.04;
 const DEFAULT_MIN_MARKET_BUY_AMOUNT = 1;
@@ -68,13 +69,26 @@ function orderCostWithCushion(amount: number, feeCushionRatio: number): number {
   return normalizeAmount(amount * (1 + Math.max(0, feeCushionRatio)));
 }
 
+function isExactShareLimitRoutedBuy(order: MarketOrderArgs, minOrderSize: number): boolean {
+  return (
+    order.side === "BUY" &&
+    order.price !== undefined &&
+    order.shareTarget !== undefined &&
+    Number.isFinite(order.price) &&
+    Number.isFinite(order.shareTarget) &&
+    order.price > 0 &&
+    order.shareTarget >= minOrderSize - EPSILON &&
+    minOrderSize >= 1 - EPSILON
+  );
+}
+
 function resizedBuyOrder(order: MarketOrderArgs, shareTarget: number, price: number, usdcBalance: number): MarketOrderArgs {
   return withUserUsdcBalance(
-    {
+    normalizeExecutableBuyOrder({
       ...order,
       shareTarget: normalizeShares(shareTarget),
       amount: normalizeAmount(shareTarget * price),
-    },
+    }),
     usdcBalance,
   );
 }
@@ -137,6 +151,7 @@ export function fitBuyOrderToUsdcBalance(
 
   const feeCushionRatio = options.feeCushionRatio ?? DEFAULT_FEE_CUSHION_RATIO;
   const minOrderSize = Math.max(0, options.minOrderSize);
+  const exactShareLimitRoutedBuy = isExactShareLimitRoutedBuy(order, minOrderSize);
   const requestedCost = orderCostWithCushion(order.amount, feeCushionRatio);
   const maxAffordableShares = normalizeShares(usdcBalance / (price * (1 + Math.max(0, feeCushionRatio))));
 
@@ -150,7 +165,7 @@ export function fitBuyOrderToUsdcBalance(
     };
   }
 
-  if (order.amount + EPSILON < minMarketBuyAmount) {
+  if (!exactShareLimitRoutedBuy && order.amount + EPSILON < minMarketBuyAmount) {
     return {
       ...(requestedShares !== undefined ? { requestedShares: normalizeShares(requestedShares) } : {}),
       maxAffordableShares,
@@ -161,10 +176,18 @@ export function fitBuyOrderToUsdcBalance(
   }
 
   if (requestedCost <= usdcBalance + EPSILON) {
+    const normalizedOrder =
+      exactShareLimitRoutedBuy && order.amount + EPSILON < minMarketBuyAmount
+        ? {
+            ...order,
+            amount: normalizeAmount(requestedShares * price),
+            shareTarget: normalizeShares(requestedShares),
+          }
+        : normalizeExecutableBuyOrder(order);
     return {
-      order: withUserUsdcBalance(order, usdcBalance),
+      order: withUserUsdcBalance(normalizedOrder, usdcBalance),
       requestedShares: normalizeShares(requestedShares),
-      finalShares: normalizeShares(requestedShares),
+      finalShares: normalizeShares(normalizedOrder.shareTarget ?? requestedShares),
       maxAffordableShares,
       adjusted: false,
       skipped: false,

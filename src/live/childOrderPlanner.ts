@@ -1,21 +1,18 @@
 import type { MarketOrderArgs, OutcomeSide, OrderLevel } from "../infra/clob/types.js";
+import { normalizeExecutableBuyOrder, normalizePositiveShares } from "../infra/clob/orderPrecision.js";
 import { OrderBookState } from "../strategy/xuan5m/orderBookState.js";
 
 function normalizeShares(value: number): number {
-  return Number(Math.max(0, value).toFixed(6));
-}
-
-function normalizeAmount(value: number): number {
-  return Number(Math.max(0, value).toFixed(6));
+  return normalizePositiveShares(value);
 }
 
 function buildChildOrder(baseOrder: MarketOrderArgs, shareTarget: number, limitPrice: number): MarketOrderArgs {
-  return {
+  return normalizeExecutableBuyOrder({
     ...baseOrder,
     shareTarget: normalizeShares(shareTarget),
     price: Number(limitPrice.toFixed(6)),
-    amount: normalizeAmount(shareTarget * limitPrice),
-  };
+    amount: shareTarget * limitPrice,
+  });
 }
 
 function asksForOutcome(books: OrderBookState, outcome: OutcomeSide): OrderLevel[] {
@@ -33,7 +30,7 @@ export function planCloneChildBuyOrders(args: {
   preferredChildShares?: number | undefined;
   maxChildOrders?: number | undefined;
 }): MarketOrderArgs[] {
-  const { order } = args;
+  const order = normalizeExecutableBuyOrder(args.order);
   if (
     order.side !== "BUY" ||
     order.price === undefined ||
@@ -57,7 +54,7 @@ export function planCloneChildBuyOrders(args: {
   const bestLevelDepth = levels[0]?.size ?? 0;
   const shouldSplit = targetShares > bestLevelDepth + 1e-6 || levels.length > 1;
   if (!shouldSplit) {
-    return [order];
+    return [buildChildOrder(order, targetShares, Math.min(order.price, levels[0]!.price))];
   }
 
   const preferredChildShares = normalizeShares(

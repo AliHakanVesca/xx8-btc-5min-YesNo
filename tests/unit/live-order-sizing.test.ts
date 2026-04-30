@@ -5,6 +5,7 @@ import {
   debitBuyOrderFromUsdcBalance,
   extractInsufficientBalanceUsdc,
   fitBuyOrderToUsdcBalance,
+  isNonExecutableResidualBuySizingReason,
 } from "../../src/live/orderSizing.js";
 
 function buyOrder(overrides: Partial<MarketOrderArgs> = {}): MarketOrderArgs {
@@ -63,6 +64,26 @@ describe("live order sizing", () => {
     expect(result.skipped).toBe(true);
     expect(result.order).toBeUndefined();
     expect(result.reason).toBe("below_min_market_buy_amount");
+  });
+
+  it("skips residual BUY orders below the market minimum share size before submit", () => {
+    const result = fitBuyOrderToUsdcBalance(
+      buyOrder({
+        price: 0.75,
+        amount: 0.722902,
+        shareTarget: 0.963869,
+      }),
+      {
+        usdcBalance: 10,
+        minOrderSize: 5,
+        sizeLadder: [15, 12, 8, 5],
+      },
+    );
+
+    expect(result.skipped).toBe(true);
+    expect(result.order).toBeUndefined();
+    expect(result.reason).toBe("below_min_order_size");
+    expect(isNonExecutableResidualBuySizingReason(result.reason)).toBe(true);
   });
 
   it("debits accepted buys with the same fee cushion used for affordability", () => {

@@ -29,6 +29,26 @@ export class OrderManager {
         requestedAt: Date.now(),
       };
     }
+    if (
+      order.side === "BUY" &&
+      order.price !== undefined &&
+      order.shareTarget !== undefined &&
+      Number.isFinite(order.price) &&
+      Number.isFinite(order.shareTarget) &&
+      order.price > 0 &&
+      order.shareTarget > 0
+    ) {
+      return this.clob.postLimitOrder({
+        tokenId: order.tokenId,
+        price: order.price,
+        size: order.shareTarget,
+        side: order.side,
+        orderType: order.orderType,
+        postOnly: false,
+        ...(order.metadata !== undefined ? { metadata: order.metadata } : {}),
+        ...(order.builderCode !== undefined ? { builderCode: order.builderCode } : {}),
+      });
+    }
     return this.clob.postMarketOrder(order);
   }
 }

@@ -24,10 +24,15 @@ export interface AffordableBuyOrderResult {
     | "not_buy"
     | "no_balance_cap"
     | "missing_price_or_shares"
+    | "below_min_order_size"
     | "below_min_market_buy_amount"
     | "fits_balance"
     | "downshifted_to_affordable_ladder"
     | "insufficient_balance";
+}
+
+export function isNonExecutableResidualBuySizingReason(reason: AffordableBuyOrderResult["reason"]): boolean {
+  return reason === "below_min_order_size" || reason === "below_min_market_buy_amount";
 }
 
 function normalizeAmount(value: number): number {
@@ -130,19 +135,31 @@ export function fitBuyOrderToUsdcBalance(
       };
   }
 
+  const feeCushionRatio = options.feeCushionRatio ?? DEFAULT_FEE_CUSHION_RATIO;
+  const minOrderSize = Math.max(0, options.minOrderSize);
+  const requestedCost = orderCostWithCushion(order.amount, feeCushionRatio);
+  const maxAffordableShares = normalizeShares(usdcBalance / (price * (1 + Math.max(0, feeCushionRatio))));
+
+  if (requestedShares + EPSILON < minOrderSize) {
+    return {
+      requestedShares: normalizeShares(requestedShares),
+      maxAffordableShares,
+      adjusted: false,
+      skipped: true,
+      reason: "below_min_order_size",
+    };
+  }
+
   if (order.amount + EPSILON < minMarketBuyAmount) {
     return {
       ...(requestedShares !== undefined ? { requestedShares: normalizeShares(requestedShares) } : {}),
+      maxAffordableShares,
       adjusted: false,
       skipped: true,
       reason: "below_min_market_buy_amount",
     };
   }
 
-  const feeCushionRatio = options.feeCushionRatio ?? DEFAULT_FEE_CUSHION_RATIO;
-  const minOrderSize = Math.max(0, options.minOrderSize);
-  const requestedCost = orderCostWithCushion(order.amount, feeCushionRatio);
-  const maxAffordableShares = normalizeShares(usdcBalance / (price * (1 + Math.max(0, feeCushionRatio))));
   if (requestedCost <= usdcBalance + EPSILON) {
     return {
       order: withUserUsdcBalance(order, usdcBalance),

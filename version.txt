@@ -1,6 +1,17 @@
 
 ##############################################
 
+Version : V.0.0.66
+Date    : 30.04.2026
+Author  : Ali Hakan Çakır
+Changes : - Share-target BUY emirleri exact-size limit FAK yoluna alindi.
+          - Min lot ve min notional altindaki residual completion submitleri engellendi.
+          - Order manager ve live order sizing regresyon testleri eklendi.
+
+##############################################
+
+##############################################
+
 Version : V.0.0.65
 Date    : 30.04.2026
 Author  : Ali Hakan Çakır

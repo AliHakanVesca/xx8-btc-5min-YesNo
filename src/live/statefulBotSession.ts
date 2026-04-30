@@ -92,6 +92,7 @@ import {
   debitBuyOrderFromUsdcBalance,
   extractInsufficientBalanceUsdc,
   fitBuyOrderToUsdcBalance,
+  isNonExecutableResidualBuySizingReason,
 } from "./orderSizing.js";
 
 export interface BotSessionOptions {
@@ -2428,11 +2429,34 @@ function withAvailableUsdcBalance(
   config: XuanStrategyConfig,
   minOrderSize: number,
 ): MarketOrderArgs | undefined {
+  return fitOrderToAvailableUsdcBalance(order, usdcBalance, config, minOrderSize).order;
+}
+
+function fitOrderToAvailableUsdcBalance(
+  order: MarketOrderArgs,
+  usdcBalance: number | undefined,
+  config: XuanStrategyConfig,
+  minOrderSize: number,
+): ReturnType<typeof fitBuyOrderToUsdcBalance> {
   return fitBuyOrderToUsdcBalance(order, {
     usdcBalance,
     minOrderSize,
     sizeLadder: liveOrderSizeLadder(config, minOrderSize),
-  }).order;
+  });
+}
+
+function completionSizingBlockKey(args: {
+  side: OutcomeSide;
+  missingShares: number;
+  reason: ReturnType<typeof fitBuyOrderToUsdcBalance>["reason"];
+  minOrderSize: number;
+}): string {
+  return [
+    args.side,
+    normalizeShares(args.missingShares),
+    args.reason,
+    normalizeShares(args.minOrderSize),
+  ].join(":");
 }
 
 function assignSequentialUsdcBalances(
@@ -2920,6 +2944,7 @@ export async function runStatefulBotSession(
   let pendingPairExecution: PendingPairExecution | undefined;
   let pendingCompletionSubmission: PendingCompletionSubmission | undefined;
   let pendingEntryRepairSubmission: PendingCompletionSubmission | undefined;
+  let lastUnfillableCompletionSizingKey: string | undefined;
   let partialOpenGroupLock: PartialOpenGroupLock | undefined;
   let runtimeProtectedResidualLock: RuntimeProtectedResidualLock | undefined;
   let arbitrationCarry: ArbitrationCarry | undefined;
@@ -5197,12 +5222,41 @@ export async function runStatefulBotSession(
         }
         completionSubmittedThisTick = true;
         assertClassifiedBuyMode(decision.completion.mode, config);
-        const liveOrder = withAvailableUsdcBalance(
+        const completionSizing = fitOrderToAvailableUsdcBalance(
           decision.completion.order,
           cachedUsdcBalance,
           config,
           state.market.minOrderSize,
         );
+        const liveOrder = completionSizing.order;
+        if (!liveOrder && isNonExecutableResidualBuySizingReason(completionSizing.reason)) {
+          const blockKey = completionSizingBlockKey({
+            side: decision.completion.sideToBuy,
+            missingShares: decision.completion.missingShares,
+            reason: completionSizing.reason,
+            minOrderSize: state.market.minOrderSize,
+          });
+          if (lastUnfillableCompletionSizingKey !== blockKey) {
+            await traceLogger.write("orders", {
+              eventType: "completion_submit_blocked",
+              normalizedMode: `COMPLETION_${decision.completion.sideToBuy}`,
+              outcome: decision.completion.sideToBuy,
+              requestedSize: decision.completion.missingShares,
+              price: decision.completion.order.price ?? null,
+              shareTarget: decision.completion.order.shareTarget ?? null,
+              spendAmount: decision.completion.order.amount,
+              reason: completionSizing.reason,
+              minOrderSize: state.market.minOrderSize,
+              maxAffordableShares: completionSizing.maxAffordableShares ?? null,
+              oldGap: decision.completion.oldGap,
+              newGapEstimate: decision.completion.newGap,
+              capUsed: decision.completion.capMode,
+            });
+          }
+          lastUnfillableCompletionSizingKey = blockKey;
+          return false;
+        }
+        lastUnfillableCompletionSizingKey = undefined;
         const submittedCompletionOrder = liveOrder ?? decision.completion.order;
         const result = liveOrder
           ? await completeOrderSafely(completionManager, liveOrder)

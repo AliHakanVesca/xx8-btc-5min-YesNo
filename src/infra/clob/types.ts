@@ -47,7 +47,7 @@ export interface LimitOrderArgs {
   price: number;
   size: number;
   side: TradeSide;
-  orderType: MakerOrderType;
+  orderType: MakerOrderType | TakerOrderType;
   expiration?: number | undefined;
   postOnly?: boolean | undefined;
   metadata?: string | undefined;

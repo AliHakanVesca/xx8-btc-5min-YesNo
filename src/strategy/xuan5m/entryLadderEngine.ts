@@ -67,6 +67,7 @@ import {
   plannedOppositeMinWaitSec as sharedPlannedOppositeMinWaitSec,
   plannedOppositeProtectiveReleaseReady as sharedPlannedOppositeProtectiveReleaseReady,
   plannedOppositeTargetReleaseReady as sharedPlannedOppositeTargetReleaseReady,
+  shouldBlockSmallLotExpensiveCompletion as sharedShouldBlockSmallLotExpensiveCompletion,
   strictXuanCloseablePairCostCap as sharedStrictXuanCloseablePairCostCap,
   strictXuanPairCostTargetCap as sharedStrictXuanPairCostTargetCap,
   xuanPairCostImprovesOrMeetsTarget as sharedXuanPairCostImprovesOrMeetsTarget,
@@ -417,6 +418,7 @@ export interface EntryDecisionTrace {
   repairFinalQty?: number;
   repairOldGap?: number;
   repairNewGap?: number;
+  repairMergeableQty?: number;
   repairWouldIncreaseImbalance?: boolean;
   repairMissingQty?: number;
   repairOppositeAveragePrice?: number;
@@ -888,8 +890,7 @@ function shouldHoldEntryForMergeFirstAfterCompletion(
   if (!smallExplicitMergeTarget && lastBuyAgeSec > immediateCompletionLockSec + 1e-9) {
     return false;
   }
-  const flatDust = Math.max(config.postMergeFlatDustShares, state.market.minOrderSize * 0.01, 1e-6);
-  if (Math.abs(state.upShares - state.downShares) > flatDust + 1e-9) {
+  if (!xuanDustNeutralResidual(config, state)) {
     return false;
   }
   return basketState.basketEffectiveAvg <= config.marketBasketMergeEffectivePairCap + 1e-9;
@@ -931,12 +932,11 @@ function completionReadyBasketShouldAvoidStagedSeed(config: XuanStrategyConfig, 
   if (!lastBuy || !isCompletionLikeBuyMode(lastBuy.executionMode)) {
     return false;
   }
-  const flatDust = Math.max(config.postMergeFlatDustShares, state.market.minOrderSize * 0.01, 1e-6);
   const mergeFirstTarget = isAggressivePublicFootprint(config)
     ? publicFootprintBasketMergeTargetQty(config)
     : config.mergeMinShares;
   return (
-    Math.abs(state.upShares - state.downShares) <= flatDust + 1e-9 &&
+    xuanDustNeutralResidual(config, state) &&
     mergeableShares(state) >= mergeFirstTarget - 1e-9
   );
 }
@@ -1143,6 +1143,14 @@ function xuanFreshCycleFlatDustThreshold(config: XuanStrategyConfig, state: Xuan
     return Math.max(baseThreshold, state.market.minOrderSize);
   }
   return baseThreshold;
+}
+
+function xuanDustNeutralResidual(
+  config: XuanStrategyConfig,
+  state: XuanMarketState,
+  residualQty = Math.abs(state.upShares - state.downShares),
+): boolean {
+  return residualQty <= xuanFreshCycleFlatDustThreshold(config, state) + 1e-9;
 }
 
 function fixedFiveDustNeutralAfterMerge(config: XuanStrategyConfig, state: XuanMarketState): boolean {
@@ -1731,7 +1739,7 @@ function marketBasketStateTrace(config: XuanStrategyConfig, state: XuanMarketSta
     config.balancedDebtContinuationEnabled &&
     config.marketBasketContinuationEnabled &&
     mergeableQty >= config.marketBasketContinuationMinMatchedShares - 1e-9 &&
-    residualQty <= Math.max(config.postMergeFlatDustShares, 1e-6) + 1e-9 &&
+    xuanDustNeutralResidual(config, state, residualQty) &&
     basketDebtUSDC > config.marketBasketMinDebtUsdc + 1e-9;
   const campaignSeedActive = hasCampaignSeedFill(state);
   const campaignFlowCount = estimateTraceCampaignFlowCount(state);
@@ -1743,6 +1751,7 @@ function marketBasketStateTrace(config: XuanStrategyConfig, state: XuanMarketSta
     config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
     campaignSeedActive &&
     residualSide !== "BALANCED" &&
+    !xuanDustNeutralResidual(config, state, residualQty) &&
     residualQty >= Math.max(config.repairMinQty, config.completionMinQty) - 1e-9 &&
     mergeableQty < campaignMergeTargetQty - 1e-9;
   const debtPositiveCampaignActive =
@@ -1752,7 +1761,7 @@ function marketBasketStateTrace(config: XuanStrategyConfig, state: XuanMarketSta
     basketDebtUSDC > config.marketBasketMinDebtUsdc + 1e-9 &&
     basketEffectiveAvg > config.marketBasketGoodAvgCap + 1e-9 &&
     (
-      residualQty <= Math.max(config.postMergeFlatDustShares, 1e-6) + 1e-9 ||
+      xuanDustNeutralResidual(config, state, residualQty) ||
       campaignSeedActive
     );
   const postProfitCampaignActive =
@@ -1761,7 +1770,7 @@ function marketBasketStateTrace(config: XuanStrategyConfig, state: XuanMarketSta
     config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
     campaignSeedActive &&
     mergeableQty >= config.xuanBasketCampaignMinMatchedShares - 1e-9 &&
-    residualQty <= Math.max(config.postMergeFlatDustShares, 1e-6) + 1e-9 &&
+    xuanDustNeutralResidual(config, state, residualQty) &&
     basketEffectiveAvg <= config.marketBasketMergeEffectivePairCap + 1e-9 &&
     mergeableQty < campaignMergeTargetQty - 1e-9 &&
     campaignFlowCount < campaignFlowTarget;
@@ -2385,8 +2394,7 @@ function aggressiveFamilyHighLowContinuationAllowed(
     lowSidePrice <= 0.45 + 1e-9;
   const postMergeRecycleContinuation =
     state.mergeHistory.length > 0 &&
-    state.upShares + state.downShares <=
-      Math.max(config.postMergeFlatDustShares * 2, state.market.minOrderSize * 0.01, 0.05) + 1e-9 &&
+    state.upShares + state.downShares <= xuanFreshCycleFlatDustThreshold(config, state) + 1e-9 &&
     candidateContext.ctx.secsFromOpen >= 210 &&
     candidateContext.ctx.secsFromOpen <= 245 &&
     seedIsHighSide &&
@@ -2994,8 +3002,7 @@ function newCyclePacingSkipReason(
     aggressivePublicFootprint ? resolveBundledSeedSequencePrior(state.market.slug, ctx.secsFromOpen) : undefined;
   const aggressiveSequencePriorActive = aggressiveSeedPrior !== undefined;
   const dustFlatAfterRecycle =
-    state.upShares + state.downShares <=
-    Math.max(config.postMergeFlatDustShares * 2, state.market.minOrderSize * 0.01, 0.05);
+    state.upShares + state.downShares <= xuanFreshCycleFlatDustThreshold(config, state) + 1e-9;
   const aggressiveFamilyCycleReleaseActive =
     aggressivePublicFootprint &&
     ctx.secsToClose > config.finalWindowNoChaseSec &&
@@ -3094,8 +3101,7 @@ function freshCycleCandidateSkipReason(
     candidateContext.highSidePrice !== undefined &&
     candidateContext.lowSidePrice !== undefined &&
     state.mergeHistory.length > 0 &&
-    state.upShares + state.downShares <=
-      Math.max(config.postMergeFlatDustShares * 2, state.market.minOrderSize * 0.01, 0.05) + 1e-9 &&
+    state.upShares + state.downShares <= xuanFreshCycleFlatDustThreshold(config, state) + 1e-9 &&
     candidateContext.ctx.secsFromOpen >= 230 &&
     candidateContext.ctx.secsFromOpen <= 245 &&
     candidateContext.seedPrice !== undefined &&
@@ -4065,11 +4071,26 @@ export function evaluateEntryBuys(
   }
 
   if (repairSize <= 0) {
+    const mergeableQtyForMicroResidual = mergeableShares(state);
+    const microResidualDustThreshold = Math.max(
+      config.postMergeFlatDustShares,
+      config.maxCompletionOvershootShares,
+      0.25,
+    );
+    const mergeableMicroResidual =
+      aggressivePublicFootprint &&
+      mergeableQtyForMicroResidual >= state.market.minOrderSize - 1e-9 &&
+      shareGap <= microResidualDustThreshold + 1e-9;
     return {
       decisions: [],
       trace: {
         ...trace,
-        skipReason: shareGap < config.repairMinQty ? "repair_size_zero" : "repair_qty_cap",
+        repairMergeableQty: normalizeTraceNumber(mergeableQtyForMicroResidual),
+        skipReason: mergeableMicroResidual
+          ? "xuan_mergeable_micro_residual_wait"
+          : shareGap < config.repairMinQty
+            ? "repair_size_zero"
+            : "repair_qty_cap",
       },
     };
   }
@@ -4433,6 +4454,35 @@ export function evaluateEntryBuys(
           openingCampaignDeadlineCompletionAllowed ||
           (plannedOppositePriceTargetMet && xuanCostDisciplinedCompletion)
         : repairCost <= 1.025 + 1e-9);
+    if (
+      shouldBlockSmallLotExpensiveCompletion({
+        config,
+        costWithFees: repairCost,
+        secsToClose: ctx.secsToClose,
+        oldGap,
+        minOrderSize: state.market.minOrderSize,
+        exactPriorActive: Boolean(exactCompletionQtyPrior),
+      })
+    ) {
+      lastBlockedRepairEvaluation = {
+        decisions: [],
+        trace: {
+          ...trace,
+          repairSizingMode,
+          repairCandidateCount: repairCandidateSizes.length,
+          repairFilledSize: executableSize,
+          repairFinalQty: executableSize,
+          repairCost,
+          repairOldGap: oldGap,
+          repairNewGap: newGap,
+          repairOppositeAveragePrice: oppositeAveragePrice,
+          continuationRejectedReason: "xuan_completion_cost_hard_stop",
+          overlapRepairOutcome: "wait",
+          skipReason: "xuan_completion_cost_hard_stop",
+        },
+      };
+      continue;
+    }
     const plannedOppositeDebtReducing =
       plannedOppositeCandidate &&
       repairCost <= strictXuanPairCostTargetCap(config) + 1e-9;
@@ -7219,8 +7269,7 @@ function inspectBalancedPairCandidates(
     const postMergeRecycleSlot =
       aggressivePublicFootprint &&
       state.mergeHistory.length > 0 &&
-      state.upShares + state.downShares <=
-        Math.max(config.postMergeFlatDustShares * 2, state.market.minOrderSize * 0.01, 0.05) + 1e-9 &&
+      state.upShares + state.downShares <= xuanFreshCycleFlatDustThreshold(config, state) + 1e-9 &&
       secsToClose > config.finalWindowCompletionOnlySec;
     const xuanStrictSequenceClipMax = Math.max(
       state.market.minOrderSize,
@@ -7309,7 +7358,7 @@ function inspectBalancedPairCandidates(
       !aggressivePublicFootprint &&
       buyFillCount < config.xuanMinFillCountForPass &&
       secsToClose > config.finalWindowCompletionOnlySec &&
-      Math.abs(state.upShares - state.downShares) <= Math.max(config.postMergeFlatDustShares, 1e-6) + 1e-9 &&
+      xuanDustNeutralResidual(config, state) &&
       mergeableShares(state) >= config.xuanBasketCampaignMinMatchedShares - 1e-9 &&
       requestedSize <= Math.max(state.market.minOrderSize, config.xuanMicroPairMaxQty) + 1e-9 &&
       upExecution.fullyFilled &&
@@ -7326,7 +7375,7 @@ function inspectBalancedPairCandidates(
       config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
       buyFillCount < config.xuanMinFillCountForPass &&
       secsToClose > config.finalWindowCompletionOnlySec &&
-      Math.abs(state.upShares - state.downShares) <= Math.max(config.postMergeFlatDustShares, 1e-6) + 1e-9 &&
+      xuanDustNeutralResidual(config, state) &&
       mergeableShares(state) >= config.xuanBasketCampaignMinMatchedShares - 1e-9 &&
       requestedSize <= Math.max(state.market.minOrderSize, config.xuanMicroPairMaxQty) + 1e-9 &&
       upExecution.fullyFilled &&
@@ -7352,7 +7401,7 @@ function inspectBalancedPairCandidates(
       aggressivePublicFootprint &&
       (familySeedPrior !== undefined || postMergeRecycleSlot || postMergeFlatImmediatePairRecycle) &&
       secsToClose > config.finalWindowCompletionOnlySec &&
-      Math.abs(state.upShares - state.downShares) <= Math.max(config.postMergeFlatDustShares, 1e-6) + 1e-9 &&
+      xuanDustNeutralResidual(config, state) &&
       upExecution.fullyFilled &&
       downExecution.fullyFilled &&
       requestedSize <= xuanStrictSequenceClipMax + 1e-9 &&
@@ -7364,7 +7413,7 @@ function inspectBalancedPairCandidates(
       config.botMode === "XUAN" &&
       config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
       secsToClose > config.finalWindowCompletionOnlySec &&
-      Math.abs(state.upShares - state.downShares) <= Math.max(config.postMergeFlatDustShares, 1e-6) + 1e-9 &&
+      xuanDustNeutralResidual(config, state) &&
       (mergeableShares(state) >= config.xuanBasketCampaignMinMatchedShares - 1e-9 || xuanStrictSequenceContinuation) &&
       upExecution.fullyFilled &&
       downExecution.fullyFilled &&
@@ -7894,8 +7943,7 @@ function evaluateSingleLegSeed(
   const postMergeRecycleWindow =
     isAggressivePublicFootprint(config) &&
     state.mergeHistory.length > 0 &&
-    state.upShares + state.downShares <=
-      Math.max(config.postMergeFlatDustShares * 2, state.market.minOrderSize * 0.01, 0.05) + 1e-9 &&
+    state.upShares + state.downShares <= xuanFreshCycleFlatDustThreshold(config, state) + 1e-9 &&
     ctx.secsFromOpen >= 210 &&
     ctx.secsFromOpen <= 245 &&
     ctx.secsToClose > config.finalWindowCompletionOnlySec;
@@ -7904,7 +7952,7 @@ function evaluateSingleLegSeed(
     !basketContinuationDuty &&
     !postMergeRecycleWindow &&
     config.xuanBorderlineEntryEnabled &&
-    Math.abs(state.upShares - state.downShares) <= Math.max(config.postMergeFlatDustShares, 1e-6)
+    xuanDustNeutralResidual(config, state)
       ? borderlineEntryMaxQtyForAge(config, ctx)
       : Number.POSITIVE_INFINITY;
   const stagedBorderlineInitialCap =
@@ -7912,7 +7960,7 @@ function evaluateSingleLegSeed(
     !basketContinuationDuty &&
     !postMergeRecycleWindow &&
     config.borderlinePairStagedEntryEnabled &&
-    Math.abs(state.upShares - state.downShares) <= Math.max(config.postMergeFlatDustShares, 1e-6)
+    xuanDustNeutralResidual(config, state)
       ? Math.max(state.market.minOrderSize, config.borderlinePairInitialQty)
       : Number.POSITIVE_INFINITY;
   const candidateSize = normalizeOrderSize(
@@ -8092,8 +8140,7 @@ function evaluateSingleLegSeed(
     const postMergeHighSideSetup =
       isAggressivePublicFootprint(config) &&
       state.mergeHistory.length > 0 &&
-      state.upShares + state.downShares <=
-        Math.max(config.postMergeFlatDustShares * 2, state.market.minOrderSize * 0.01, 0.05) + 1e-9 &&
+      state.upShares + state.downShares <= xuanFreshCycleFlatDustThreshold(config, state) + 1e-9 &&
       ctx.secsFromOpen >= 230 &&
       ctx.secsFromOpen <= 245 &&
       lastBuyFill(state)?.outcome === side &&
@@ -8605,6 +8652,17 @@ function strictXuanCloseablePairCostCap(config: XuanStrategyConfig): number {
   return sharedStrictXuanCloseablePairCostCap(config);
 }
 
+function shouldBlockSmallLotExpensiveCompletion(args: {
+  config: XuanStrategyConfig;
+  costWithFees: number;
+  secsToClose: number;
+  oldGap: number;
+  minOrderSize: number;
+  exactPriorActive?: boolean | undefined;
+}): boolean {
+  return sharedShouldBlockSmallLotExpensiveCompletion(args);
+}
+
 function strictXuanSeedCostBlockReason(args: {
   config: XuanStrategyConfig;
   state: XuanMarketState;
@@ -8729,7 +8787,7 @@ function strictXuanSeedCostBlockReason(args: {
     args.hasVisibleOppositePath &&
     args.state.mergeHistory.length > 0 &&
     args.state.upShares + args.state.downShares <=
-      Math.max(args.config.postMergeFlatDustShares * 2, args.state.market.minOrderSize * 0.01, 0.05) + 1e-9 &&
+      xuanFreshCycleFlatDustThreshold(args.config, args.state) + 1e-9 &&
     args.secsFromOpen >= 230 &&
     args.secsFromOpen <= 245 &&
     args.seedPrice !== undefined &&
@@ -8887,7 +8945,7 @@ function isPostMergeFlatImmediatePairRecycle(args: {
   ) {
     return false;
   }
-  const flatDust = Math.max(args.config.postMergeFlatDustShares * 2, args.state.market.minOrderSize * 0.01, 0.05);
+  const flatDust = xuanFreshCycleFlatDustThreshold(args.config, args.state);
   const secsToClose =
     args.secsFromOpen !== undefined
       ? args.state.market.endTs - (args.state.market.startTs + args.secsFromOpen)
@@ -8903,11 +8961,20 @@ function isPostMergeFlatImmediatePairRecycle(args: {
     return false;
   }
   const maxRecycleQty = Math.max(args.state.market.minOrderSize, Math.min(15, configuredLadderMax));
-  const effectivePairCap = Math.min(args.config.xuanPairSweepHardCap, 1.045);
+  const effectivePairCap = Math.min(
+    args.config.xuanPairSweepHardCap,
+    Math.max(args.config.hardNewCycleCap, args.config.xuanBorderlineLateEffectivePairCap, 1.025),
+  );
+  const negativeEdgeUsdc = Math.max(0, args.referencePairCost - 1) * args.requestedSize;
+  const controlledLossBudgetUsdc = Math.max(
+    0.15,
+    Math.min(args.config.maxNegativePairEdgePerCycleUsdc, 0.3, args.requestedSize * 0.05),
+  );
   return (
     args.state.upShares + args.state.downShares <= flatDust + 1e-9 &&
     args.requestedSize <= maxRecycleQty + 1e-9 &&
-    args.referencePairCost <= effectivePairCap + 1e-9
+    args.referencePairCost <= effectivePairCap + 1e-9 &&
+    negativeEdgeUsdc <= controlledLossBudgetUsdc + 1e-9
   );
 }
 
@@ -9542,7 +9609,7 @@ function buildStagedDebtReducingFlowSeed(args: {
     !args.config.marketBasketContinuationEnabled ||
     args.ctx.secsToClose <= args.config.finalWindowCompletionOnlySec ||
     !(args.basketState.balancedButDebted || args.basketState.campaignActive) ||
-    Math.abs(args.state.upShares - args.state.downShares) > Math.max(args.config.postMergeFlatDustShares, 1e-6)
+    !xuanDustNeutralResidual(args.config, args.state)
   ) {
     return undefined;
   }

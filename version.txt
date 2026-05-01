@@ -1,6 +1,17 @@
 
 ##############################################
 
+Version : V.0.0.76
+Date    : 01.05.2026
+Author  : Ali Hakan Çakır
+Changes : - Kucuk lot XUAN completion hard-stop policy eklendi.
+          - Planned-opposite, dust-neutral entry ve stale recycle merge davranislari guncellendi.
+          - XUAN policy ve merge regresyon testleri genisletildi.
+
+##############################################
+
+##############################################
+
 Version : V.0.0.75
 Date    : 30.04.2026
 Author  : Ali Hakan Çakır

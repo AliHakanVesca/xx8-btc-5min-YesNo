@@ -2,6 +2,7 @@ import type { XuanStrategyConfig } from "../../config/strategyPresets.js";
 
 export const XUAN_STRICT_PAIR_COST_TARGET_CAP = 0.982;
 export const XUAN_STRICT_CLOSEABLE_PAIR_COST_CAP = 0.995;
+export const XUAN_STRICT_SMALL_LOT_COMPLETION_HARD_STOP_CAP = 1.06;
 export const XUAN_STRICT_PROTECTIVE_RELEASE_MIN_WAIT_SEC = 15;
 export const XUAN_STRICT_PLANNED_OPPOSITE_MIN_WAIT_SEC = 20;
 export const XUAN_STRICT_PLANNED_OPPOSITE_DEADLINE_SEC = 35;
@@ -28,6 +29,46 @@ export function strictXuanCloseablePairCostCap(config: XuanStrategyConfig): numb
   return isAggressivePublicFootprint(config)
     ? Math.max(strictXuanPairCostTargetCap(config), XUAN_STRICT_CLOSEABLE_PAIR_COST_CAP)
     : strictXuanPairCostTargetCap(config);
+}
+
+export function isXuanSmallLotAggressiveProfile(
+  config: Pick<
+    XuanStrategyConfig,
+    "botMode" | "xuanCloneMode" | "xuanCloneIntensity" | "defaultLot" | "liveSmallLotLadder"
+  >,
+): boolean {
+  if (!isAggressivePublicFootprint(config)) {
+    return false;
+  }
+  const configuredMaxLot = Math.max(0, config.defaultLot, ...config.liveSmallLotLadder);
+  return configuredMaxLot > 0 && configuredMaxLot <= 15 + 1e-9;
+}
+
+export function xuanSmallLotCompletionHardStopCap(config: XuanStrategyConfig): number {
+  return Math.max(strictXuanCloseablePairCostCap(config), XUAN_STRICT_SMALL_LOT_COMPLETION_HARD_STOP_CAP);
+}
+
+export function shouldBlockSmallLotExpensiveCompletion(args: {
+  config: XuanStrategyConfig;
+  costWithFees: number;
+  secsToClose: number;
+  oldGap: number;
+  minOrderSize: number;
+  exactPriorActive?: boolean | undefined;
+}): boolean {
+  if (!isXuanSmallLotAggressiveProfile(args.config) || args.exactPriorActive) {
+    return false;
+  }
+  if (!Number.isFinite(args.costWithFees)) {
+    return true;
+  }
+  if (args.costWithFees <= xuanSmallLotCompletionHardStopCap(args.config) + 1e-9) {
+    return false;
+  }
+  const finalEmergencyWindow =
+    args.secsToClose <= args.config.finalWindowNoChaseSec &&
+    args.oldGap >= Math.max(args.minOrderSize, args.config.repairMinQty) - 1e-9;
+  return !finalEmergencyWindow;
 }
 
 export function plannedOppositeStrictPairReleaseReady(

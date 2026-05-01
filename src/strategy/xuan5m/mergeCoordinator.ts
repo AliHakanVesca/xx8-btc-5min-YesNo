@@ -366,8 +366,23 @@ export function evaluateDelayedMergeGate(
     Math.max(0, basketEffectivePair - 1) * metrics.pendingMatchedQty <=
       Math.max(0.75, fixedFiveProfileMaxLot * 0.05) + 1e-9 &&
     args.secsToClose > Math.max(config.finalWindowCompletionOnlySec, 20);
+  const fixedFiveStaleControlledLossRelease =
+    fixedFiveQuickRecycleProfile &&
+    !exactMergePriorActive &&
+    basketEffectivePair !== undefined &&
+    basketEffectivePair > config.marketBasketMergeEffectivePairCap + 1e-9 &&
+    metrics.completedCycles >= 1 &&
+    metrics.pendingMatchedQty >= state.market.minOrderSize - 1e-9 &&
+    metrics.pendingMatchedQty <= fixedFiveProfileMaxLot + Math.max(1, state.market.minOrderSize * 0.1) + 1e-9 &&
+    metrics.oldestMatchedAgeSec !== undefined &&
+    metrics.oldestMatchedAgeSec >= Math.max(15, config.xuanRhythmMaxWaitSec) - 1e-9 &&
+    Math.max(0, basketEffectivePair - 1) * metrics.pendingMatchedQty <=
+      Math.max(1.25, fixedFiveProfileMaxLot * 0.35) + 1e-9 &&
+    args.secsToClose > Math.max(config.finalWindowCompletionOnlySec, 30);
   const shouldHoldNegativeEconomics =
-    aggressiveNormalRecycleNegativeEconomicsHold && !fixedFiveQuickRecycleLossRelease;
+    aggressiveNormalRecycleNegativeEconomicsHold &&
+    !fixedFiveQuickRecycleLossRelease &&
+    !fixedFiveStaleControlledLossRelease;
   const negativeEconomicsHoldDecision = (): MergeGateDecision => ({
     allow: false,
     forced: false,
@@ -382,7 +397,8 @@ export function evaluateDelayedMergeGate(
       basketEffectivePair === undefined ||
       basketEffectivePair <= config.marketBasketMergeEffectivePairCap + 1e-9 ||
       basketRawEconomicsPositive ||
-      fixedFiveQuickRecycleLossRelease;
+      fixedFiveQuickRecycleLossRelease ||
+      fixedFiveStaleControlledLossRelease;
     if (!immediateMergeEconomicsSafe && !finalResidualMergeWindow) {
       return negativeEconomicsHoldDecision();
     }
@@ -535,7 +551,8 @@ export function evaluateDelayedMergeGate(
   const aggressivePostMergeCycleEconomicsSafe =
     basketEffectivePair === undefined ||
     basketEffectivePair <= config.marketBasketMergeEffectivePairCap + 1e-9 ||
-    fixedFiveQuickRecycleLossRelease;
+    fixedFiveQuickRecycleLossRelease ||
+    fixedFiveStaleControlledLossRelease;
   if (aggressivePostMergeCycleReleaseCandidate && !aggressivePostMergeCycleEconomicsSafe) {
     return negativeEconomicsHoldDecision();
   }

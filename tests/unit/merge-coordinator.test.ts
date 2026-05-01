@@ -1002,6 +1002,73 @@ describe("merge coordinator", () => {
     expect(gate.basketEffectivePair).toBeGreaterThan(1);
   });
 
+  it("releases a stale fixed 15/15 negative basket as a controlled loss so recycle is not locked", () => {
+    const config = buildConfig({
+      BOT_MODE: "XUAN",
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+      XUAN_BASE_LOT_LADDER: "15",
+      LIVE_SMALL_LOT_LADDER: "15",
+      MARKET_BASKET_MIN_MERGE_SHARES: "15",
+      MARKET_BASKET_MERGE_EFFECTIVE_PAIR_CAP: "1",
+    });
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      price: 0.48,
+      size: 15,
+      timestamp: market.startTs,
+      makerTaker: "taker",
+    });
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.49,
+      size: 15,
+      timestamp: market.startTs + 1,
+      makerTaker: "taker",
+    });
+    state = applyMerge(state, {
+      amount: 15,
+      timestamp: market.startTs + 160,
+      simulated: true,
+    });
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      price: 0.73,
+      size: 15,
+      timestamp: market.startTs + 185,
+      makerTaker: "taker",
+      executionMode: "TEMPORAL_SINGLE_LEG_SEED",
+    });
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.55,
+      size: 15,
+      timestamp: market.startTs + 188,
+      makerTaker: "taker",
+      executionMode: "PARTIAL_FAST_COMPLETION",
+    });
+    let tracker = createMergeBatchTracker();
+    tracker = syncMergeBatchTracker(tracker, 15, market.startTs + 188);
+
+    const gate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 220,
+      secsFromOpen: 220,
+      secsToClose: 80,
+      usdcBalance: 100,
+      tracker,
+    });
+
+    expect(gate.allow).toBe(true);
+    expect(gate.reason).toBe("cycle_target");
+    expect(gate.basketEffectivePair).toBeGreaterThan(1);
+  });
+
   it("does not let the first family merge window release a post-merge negative age-target recycle", () => {
     const config = buildConfig({
       BOT_MODE: "XUAN",

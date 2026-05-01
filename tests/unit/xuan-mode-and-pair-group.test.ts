@@ -8929,6 +8929,144 @@ describe("xuan mode and pair order groups", () => {
     expect(evaluation.trace.skipReason).not.toBe("xuan_strict_micro_reentry_disabled");
   });
 
+  it("ignores post-merge overfill dust and opens a two-child controlled recycle pair", () => {
+    const market = buildOfflineMarket(1777626000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      size: 15,
+      price: 0.49,
+      timestamp: market.startTs + 5,
+      makerTaker: "taker",
+      executionMode: "PAIRGROUP_COVERED_SEED",
+    });
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 17.25,
+      price: 0.46,
+      timestamp: market.startTs + 114,
+      makerTaker: "taker",
+      executionMode: "PARTIAL_SOFT_COMPLETION",
+    });
+    state = applyMerge(state, {
+      amount: 14.99,
+      timestamp: market.startTs + 142,
+      simulated: true,
+    });
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.87, size: 200 }], [{ price: 0.88, size: 200 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.11, size: 200 }], [{ price: 0.12, size: 200 }]),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+        LIVE_SMALL_LOT_LADDER: "5,10,15",
+        XUAN_BASE_LOT_LADDER: "5,10,15",
+        DEFAULT_LOT: "15",
+        MARKET_BASKET_MIN_MERGE_SHARES: "15",
+        MARKET_BASKET_BOOTSTRAP_ENABLED: "false",
+        COVERED_SEED_REQUIRES_FAIR_VALUE: "false",
+        SINGLE_LEG_FAIR_VALUE_VETO: "false",
+        MAX_NEGATIVE_PAIR_EDGE_PER_CYCLE_USDC: "0.3",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 232,
+        secsToClose: 68,
+        lot: 15,
+        fairValueSnapshot: {
+          status: "valid",
+          estimatedThreshold: false,
+          fairUp: 0.5,
+          fairDown: 0.5,
+        },
+      },
+    );
+
+    expect(state.upShares).toBeCloseTo(2.26, 6);
+    expect(state.downShares).toBeCloseTo(0.01, 6);
+    expect(evaluation.decisions.map((decision) => decision.side).sort()).toEqual(["DOWN", "UP"]);
+    expect(evaluation.decisions.every((decision) => decision.size <= 15)).toBe(true);
+    expect(evaluation.decisions.every((decision) =>
+      decision.mode === "XUAN_HARD_PAIR_SWEEP" || decision.mode === "XUAN_SOFT_PAIR_SWEEP",
+    )).toBe(true);
+    expect(evaluation.trace.selectedMode).not.toBe("PAIRGROUP_COVERED_SEED");
+    expect(evaluation.trace.skipReason).not.toBe("pair_cap+single_leg_seed");
+    expect(evaluation.trace.skipReason).not.toBe("high_low_effective_not_debt_reducing");
+  });
+
+  it("keeps post-merge controlled recycle closed when the pair loss exceeds the bounded budget", () => {
+    const market = buildOfflineMarket(1777626000);
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      size: 15,
+      price: 0.49,
+      timestamp: market.startTs + 5,
+      makerTaker: "taker",
+      executionMode: "PAIRGROUP_COVERED_SEED",
+    });
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      size: 17.25,
+      price: 0.46,
+      timestamp: market.startTs + 114,
+      makerTaker: "taker",
+      executionMode: "PARTIAL_SOFT_COMPLETION",
+    });
+    state = applyMerge(state, {
+      amount: 14.99,
+      timestamp: market.startTs + 142,
+      simulated: true,
+    });
+
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.49, size: 200 }], [{ price: 0.5, size: 200 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.53, size: 200 }], [{ price: 0.54, size: 200 }]),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+        LIVE_SMALL_LOT_LADDER: "5,10,15",
+        XUAN_BASE_LOT_LADDER: "5,10,15",
+        DEFAULT_LOT: "15",
+        MARKET_BASKET_MIN_MERGE_SHARES: "15",
+        MARKET_BASKET_BOOTSTRAP_ENABLED: "false",
+        COVERED_SEED_REQUIRES_FAIR_VALUE: "false",
+        SINGLE_LEG_FAIR_VALUE_VETO: "false",
+        MAX_NEGATIVE_PAIR_EDGE_PER_CYCLE_USDC: "0.3",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 232,
+        secsToClose: 68,
+        lot: 15,
+        fairValueSnapshot: {
+          status: "valid",
+          estimatedThreshold: false,
+          fairUp: 0.5,
+          fairDown: 0.5,
+        },
+      },
+    );
+
+    expect(evaluation.decisions).toHaveLength(0);
+    expect(evaluation.trace.candidates?.some((candidate) => candidate.verdict === "ok")).not.toBe(true);
+  });
+
   it("blocks small post-merge paired recycle in the final seconds even when both legs are immediately fillable", () => {
     const market = buildOfflineMarket(1713696000);
     let state = createMarketState(market);

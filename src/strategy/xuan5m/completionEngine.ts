@@ -50,6 +50,7 @@ import {
   plannedOppositeMinWaitSec as sharedPlannedOppositeMinWaitSec,
   plannedOppositeProtectiveReleaseReady as sharedPlannedOppositeProtectiveReleaseReady,
   plannedOppositeTargetReleaseReady as sharedPlannedOppositeTargetReleaseReady,
+  shouldBlockSmallLotExpensiveCompletion as sharedShouldBlockSmallLotExpensiveCompletion,
   strictXuanCloseablePairCostCap as sharedStrictXuanCloseablePairCostCap,
   strictXuanPairCostTargetCap as sharedStrictXuanPairCostTargetCap,
   xuanPairCostImprovesOrMeetsTarget as sharedXuanPairCostImprovesOrMeetsTarget,
@@ -190,6 +191,17 @@ function strictXuanPairCostTargetCap(config: XuanStrategyConfig): number {
 
 function strictXuanCloseablePairCostCap(config: XuanStrategyConfig): number {
   return sharedStrictXuanCloseablePairCostCap(config);
+}
+
+function shouldBlockSmallLotExpensiveCompletion(args: {
+  config: XuanStrategyConfig;
+  costWithFees: number;
+  secsToClose: number;
+  oldGap: number;
+  minOrderSize: number;
+  exactPriorActive?: boolean | undefined;
+}): boolean {
+  return sharedShouldBlockSmallLotExpensiveCompletion(args);
 }
 
 function xuanPairCostImprovesOrMeetsTarget(
@@ -925,6 +937,18 @@ function chooseCompletion(
           postMergeFinalCarryCompletionAllowed ||
           (plannedOppositePriceTargetMet && (xuanCostDisciplinedCompletion || xuanCloseablePlannedOppositeCompletion))
         : costWithFees <= 1.025 + 1e-9);
+    if (
+      shouldBlockSmallLotExpensiveCompletion({
+        config,
+        costWithFees,
+        secsToClose: ctx.secsToClose,
+        oldGap,
+        minOrderSize: state.market.minOrderSize,
+        exactPriorActive: Boolean(exactCompletionQtyPrior),
+      })
+    ) {
+      continue;
+    }
     const plannedOppositeDebtReducing =
       plannedOppositeCandidate &&
       costWithFees <= strictXuanPairCostTargetCap(config) + 1e-9;

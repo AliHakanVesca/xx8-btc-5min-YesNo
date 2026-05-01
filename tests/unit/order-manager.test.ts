@@ -119,4 +119,44 @@ describe("order manager exact-size taker buys", () => {
       },
     ]);
   });
+
+  it("snaps exact-size FAK buys onto a CLOB-valid cent maker grid", async () => {
+    const captures = { limit: [] as LimitOrderArgs[], market: [] as MarketOrderArgs[] };
+    const manager = new OrderManager(adapter(captures));
+
+    await manager.placeMarketOrder({
+      tokenId: "token-up",
+      side: "BUY",
+      price: 0.65,
+      amount: 4.87,
+      shareTarget: 7.5,
+      orderType: "FAK",
+    });
+    await manager.placeMarketOrder({
+      tokenId: "token-down",
+      side: "BUY",
+      price: 0.23,
+      amount: 3.5,
+      shareTarget: 15.223878,
+      orderType: "FAK",
+    });
+    await manager.placeMarketOrder({
+      tokenId: "token-up",
+      side: "BUY",
+      price: 0.41,
+      amount: 5.96,
+      shareTarget: 14.535716,
+      orderType: "FAK",
+    });
+
+    expect(captures.market).toHaveLength(0);
+    expect(captures.limit.map((order) => ({ price: order.price, size: order.size }))).toEqual([
+      { price: 0.65, size: 7.4 },
+      { price: 0.23, size: 15 },
+      { price: 0.41, size: 14 },
+    ]);
+    for (const order of captures.limit) {
+      expect(Number.isInteger(Number((order.price * order.size * 100).toFixed(6)))).toBe(true);
+    }
+  });
 });

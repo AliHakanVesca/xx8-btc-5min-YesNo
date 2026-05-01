@@ -86,7 +86,7 @@ describe("live order sizing", () => {
     expect(result.order?.shareTarget).toBe(5);
   });
 
-  it("keeps share-targeted completion buys exact-size instead of bridging through market-buy notional", () => {
+  it("bridges share-targeted completion buys to the CLOB one-dollar notional floor when overshoot is bounded", () => {
     const result = fitBuyOrderToUsdcBalance(
       buyOrder({
         price: 0.06,
@@ -98,19 +98,20 @@ describe("live order sizing", () => {
         minOrderSize: 5,
         sizeLadder: [15],
         allowMinMarketBuyAmountBridge: true,
+        enforceMinMarketBuyAmountForExactShareTarget: true,
         maxMinMarketBuyAmountBridgeOvershootShares: 3.75,
       },
     );
 
     expect(result.skipped).toBe(false);
-    expect(result.adjusted).toBe(false);
-    expect(result.reason).toBe("fits_balance");
+    expect(result.adjusted).toBe(true);
+    expect(result.reason).toBe("bridged_to_min_market_buy_amount");
     expect(result.requestedShares).toBe(15);
-    expect(result.order?.amount).toBe(0.9);
-    expect(result.order?.shareTarget).toBe(15);
+    expect(result.order?.amount).toBe(1.02);
+    expect(result.order?.shareTarget).toBe(17);
   });
 
-  it("does not bridge very cheap exact-size completion buys into oversized market-buy exposure", () => {
+  it("does not submit very cheap exact-size completion buys when min-notional bridge would overshoot too much", () => {
     const result = fitBuyOrderToUsdcBalance(
       buyOrder({
         price: 0.01,
@@ -122,15 +123,60 @@ describe("live order sizing", () => {
         minOrderSize: 5,
         sizeLadder: [15],
         allowMinMarketBuyAmountBridge: true,
+        enforceMinMarketBuyAmountForExactShareTarget: true,
+        maxMinMarketBuyAmountBridgeOvershootShares: 3.75,
+      },
+    );
+
+    expect(result.skipped).toBe(true);
+    expect(result.adjusted).toBe(false);
+    expect(result.reason).toBe("below_min_market_buy_amount");
+    expect(result.order).toBeUndefined();
+  });
+
+  it("blocks the live 11.5 share at 4 cent completion instead of sending a sub-dollar CLOB order", () => {
+    const result = fitBuyOrderToUsdcBalance(
+      buyOrder({
+        price: 0.04,
+        amount: 0.46,
+        shareTarget: 11.5,
+      }),
+      {
+        usdcBalance: 10,
+        minOrderSize: 5,
+        sizeLadder: [15],
+        allowMinMarketBuyAmountBridge: true,
+        enforceMinMarketBuyAmountForExactShareTarget: true,
+        maxMinMarketBuyAmountBridgeOvershootShares: 3.75,
+      },
+    );
+
+    expect(result.skipped).toBe(true);
+    expect(result.reason).toBe("below_min_market_buy_amount");
+    expect(result.order).toBeUndefined();
+  });
+
+  it("allows a cheap completion bridge when the one-dollar floor only adds a small clip", () => {
+    const result = fitBuyOrderToUsdcBalance(
+      buyOrder({
+        price: 0.08,
+        amount: 0.92,
+        shareTarget: 11.5,
+      }),
+      {
+        usdcBalance: 10,
+        minOrderSize: 5,
+        sizeLadder: [15],
+        allowMinMarketBuyAmountBridge: true,
+        enforceMinMarketBuyAmountForExactShareTarget: true,
         maxMinMarketBuyAmountBridgeOvershootShares: 3.75,
       },
     );
 
     expect(result.skipped).toBe(false);
-    expect(result.adjusted).toBe(false);
-    expect(result.reason).toBe("fits_balance");
-    expect(result.order?.amount).toBe(0.15);
-    expect(result.order?.shareTarget).toBe(15);
+    expect(result.reason).toBe("bridged_to_min_market_buy_amount");
+    expect(result.order?.amount).toBe(1);
+    expect(result.order?.shareTarget).toBe(12.5);
   });
 
   it("skips residual BUY orders below the market minimum share size before submit", () => {
@@ -192,6 +238,23 @@ describe("live order sizing", () => {
 
     expect(orders).toHaveLength(1);
     expect(orders[0]?.shareTarget).toBe(20);
+  });
+
+  it("does not keep planning pair children after an exact-share child violates the CLOB notional floor", () => {
+    const orders = assignAffordableSequentialUsdcBalances(
+      [
+        buyOrder({ price: 0.04, amount: 0.46, shareTarget: 11.5 }),
+        buyOrder({ price: 0.95, amount: 14.25, shareTarget: 15 }),
+      ],
+      {
+        usdcBalance: 100,
+        minOrderSize: 5,
+        sizeLadder: [15],
+        enforceMinMarketBuyAmountForExactShareTarget: true,
+      },
+    );
+
+    expect(orders).toHaveLength(0);
   });
 
   it("extracts CLOB insufficient-balance micro-USDC from nested error payloads", () => {

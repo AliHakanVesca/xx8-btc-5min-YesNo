@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { parseEnv } from "../../src/config/env.js";
 import { buildStrategyConfig } from "../../src/config/strategyPresets.js";
 import { buildOfflineMarket } from "../../src/infra/gamma/marketDiscovery.js";
+import { OrderBookState } from "../../src/strategy/xuan5m/orderBookState.js";
 import { applyFill } from "../../src/strategy/xuan5m/inventoryState.js";
 import { createMarketState } from "../../src/strategy/xuan5m/marketState.js";
 import {
@@ -11,11 +12,14 @@ import {
   clampEntryRepairBuyDecision,
   clampMergeAmountToObservedBalances,
   botFillAccountingKey,
+  botFillAccountingFingerprintKey,
   deriveRuntimeFlowCalibrationBias,
   deriveRuntimeFlowBudgetState,
   deriveArbitrationCarryExpiry,
   deriveCarryFlowConfidence,
   detectOrderResultShareOverfill,
+  estimateMarketBuyTakingSharesForOrder,
+  evaluateSingleLegSeedClosePath,
   expectedSharesForSubmission,
   deriveConfirmedCarryAlignmentStreak,
   applyImmediateOrderResultFill,
@@ -56,7 +60,153 @@ function buildConfig(overrides: Record<string, string> = {}) {
   );
 }
 
+function booksWithAsks(upAsk: number, downAsk: number): OrderBookState {
+  return new OrderBookState(
+    {
+      market: "up",
+      assetId: "up-token",
+      timestamp: 0,
+      bids: [],
+      asks: [{ price: upAsk, size: 1_000 }],
+      tickSize: 0.01,
+      minOrderSize: 5,
+      negRisk: false,
+    },
+    {
+      market: "down",
+      assetId: "down-token",
+      timestamp: 0,
+      bids: [],
+      asks: [{ price: downAsk, size: 1_000 }],
+      tickSize: 0.01,
+      minOrderSize: 5,
+      negRisk: false,
+    },
+  );
+}
+
+function booksWithAskLevels(
+  upAsks: Array<{ price: number; size: number }>,
+  downAsks: Array<{ price: number; size: number }>,
+): OrderBookState {
+  return new OrderBookState(
+    {
+      market: "up",
+      assetId: "up-token",
+      timestamp: 0,
+      bids: [],
+      asks: upAsks,
+      tickSize: 0.01,
+      minOrderSize: 5,
+      negRisk: false,
+    },
+    {
+      market: "down",
+      assetId: "down-token",
+      timestamp: 0,
+      bids: [],
+      asks: downAsks,
+      tickSize: 0.01,
+      minOrderSize: 5,
+      negRisk: false,
+    },
+  );
+}
+
 describe("stateful bot session helpers", () => {
+  it("blocks strict Xuan re-entry when the planned opposite completion cannot clear CLOB min-notional safely", () => {
+    const config = buildConfig({
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      LIVE_SMALL_LOT_LADDER: "15",
+      XUAN_BASE_LOT_LADDER: "15",
+      DEFAULT_LOT: "15",
+      MAX_COMPLETION_OVERSHOOT_SHARES: "0.5",
+    });
+    const state = createMarketState(buildOfflineMarket(1713696000));
+    state.downShares = 3.5;
+    state.downCost = 0.14;
+
+    const evaluation = evaluateSingleLegSeedClosePath({
+      config,
+      state,
+      books: booksWithAsks(0.95, 0.04),
+      usdcBalance: 100,
+      entryBuy: {
+        side: "UP",
+        size: 15,
+        mode: "PAIRGROUP_COVERED_SEED",
+        order: {
+          tokenId: state.market.tokens.UP.tokenId,
+          side: "BUY",
+          price: 0.95,
+          amount: 14.25,
+          shareTarget: 15,
+          orderType: "FAK",
+        },
+      },
+    });
+
+    expect(evaluation.block).toBe(true);
+    expect(evaluation.reason).toBe("below_min_market_buy_amount");
+    expect(evaluation.projectedMissingShares).toBe(11.5);
+    expect(evaluation.oppositeSide).toBe("DOWN");
+  });
+
+  it("allows strict Xuan re-entry when the planned opposite completion can bridge min-notional with bounded overshoot", () => {
+    const config = buildConfig({
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      LIVE_SMALL_LOT_LADDER: "15",
+      XUAN_BASE_LOT_LADDER: "15",
+      DEFAULT_LOT: "15",
+      MAX_COMPLETION_OVERSHOOT_SHARES: "0.5",
+    });
+    const state = createMarketState(buildOfflineMarket(1713696000));
+    state.downShares = 3.5;
+    state.downCost = 0.28;
+
+    const evaluation = evaluateSingleLegSeedClosePath({
+      config,
+      state,
+      books: booksWithAsks(0.92, 0.08),
+      usdcBalance: 100,
+      entryBuy: {
+        side: "UP",
+        size: 15,
+        mode: "PAIRGROUP_COVERED_SEED",
+        order: {
+          tokenId: state.market.tokens.UP.tokenId,
+          side: "BUY",
+          price: 0.92,
+          amount: 13.8,
+          shareTarget: 15,
+          orderType: "FAK",
+        },
+      },
+    });
+
+    expect(evaluation.block).toBe(false);
+    expect(evaluation.reason).toBe("opposite_completion_executable");
+    expect(evaluation.finalShares).toBe(12.5);
+  });
+
+  it("detects bridge completion raw-fill overrun risk from executable book depth", () => {
+    const market = buildOfflineMarket(1713696000);
+    const estimatedTakingShares = estimateMarketBuyTakingSharesForOrder({
+      outcome: "UP",
+      books: booksWithAskLevels([{ price: 0.05, size: 1_000 }], [{ price: 0.96, size: 1_000 }]),
+      order: {
+        tokenId: market.tokens.UP.tokenId,
+        side: "BUY",
+        price: 0.06,
+        amount: 1.02,
+        shareTarget: 17,
+        orderType: "FAK",
+      },
+    });
+
+    expect(estimatedTakingShares).toBe(20.4);
+  });
+
   it("counts duration from market open when the selected market has not started yet", () => {
     expect(
       resolveSessionTradingDeadline({
@@ -719,7 +869,7 @@ describe("stateful bot session helpers", () => {
       MAX_COMPLETION_OVERSHOOT_SHARES: "0.25",
     });
 
-    expect(orderResultOverfillDustThreshold({ config, minOrderSize: 5, shareTarget: 15 })).toBe(2.5);
+    expect(orderResultOverfillDustThreshold({ config, minOrderSize: 5, shareTarget: 15 })).toBe(5);
     expect(
       isNonBlockingOrderResultOverfillDust({
         config,
@@ -736,7 +886,17 @@ describe("stateful bot session helpers", () => {
         minOrderSize: 5,
         overfill: {
           shareTarget: 15,
-          excessShares: 2.857141,
+          excessShares: 3.333332,
+        },
+      }),
+    ).toBe(true);
+    expect(
+      isNonBlockingOrderResultOverfillDust({
+        config,
+        minOrderSize: 5,
+        overfill: {
+          shareTarget: 15,
+          excessShares: 5.1,
         },
       }),
     ).toBe(false);
@@ -807,6 +967,25 @@ describe("stateful bot session helpers", () => {
         { orderId: "same-order" },
       ),
     ).toBe("order:same-order:UP:BUY");
+  });
+
+  it("builds a fallback fill accounting fingerprint when the user websocket has no order id", () => {
+    const fill = {
+      outcome: "DOWN" as const,
+      side: "BUY" as const,
+      price: 0.25,
+      size: 15.2,
+      timestamp: 1777581418,
+    };
+
+    expect(botFillAccountingKey(fill, { orderId: undefined })).toBeUndefined();
+    expect(botFillAccountingFingerprintKey(fill)).toBe("fill:DOWN:BUY:15.2000:0.2500:888790709");
+    expect(
+      botFillAccountingFingerprintKey({
+        ...fill,
+        timestamp: 1777581419,
+      }),
+    ).toBe("fill:DOWN:BUY:15.2000:0.2500:888790709");
   });
 
   it("does not register submitted fill intents for rejected child orders", () => {
@@ -955,6 +1134,40 @@ describe("stateful bot session helpers", () => {
     expect(clamped.entryBuy.size).toBe(5);
     expect(clamped.entryBuy.order.shareTarget).toBe(5);
     expect(clamped.entryBuy.order.amount).toBe(1.2);
+  });
+
+  it("preserves CLOB precision when entry repair clamps a fractional completion quantity", () => {
+    const market = buildOfflineMarket(1713696000);
+    const clamped = clampEntryRepairBuyDecision({
+      minOrderSize: 5,
+      entryTrace: {
+        repairRequestedQty: 14.535716,
+        repairSize: 14.535716,
+        repairFinalQty: 14.535716,
+      },
+      entryBuy: {
+        side: "UP",
+        size: 15,
+        reason: "lagging_rebalance",
+        mode: "HIGH_LOW_COMPLETION_CHASE",
+        expectedAveragePrice: 0.41,
+        effectivePricePerShare: 0.41,
+        order: {
+          tokenId: market.tokens.UP.tokenId,
+          side: "BUY",
+          price: 0.41,
+          amount: 6.15,
+          shareTarget: 15,
+          orderType: "FAK",
+        },
+      },
+    });
+
+    expect(clamped.clamped).toBe(true);
+    expect(clamped.entryBuy.size).toBe(14);
+    expect(clamped.entryBuy.order.shareTarget).toBe(14);
+    expect(clamped.entryBuy.order.amount).toBe(5.74);
+    expect(Number.isInteger(Number((clamped.entryBuy.order.shareTarget! * 0.41 * 100).toFixed(6)))).toBe(true);
   });
 
   it("applies matched entry repair order results to state immediately", () => {

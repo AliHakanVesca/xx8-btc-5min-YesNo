@@ -52,6 +52,10 @@ import {
   syncMergeBatchTracker,
 } from "../strategy/xuan5m/mergeCoordinator.js";
 import {
+  shouldBlockSmallLotExpensiveCompletion,
+  xuanSmallLotCompletionHardStopCap,
+} from "../strategy/xuan5m/xuanStrictPlannedOppositePolicy.js";
+import {
   classifyFlowPressureBudget,
   classifyResidualSeverity,
   deriveFlowPressureBudget,
@@ -1758,11 +1762,12 @@ export function clampEntryRepairBuyDecision(args: {
     if (missingToMinimum > maxOvershoot + 1e-9) {
       return { entryBuy: args.entryBuy, clamped: false };
     }
+    const resizedOrder = resizeMarketBuyOrderShareTarget(args.entryBuy.order, args.minOrderSize);
     return {
       entryBuy: {
         ...args.entryBuy,
-        size: normalizePositiveShares(Math.max(args.entryBuy.size, args.minOrderSize)),
-        order: resizeMarketBuyOrderShareTarget(args.entryBuy.order, args.minOrderSize),
+        size: normalizePositiveShares(resizedOrder.shareTarget ?? Math.max(args.entryBuy.size, args.minOrderSize)),
+        order: resizedOrder,
       },
       clamped: true,
       capShares: normalizePositiveShares(args.minOrderSize),
@@ -1774,11 +1779,12 @@ export function clampEntryRepairBuyDecision(args: {
     return { entryBuy: args.entryBuy, clamped: false, capShares, originalShares };
   }
 
+  const resizedOrder = resizeMarketBuyOrderShareTarget(args.entryBuy.order, capShares);
   return {
     entryBuy: {
       ...args.entryBuy,
-      size: normalizePositiveShares(Math.min(args.entryBuy.size, capShares)),
-      order: resizeMarketBuyOrderShareTarget(args.entryBuy.order, capShares),
+      size: normalizePositiveShares(resizedOrder.shareTarget ?? Math.min(args.entryBuy.size, capShares)),
+      order: resizedOrder,
     },
     clamped: true,
     capShares,
@@ -2492,7 +2498,7 @@ export function orderResultOverfillDustThreshold(args: {
   return normalizeShares(
     Math.max(
       args.config.maxCompletionOvershootShares,
-      Math.max(0, args.minOrderSize) * 0.5,
+      Math.max(0, args.minOrderSize),
       Math.max(0, args.shareTarget) * 0.1,
     ),
   );
@@ -2800,8 +2806,220 @@ function fitCompletionOrderToAvailableUsdcBalance(
     minOrderSize,
     sizeLadder: liveOrderSizeLadder(config, minOrderSize),
     allowMinMarketBuyAmountBridge: true,
+    enforceMinMarketBuyAmountForExactShareTarget: true,
     maxMinMarketBuyAmountBridgeOvershootShares: completionMinNotionalBridgeMaxOvershootShares(config, minOrderSize),
   });
+}
+
+function executableAskLevelsForMarketBuy(
+  books: OrderBookState,
+  outcome: OutcomeSide,
+): Array<{ price: number; size: number }> {
+  const directAsks = outcome === "UP" ? books.up?.asks ?? [] : books.down?.asks ?? [];
+  const rawLevels =
+    directAsks.length > 0
+      ? directAsks
+      : (outcome === "UP" ? books.down?.bids ?? [] : books.up?.bids ?? []).map((level) => ({
+          price: Math.max(0, Math.min(1, 1 - level.price)),
+          size: level.size,
+        }));
+  return rawLevels
+    .filter((level) => Number.isFinite(level.price) && level.price > 0 && Number.isFinite(level.size) && level.size > 0)
+    .sort((left, right) => left.price - right.price);
+}
+
+export function estimateMarketBuyTakingSharesForOrder(args: {
+  order: MarketOrderArgs;
+  outcome: OutcomeSide;
+  books: OrderBookState;
+}): number | undefined {
+  if (
+    args.order.side !== "BUY" ||
+    args.order.price === undefined ||
+    !Number.isFinite(args.order.price) ||
+    args.order.price <= 0 ||
+    !Number.isFinite(args.order.amount) ||
+    args.order.amount <= 0
+  ) {
+    return undefined;
+  }
+
+  let remainingAmount = args.order.amount;
+  let estimatedShares = 0;
+  for (const level of executableAskLevelsForMarketBuy(args.books, args.outcome)) {
+    if (remainingAmount <= 1e-9) {
+      break;
+    }
+    if (level.price > args.order.price + 1e-9) {
+      break;
+    }
+    const spendAtLevel = Math.min(remainingAmount, level.size * level.price);
+    if (spendAtLevel <= 0) {
+      continue;
+    }
+    estimatedShares += spendAtLevel / level.price;
+    remainingAmount -= spendAtLevel;
+  }
+
+  return estimatedShares > 0 ? normalizeShares(estimatedShares) : undefined;
+}
+
+function bridgeOrderOverfillRisk(args: {
+  order: MarketOrderArgs;
+  outcome: OutcomeSide;
+  books: OrderBookState;
+  config: XuanStrategyConfig;
+}):
+  | {
+      estimatedTakingShares: number;
+      shareTarget: number;
+      excessShares: number;
+      maxAllowedExcessShares: number;
+    }
+  | undefined {
+  if (
+    args.order.shareTarget === undefined ||
+    !Number.isFinite(args.order.shareTarget) ||
+    args.order.shareTarget <= 0
+  ) {
+    return undefined;
+  }
+  const estimatedTakingShares = estimateMarketBuyTakingSharesForOrder(args);
+  if (estimatedTakingShares === undefined) {
+    return undefined;
+  }
+  const shareTarget = normalizeShares(args.order.shareTarget);
+  const maxAllowedExcessShares = normalizeShares(Math.max(0, args.config.maxCompletionOvershootShares));
+  if (estimatedTakingShares <= shareTarget + maxAllowedExcessShares + 1e-9) {
+    return undefined;
+  }
+  return {
+    estimatedTakingShares,
+    shareTarget,
+    excessShares: normalizeShares(estimatedTakingShares - shareTarget),
+    maxAllowedExcessShares,
+  };
+}
+
+export interface SingleLegSeedClosePathEvaluation {
+  block: boolean;
+  reason:
+    | "not_strict_xuan_single_leg_seed"
+    | "no_projected_gap"
+    | "missing_opposite_price"
+    | "opposite_completion_executable"
+    | "opposite_completion_overfill_risk"
+    | ReturnType<typeof fitBuyOrderToUsdcBalance>["reason"];
+  oppositeSide?: OutcomeSide | undefined;
+  oppositePrice?: number | undefined;
+  projectedMissingShares?: number | undefined;
+  requestedShares?: number | undefined;
+  finalShares?: number | undefined;
+  maxAffordableShares?: number | undefined;
+  estimatedTakingShares?: number | undefined;
+  maxAllowedExcessShares?: number | undefined;
+}
+
+function strictXuanSingleLegSeedMode(mode: StrategyExecutionMode): boolean {
+  return mode === "TEMPORAL_SINGLE_LEG_SEED" || mode === "PAIRGROUP_COVERED_SEED";
+}
+
+export function evaluateSingleLegSeedClosePath(args: {
+  entryBuy: Pick<EntryBuyDecision, "mode" | "order" | "side" | "size">;
+  state: XuanMarketState;
+  books: OrderBookState;
+  config: XuanStrategyConfig;
+  usdcBalance?: number | undefined;
+}): SingleLegSeedClosePathEvaluation {
+  if (
+    args.config.botMode !== "XUAN" ||
+    args.config.xuanCloneMode !== "PUBLIC_FOOTPRINT" ||
+    !strictXuanSingleLegSeedMode(args.entryBuy.mode)
+  ) {
+    return { block: false, reason: "not_strict_xuan_single_leg_seed" };
+  }
+
+  const minOrderSize = args.state.market.minOrderSize;
+  const seedShares = normalizeShares(args.entryBuy.order.shareTarget ?? args.entryBuy.size);
+  const projectedUp = normalizeShares(args.state.upShares + (args.entryBuy.side === "UP" ? seedShares : 0));
+  const projectedDown = normalizeShares(args.state.downShares + (args.entryBuy.side === "DOWN" ? seedShares : 0));
+  const projectedMissingShares = normalizeShares(
+    args.entryBuy.side === "UP"
+      ? Math.max(0, projectedUp - projectedDown)
+      : Math.max(0, projectedDown - projectedUp),
+  );
+  if (projectedMissingShares < minOrderSize - 1e-9) {
+    return {
+      block: false,
+      reason: "no_projected_gap",
+      projectedMissingShares,
+      requestedShares: seedShares,
+    };
+  }
+
+  const oppositeSide: OutcomeSide = args.entryBuy.side === "UP" ? "DOWN" : "UP";
+  const oppositePrice = args.books.bestAsk(oppositeSide);
+  if (!Number.isFinite(oppositePrice) || oppositePrice <= 0 || oppositePrice >= 1 - 1e-9) {
+    return {
+      block: true,
+      reason: "missing_opposite_price",
+      oppositeSide,
+      oppositePrice,
+      projectedMissingShares,
+      requestedShares: seedShares,
+    };
+  }
+
+  const probeBalance =
+    args.usdcBalance !== undefined && Number.isFinite(args.usdcBalance) && args.usdcBalance > 0
+      ? args.usdcBalance
+      : 1_000_000;
+  const probeOrder = normalizeExecutableBuyOrder({
+    tokenId: args.state.market.tokens[oppositeSide].tokenId,
+    side: "BUY",
+    price: oppositePrice,
+    amount: normalizeShares(projectedMissingShares * oppositePrice),
+    shareTarget: projectedMissingShares,
+    orderType: "FAK",
+  });
+  const completionSizing = fitCompletionOrderToAvailableUsdcBalance(
+    probeOrder,
+    probeBalance,
+    args.config,
+    minOrderSize,
+  );
+  if (completionSizing.order && completionSizing.reason === "bridged_to_min_market_buy_amount") {
+    const overfillRisk = bridgeOrderOverfillRisk({
+      order: completionSizing.order,
+      outcome: oppositeSide,
+      books: args.books,
+      config: args.config,
+    });
+    if (overfillRisk) {
+      return {
+        block: true,
+        reason: "opposite_completion_overfill_risk",
+        oppositeSide,
+        oppositePrice,
+        projectedMissingShares,
+        requestedShares: completionSizing.requestedShares ?? projectedMissingShares,
+        finalShares: completionSizing.finalShares,
+        maxAffordableShares: completionSizing.maxAffordableShares,
+        estimatedTakingShares: overfillRisk.estimatedTakingShares,
+        maxAllowedExcessShares: overfillRisk.maxAllowedExcessShares,
+      };
+    }
+  }
+  return {
+    block: !completionSizing.order,
+    reason: completionSizing.order ? "opposite_completion_executable" : completionSizing.reason,
+    oppositeSide,
+    oppositePrice,
+    projectedMissingShares,
+    requestedShares: completionSizing.requestedShares ?? projectedMissingShares,
+    finalShares: completionSizing.finalShares,
+    maxAffordableShares: completionSizing.maxAffordableShares,
+  };
 }
 
 function completionSizingBlockKey(args: {
@@ -2818,16 +3036,59 @@ function completionSizingBlockKey(args: {
   ].join(":");
 }
 
+function bridgeOverfillRiskBlockKey(args: {
+  side: OutcomeSide;
+  requestedShares: number;
+  shareTarget: number;
+  estimatedTakingShares: number;
+  price: number | undefined;
+}): string {
+  return [
+    args.side,
+    normalizeShares(args.requestedShares),
+    normalizeShares(args.shareTarget),
+    normalizeShares(args.estimatedTakingShares),
+    args.price === undefined ? "NA" : Number(args.price.toFixed(4)),
+  ].join(":");
+}
+
+function pairNonExecutableBlockKey(args: {
+  selectedMode: StrategyExecutionMode;
+  upPrice: number | undefined;
+  downPrice: number | undefined;
+  upChildOrderCount: number;
+  downChildOrderCount: number;
+  upPlannedShares: number | undefined;
+  downPlannedShares: number | undefined;
+  minOrderSize: number;
+}): string {
+  return [
+    args.selectedMode,
+    args.upPrice === undefined ? "NA" : Number(args.upPrice.toFixed(4)),
+    args.downPrice === undefined ? "NA" : Number(args.downPrice.toFixed(4)),
+    args.upChildOrderCount,
+    args.downChildOrderCount,
+    args.upPlannedShares === undefined ? "NA" : normalizeShares(args.upPlannedShares),
+    args.downPlannedShares === undefined ? "NA" : normalizeShares(args.downPlannedShares),
+    normalizeShares(args.minOrderSize),
+  ].join(":");
+}
+
 function assignSequentialUsdcBalances(
   orders: MarketOrderArgs[],
   usdcBalance: number | undefined,
   config: XuanStrategyConfig,
   minOrderSize: number,
+  options: Pick<
+    Parameters<typeof fitBuyOrderToUsdcBalance>[1],
+    "allowMinMarketBuyAmountBridge" | "enforceMinMarketBuyAmountForExactShareTarget" | "maxMinMarketBuyAmountBridgeOvershootShares"
+  > = {},
 ): MarketOrderArgs[] {
   return assignAffordableSequentialUsdcBalances(orders, {
     usdcBalance,
     minOrderSize,
     sizeLadder: liveOrderSizeLadder(config, minOrderSize),
+    ...options,
   });
 }
 
@@ -2923,7 +3184,9 @@ function buildPairOrderPlan(args: {
             preferredChildShares: args.config.cloneChildPreferredShares,
           })
         : [baseOrder];
-    return assignSequentialUsdcBalances(plannedOrders, args.cachedUsdcBalance, args.config, args.minOrderSize);
+    return assignSequentialUsdcBalances(plannedOrders, args.cachedUsdcBalance, args.config, args.minOrderSize, {
+      enforceMinMarketBuyAmountForExactShareTarget: true,
+    });
   };
 
   return {
@@ -3315,6 +3578,13 @@ export async function runStatefulBotSession(
   let pendingCompletionSubmission: PendingCompletionSubmission | undefined;
   let pendingEntryRepairSubmission: PendingCompletionSubmission | undefined;
   let lastUnfillableCompletionSizingKey: string | undefined;
+  let lastBridgeOverfillRiskKey: string | undefined;
+  let lastPairNonExecutableBlock:
+    | {
+        key: string;
+        expiresAtMs: number;
+      }
+    | undefined;
   let partialOpenGroupLock: PartialOpenGroupLock | undefined;
   let runtimeProtectedResidualLock: RuntimeProtectedResidualLock | undefined;
   let arbitrationCarry: ArbitrationCarry | undefined;
@@ -5852,6 +6122,7 @@ export async function runStatefulBotSession(
       }
 
       let completionSubmittedThisTick = false;
+      let completionCostHardStopBlockedThisTick = false;
       const submitDecisionCompletion = async (submitContext: "completion_only" | "same_window_completion_first") => {
         if (!decision.completion || completionSubmittedThisTick) {
           return false;
@@ -5876,6 +6147,49 @@ export async function runStatefulBotSession(
             pendingRequestedShares: pendingCompletionSubmission?.requestedShares ?? null,
             pendingSubmittedAt: pendingCompletionSubmission?.submittedAt ?? null,
             pendingExpiresAt: pendingCompletionSubmission?.expiresAt ?? null,
+          });
+          return false;
+        }
+        if (
+          shouldBlockSmallLotExpensiveCompletion({
+            config,
+            costWithFees: decision.completion.costWithFees,
+            secsToClose: market.endTs - nowTs,
+            oldGap: decision.completion.oldGap,
+            minOrderSize: state.market.minOrderSize,
+          })
+        ) {
+          completionCostHardStopBlockedThisTick = true;
+          const hardStopCap = xuanSmallLotCompletionHardStopCap(config);
+          await traceLogger.write("orders", {
+            eventType: "completion_submit_blocked",
+            normalizedMode: `COMPLETION_${decision.completion.sideToBuy}`,
+            outcome: decision.completion.sideToBuy,
+            requestedSize: decision.completion.missingShares,
+            price: decision.completion.order.price ?? null,
+            shareTarget: decision.completion.order.shareTarget ?? null,
+            spendAmount: decision.completion.order.amount,
+            reason: "xuan_completion_cost_hard_stop",
+            effectiveCompletionCost: decision.completion.costWithFees,
+            hardStopCap,
+            oldGap: decision.completion.oldGap,
+            newGapEstimate: decision.completion.newGap,
+            capUsed: decision.completion.capMode,
+            submitContext,
+          });
+          emitLiveMirror("completion_submit_blocked", {
+            marketSlug: market.slug,
+            normalizedMode: `COMPLETION_${decision.completion.sideToBuy}`,
+            outcome: decision.completion.sideToBuy,
+            requestedSize: decision.completion.missingShares,
+            price: decision.completion.order.price ?? null,
+            shareTarget: decision.completion.order.shareTarget ?? null,
+            reason: "xuan_completion_cost_hard_stop",
+            effectiveCompletionCost: decision.completion.costWithFees,
+            hardStopCap,
+            oldGap: decision.completion.oldGap,
+            newGapEstimate: decision.completion.newGap,
+            submitContext,
           });
           return false;
         }
@@ -5917,6 +6231,60 @@ export async function runStatefulBotSession(
         }
         lastUnfillableCompletionSizingKey = undefined;
         const submittedCompletionOrder = liveOrder ?? decision.completion.order;
+        if (liveOrder && completionSizing.reason === "bridged_to_min_market_buy_amount") {
+          const overfillRisk = bridgeOrderOverfillRisk({
+            order: liveOrder,
+            outcome: decision.completion.sideToBuy,
+            books,
+            config,
+          });
+          if (overfillRisk) {
+            const blockKey = bridgeOverfillRiskBlockKey({
+              side: decision.completion.sideToBuy,
+              requestedShares: completionSizing.requestedShares ?? decision.completion.missingShares,
+              shareTarget: overfillRisk.shareTarget,
+              estimatedTakingShares: overfillRisk.estimatedTakingShares,
+              price: liveOrder.price,
+            });
+            if (lastBridgeOverfillRiskKey !== blockKey) {
+              await traceLogger.write("orders", {
+                eventType: "completion_submit_blocked",
+                normalizedMode: `COMPLETION_${decision.completion.sideToBuy}`,
+                outcome: decision.completion.sideToBuy,
+                requestedSize: completionSizing.requestedShares ?? decision.completion.missingShares,
+                price: liveOrder.price ?? null,
+                shareTarget: liveOrder.shareTarget ?? null,
+                spendAmount: liveOrder.amount,
+                reason: "bridge_overfill_risk",
+                estimatedTakingShares: overfillRisk.estimatedTakingShares,
+                estimatedExcessShares: overfillRisk.excessShares,
+                maxAllowedExcessShares: overfillRisk.maxAllowedExcessShares,
+                oldGap: decision.completion.oldGap,
+                newGapEstimate: decision.completion.newGap,
+                capUsed: decision.completion.capMode,
+                submitContext,
+              });
+              emitLiveMirror("completion_submit_blocked", {
+                marketSlug: market.slug,
+                normalizedMode: `COMPLETION_${decision.completion.sideToBuy}`,
+                outcome: decision.completion.sideToBuy,
+                requestedSize: completionSizing.requestedShares ?? decision.completion.missingShares,
+                price: liveOrder.price ?? null,
+                shareTarget: liveOrder.shareTarget ?? null,
+                reason: "bridge_overfill_risk",
+                estimatedTakingShares: overfillRisk.estimatedTakingShares,
+                estimatedExcessShares: overfillRisk.excessShares,
+                maxAllowedExcessShares: overfillRisk.maxAllowedExcessShares,
+                oldGap: decision.completion.oldGap,
+                newGapEstimate: decision.completion.newGap,
+                submitContext,
+              });
+            }
+            lastBridgeOverfillRiskKey = blockKey;
+            return false;
+          }
+        }
+        lastBridgeOverfillRiskKey = undefined;
         if (liveOrder && completionSizing.reason === "bridged_to_min_market_buy_amount") {
           await traceLogger.write("orders", {
             eventType: "completion_min_notional_bridge",
@@ -6179,6 +6547,20 @@ export async function runStatefulBotSession(
         }
       }
 
+      if (completionCostHardStopBlockedThisTick && decision.entryBuys.length > 0) {
+        await traceLogger.write("orders", {
+          eventType: "entry_submit_blocked",
+          selectedMode: decision.entryBuys[0]?.mode ?? null,
+          side: decision.entryBuys[0]?.side ?? null,
+          requestedSize: decision.entryBuys[0]?.size ?? null,
+          reason: "xuan_completion_cost_hard_stop",
+          completionOutcome: decision.completion?.sideToBuy ?? null,
+          effectiveCompletionCost: decision.completion?.costWithFees ?? null,
+        });
+        await waitForDecisionPulse();
+        continue;
+      }
+
       if (decision.entryBuys.length > 0) {
         const hasFreshEntry = decision.entryBuys.some((entryBuy) => !completionLikeEntrySubmission(entryBuy.mode));
         if (hasFreshEntry && shouldHoldFreshEntryForMergeableBasket(config, state)) {
@@ -6252,6 +6634,57 @@ export async function runStatefulBotSession(
             minOrderSize: state.market.minOrderSize,
             cachedUsdcBalance,
           });
+          const upPlannedShares = sumOrderShareTargets(orderPlanBySide.UP);
+          const downPlannedShares = sumOrderShareTargets(orderPlanBySide.DOWN);
+          if (
+            orderPlanBySide.UP.length === 0 ||
+            orderPlanBySide.DOWN.length === 0 ||
+            upPlannedShares === undefined ||
+            downPlannedShares === undefined ||
+            upPlannedShares < state.market.minOrderSize - 1e-9 ||
+            downPlannedShares < state.market.minOrderSize - 1e-9
+          ) {
+            const blockKey = pairNonExecutableBlockKey({
+              selectedMode: group.selectedMode,
+              upPrice: upEntry.order.price,
+              downPrice: downEntry.order.price,
+              upChildOrderCount: orderPlanBySide.UP.length,
+              downChildOrderCount: orderPlanBySide.DOWN.length,
+              upPlannedShares,
+              downPlannedShares,
+              minOrderSize: state.market.minOrderSize,
+            });
+            const nowMsForBlock = Date.now();
+            const repeatedBlock =
+              lastPairNonExecutableBlock?.key === blockKey &&
+              nowMsForBlock < lastPairNonExecutableBlock.expiresAtMs;
+            if (!repeatedBlock) {
+              await traceLogger.write("orders", {
+                eventType: "pair_orders_submit_blocked",
+                pairGroupId: group.groupId,
+                selectedMode: group.selectedMode,
+                orderType: group.orderType,
+                reason: "xuan_pair_child_non_executable",
+                upChildOrderCount: orderPlanBySide.UP.length,
+                downChildOrderCount: orderPlanBySide.DOWN.length,
+                upRequestedSize: upEntry.size,
+                downRequestedSize: downEntry.size,
+                upPlannedShares: upPlannedShares ?? null,
+                downPlannedShares: downPlannedShares ?? null,
+                upPrice: upEntry.order.price ?? null,
+                downPrice: downEntry.order.price ?? null,
+                minOrderSize: state.market.minOrderSize,
+              });
+            }
+            lastPairNonExecutableBlock = {
+              key: blockKey,
+              expiresAtMs: nowMsForBlock + Math.max(config.reentryDelayMs, 2_000),
+            };
+            actionCooldownUntil = Math.max(actionCooldownUntil, nowMsForBlock + Math.max(config.reentryDelayMs, 1_000));
+            await waitForDecisionPulse();
+            continue;
+          }
+          lastPairNonExecutableBlock = undefined;
           const pairChildOrderDelayMs =
             runtimeFlowCalibrationBias.childOrderMicroTimingBias === "flow_intent" ||
             decision.trace.entry.childOrderReason === "flow_intent"
@@ -6588,6 +7021,47 @@ export async function runStatefulBotSession(
               pendingRequestedShares: pendingEntryRepairSubmission?.requestedShares ?? null,
               pendingSubmittedAt: pendingEntryRepairSubmission?.submittedAt ?? null,
               pendingExpiresAt: pendingEntryRepairSubmission?.expiresAt ?? null,
+            });
+            await waitForDecisionPulse();
+            continue;
+          }
+          const closePathEvaluation = evaluateSingleLegSeedClosePath({
+            entryBuy,
+            state,
+            books,
+            config,
+            usdcBalance: cachedUsdcBalance,
+          });
+          if (closePathEvaluation.block) {
+            await traceLogger.write("orders", {
+              eventType: "entry_submit_blocked",
+              selectedMode: entryBuy.mode,
+              side: entryBuy.side,
+              requestedSize: entryBuy.size,
+              reason: "xuan_unexecutable_planned_opposite_completion",
+              closePathReason: closePathEvaluation.reason,
+              oppositeSide: closePathEvaluation.oppositeSide ?? null,
+              oppositePrice: closePathEvaluation.oppositePrice ?? null,
+              projectedMissingShares: closePathEvaluation.projectedMissingShares ?? null,
+              completionRequestedShares: closePathEvaluation.requestedShares ?? null,
+              completionFinalShares: closePathEvaluation.finalShares ?? null,
+              maxAffordableShares: closePathEvaluation.maxAffordableShares ?? null,
+              estimatedTakingShares: closePathEvaluation.estimatedTakingShares ?? null,
+              maxAllowedExcessShares: closePathEvaluation.maxAllowedExcessShares ?? null,
+              maxBridgeOvershootShares: completionMinNotionalBridgeMaxOvershootShares(config, state.market.minOrderSize),
+              minOrderSize: state.market.minOrderSize,
+            });
+            emitLiveMirror("entry_submit_blocked", {
+              marketSlug: market.slug,
+              selectedMode: entryBuy.mode,
+              outcome: entryBuy.side,
+              reason: "xuan_unexecutable_planned_opposite_completion",
+              closePathReason: closePathEvaluation.reason,
+              oppositeSide: closePathEvaluation.oppositeSide ?? null,
+              oppositePrice: closePathEvaluation.oppositePrice ?? null,
+              projectedMissingShares: closePathEvaluation.projectedMissingShares ?? null,
+              estimatedTakingShares: closePathEvaluation.estimatedTakingShares ?? null,
+              maxAllowedExcessShares: closePathEvaluation.maxAllowedExcessShares ?? null,
             });
             await waitForDecisionPulse();
             continue;

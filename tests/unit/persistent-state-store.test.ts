@@ -316,6 +316,57 @@ describe("persistent state store", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
+  it("deduplicates a websocket fill without order id against the later order result fill", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "xuan-state-"));
+    const dbPath = join(dir, "state.sqlite");
+    const market = { ...buildOfflineMarket(1713696000), feeRate: 1000 };
+    const createdAt = market.startTs + 58;
+
+    let state = createMarketState(market);
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.25,
+      size: 15.2,
+      timestamp: createdAt,
+      makerTaker: "taker",
+      executionMode: "HIGH_LOW_COMPLETION_CHASE",
+    });
+
+    const store = new PersistentStateStore(dbPath);
+    const first = store.recordFill(state, state.fillHistory[0]!, {
+      source: "USER_WS",
+      executionMode: "HIGH_LOW_COMPLETION_CHASE",
+    });
+    const second = store.recordFill(state, {
+      ...state.fillHistory[0]!,
+      timestamp: createdAt + 1,
+    }, {
+      source: "ORDER_RESULT",
+      orderId: "matched-order-late",
+      executionMode: "HIGH_LOW_COMPLETION_CHASE",
+    });
+    store.close();
+
+    const db = new DatabaseSync(dbPath);
+    const lotRows = db
+      .prepare("SELECT qty_open, source, order_id FROM inventory_lots WHERE market_slug = ? AND outcome = 'DOWN'")
+      .all(market.slug) as unknown as Array<{ qty_open: number; source: string; order_id: string | null }>;
+    db.close();
+
+    expect(first).toBe(true);
+    expect(second).toBe(false);
+    expect(lotRows).toEqual([
+      {
+        qty_open: 15.2,
+        source: "USER_WS",
+        order_id: null,
+      },
+    ]);
+
+    await rm(dir, { recursive: true, force: true });
+  });
+
   it("persists latest open partial pair group and replay validation state", async () => {
     const dir = await mkdtemp(join(tmpdir(), "xuan-state-"));
     const dbPath = join(dir, "state.sqlite");

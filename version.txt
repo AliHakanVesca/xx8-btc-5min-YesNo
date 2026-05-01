@@ -1,6 +1,17 @@
 
 ##############################################
 
+Version : V.0.0.77
+Date    : 01.05.2026
+Author  : Ali Hakan Çakır
+Changes : - Completion min-notional bridge ve bridge overfill risk guardlari eklendi.
+          - Pair child non-executable bloklama ve single-leg close-path kontrolu eklendi.
+          - Live settlement ve order sizing regresyon testleri guncellendi.
+
+##############################################
+
+##############################################
+
 Version : V.0.0.76
 Date    : 01.05.2026
 Author  : Ali Hakan Çakır

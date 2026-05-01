@@ -4,6 +4,8 @@ import { normalizeExecutableBuyOrder } from "../infra/clob/orderPrecision.js";
 const DEFAULT_FEE_CUSHION_RATIO = 0.04;
 const DEFAULT_MIN_MARKET_BUY_AMOUNT = 1;
 const USDC_DECIMALS = 6;
+const MARKET_BUY_MAKER_DECIMALS = 2;
+const MARKET_BUY_TAKER_DECIMALS = 4;
 const EPSILON = 1e-9;
 
 export interface AffordableBuyOrderOptions {
@@ -13,6 +15,7 @@ export interface AffordableBuyOrderOptions {
   sizeLadder?: number[] | undefined;
   feeCushionRatio?: number | undefined;
   allowMinMarketBuyAmountBridge?: boolean | undefined;
+  enforceMinMarketBuyAmountForExactShareTarget?: boolean | undefined;
   maxMinMarketBuyAmountBridgeOvershootShares?: number | undefined;
 }
 
@@ -53,6 +56,37 @@ function ceilToDecimals(value: number, decimals: number): number {
   }
   const factor = 10 ** decimals;
   return Number((Math.ceil((value + EPSILON) * factor) / factor).toFixed(decimals));
+}
+
+function gcd(left: number, right: number): number {
+  let a = Math.abs(Math.trunc(left));
+  let b = Math.abs(Math.trunc(right));
+  while (b !== 0) {
+    const next = a % b;
+    a = b;
+    b = next;
+  }
+  return a || 1;
+}
+
+function marketBuyShareIncrement(price: number): number {
+  const priceCents = Math.round(price * 10 ** MARKET_BUY_MAKER_DECIMALS);
+  const priceIsCentTick = Math.abs(priceCents / 10 ** MARKET_BUY_MAKER_DECIMALS - price) <= 1e-9;
+  if (!priceIsCentTick || priceCents <= 0) {
+    return 1 / 10 ** MARKET_BUY_TAKER_DECIMALS;
+  }
+  return 1 / gcd(priceCents, 10 ** MARKET_BUY_TAKER_DECIMALS);
+}
+
+function ceilToShareIncrement(value: number, increment: number): number {
+  if (!Number.isFinite(value) || value <= 0) {
+    return 0;
+  }
+  if (!Number.isFinite(increment) || increment <= 0) {
+    return ceilToDecimals(value, MARKET_BUY_TAKER_DECIMALS);
+  }
+  const units = Math.ceil((value - EPSILON) / increment);
+  return Number((units * increment).toFixed(MARKET_BUY_TAKER_DECIMALS));
 }
 
 function normalizeCandidateSizes(sizes: number[], minOrderSize: number): number[] {
@@ -105,8 +139,9 @@ function resizedBuyOrder(order: MarketOrderArgs, shareTarget: number, price: num
 }
 
 function minSharesForMarketBuyAmount(price: number, minMarketBuyAmount: number): number {
-  let shareTarget = ceilToDecimals(minMarketBuyAmount / price, 4);
-  for (let attempt = 0; attempt < 10; attempt += 1) {
+  const shareIncrement = marketBuyShareIncrement(price);
+  let shareTarget = ceilToShareIncrement(minMarketBuyAmount / price, shareIncrement);
+  for (let attempt = 0; attempt < 100; attempt += 1) {
     const normalized = normalizeExecutableBuyOrder({
       tokenId: "sizing-probe",
       side: "BUY",
@@ -116,9 +151,9 @@ function minSharesForMarketBuyAmount(price: number, minMarketBuyAmount: number):
       orderType: "FAK",
     });
     if (normalized.amount + EPSILON >= minMarketBuyAmount && normalized.shareTarget !== undefined) {
-      return normalizeShares(shareTarget);
+      return normalizeShares(normalized.shareTarget);
     }
-    shareTarget = ceilToDecimals(shareTarget + 0.0001, 4);
+    shareTarget = ceilToShareIncrement((normalized.shareTarget ?? shareTarget) + shareIncrement, shareIncrement);
   }
   return normalizeShares(shareTarget);
 }
@@ -198,7 +233,9 @@ export function fitBuyOrderToUsdcBalance(
     };
   }
 
-  if (!exactShareLimitRoutedBuy && normalizedRequestedAmount + EPSILON < minMarketBuyAmount) {
+  const shouldEnforceMinMarketBuyAmount =
+    !exactShareLimitRoutedBuy || options.enforceMinMarketBuyAmountForExactShareTarget === true;
+  if (shouldEnforceMinMarketBuyAmount && normalizedRequestedAmount + EPSILON < minMarketBuyAmount) {
     const bridgedShares = minSharesForMarketBuyAmount(price, minMarketBuyAmount);
     const bridgeOvershootShares = normalizeShares(bridgedShares - normalizedRequestedShares);
     const maxBridgeOvershootShares = Math.max(0, options.maxMinMarketBuyAmountBridgeOvershootShares ?? 0);

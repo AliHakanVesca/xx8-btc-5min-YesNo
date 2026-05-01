@@ -1,6 +1,15 @@
 
 ##############################################
 
+Version : V.0.0.78
+Date    : 01.05.2026
+Author  : Ali Hakan Çakır
+Changes : - XUAN SQLite state snapshot guncellendi.
+
+##############################################
+
+##############################################
+
 Version : V.0.0.77
 Date    : 01.05.2026
 Author  : Ali Hakan Çakır

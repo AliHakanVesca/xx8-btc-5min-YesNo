@@ -1700,6 +1700,46 @@ describe("xuan mode and pair order groups", () => {
     )).toBe(true);
   });
 
+  it("blocks fresh aggressive single-leg fallback when the opposite is visible but pair cost is not closeable", () => {
+    const market = buildOfflineMarket(1777630800);
+    const state = createMarketState(market);
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.51, size: 1000 }], [{ price: 0.52, size: 1000 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.51, size: 1000 }], [{ price: 0.52, size: 1000 }]),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+        XUAN_BASE_LOT_LADDER: "15",
+        LIVE_SMALL_LOT_LADDER: "15",
+        DEFAULT_LOT: "15",
+        ALLOW_TEMPORAL_SINGLE_LEG_SEED: "true",
+        ALLOW_XUAN_COVERED_SEED: "true",
+        ENABLE_XUAN_HARD_PAIR_SWEEP: "false",
+        ALLOW_INITIAL_NEGATIVE_PAIR_SWEEP: "false",
+        MARKET_BASKET_BOOTSTRAP_ENABLED: "false",
+        COVERED_SEED_REQUIRES_FAIR_VALUE: "false",
+        SINGLE_LEG_FAIR_VALUE_VETO: "false",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 6,
+        secsToClose: 294,
+        lot: 15,
+      },
+    );
+
+    expect(evaluation.decisions.some((decision) =>
+      decision.mode === "TEMPORAL_SINGLE_LEG_SEED" || decision.mode === "PAIRGROUP_COVERED_SEED",
+    )).toBe(false);
+    expect(evaluation.trace.selectedMode).toBe("PAIRGROUP_COVERED_SEED");
+    expect(evaluation.trace.skipReason).toBeDefined();
+  });
+
   it("waits before completing a staged borderline covered seed residual", () => {
     const market = buildOfflineMarket(1713696000);
     let state = createMarketState(market);
@@ -9065,6 +9105,98 @@ describe("xuan mode and pair order groups", () => {
 
     expect(evaluation.decisions).toHaveLength(0);
     expect(evaluation.trace.candidates?.some((candidate) => candidate.verdict === "ok")).not.toBe(true);
+  });
+
+  it("opens a two-child atomic controlled pair when both flat-side legs are executable within the small loss budget", () => {
+    const market = buildOfflineMarket(1777634700);
+    const state = createMarketState(market);
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.44, size: 200 }], [{ price: 0.45, size: 200 }]),
+      buildBook(
+        market.tokens.DOWN.tokenId,
+        market.conditionId,
+        [{ price: 0.52, size: 200 }],
+        [{ price: 0.53, size: 200 }],
+      ),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+        LIVE_SMALL_LOT_LADDER: "15",
+        XUAN_BASE_LOT_LADDER: "15",
+        DEFAULT_LOT: "15",
+        MARKET_BASKET_BOOTSTRAP_ENABLED: "false",
+        COVERED_SEED_REQUIRES_FAIR_VALUE: "false",
+        SINGLE_LEG_FAIR_VALUE_VETO: "false",
+        MAX_NEGATIVE_PAIR_EDGE_PER_CYCLE_USDC: "0.3",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 161,
+        secsToClose: 139,
+        lot: 15,
+        fairValueSnapshot: {
+          status: "valid",
+          estimatedThreshold: false,
+          fairUp: 0.5,
+          fairDown: 0.5,
+        },
+      },
+    );
+
+    expect(evaluation.decisions.map((decision) => decision.side).sort()).toEqual(["DOWN", "UP"]);
+    expect(evaluation.decisions).toHaveLength(2);
+    expect(evaluation.decisions.every((decision) => decision.size <= 15)).toBe(true);
+    expect(evaluation.trace.xuanAtomicControlledPairCycle).toBe(true);
+    expect(evaluation.trace.xuanAtomicControlledPairCap).toBeCloseTo(1.025, 6);
+    expect(evaluation.trace.negativeEdgeUsdc ?? 0).toBeGreaterThan(0);
+    expect(evaluation.trace.skipReason).not.toBe("pair_cap+single_leg_seed");
+    expect(evaluation.trace.selectedMode).not.toBe("PAIRGROUP_COVERED_SEED");
+  });
+
+  it("keeps flat atomic controlled pair closed when the bounded loss cap is exceeded", () => {
+    const market = buildOfflineMarket(1777634700);
+    const state = createMarketState(market);
+    const books = new OrderBookState(
+      buildBook(market.tokens.UP.tokenId, market.conditionId, [{ price: 0.49, size: 200 }], [{ price: 0.5, size: 200 }]),
+      buildBook(market.tokens.DOWN.tokenId, market.conditionId, [{ price: 0.56, size: 200 }], [{ price: 0.57, size: 200 }]),
+    );
+
+    const evaluation = evaluateEntryBuys(
+      buildRuntimeConfig({
+        BOT_MODE: "XUAN",
+        XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+        XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+        LIVE_SMALL_LOT_LADDER: "15",
+        XUAN_BASE_LOT_LADDER: "15",
+        DEFAULT_LOT: "15",
+        MARKET_BASKET_BOOTSTRAP_ENABLED: "false",
+        COVERED_SEED_REQUIRES_FAIR_VALUE: "false",
+        SINGLE_LEG_FAIR_VALUE_VETO: "false",
+        MAX_NEGATIVE_PAIR_EDGE_PER_CYCLE_USDC: "0.3",
+      }),
+      state,
+      books,
+      {
+        secsFromOpen: 161,
+        secsToClose: 139,
+        lot: 15,
+        fairValueSnapshot: {
+          status: "valid",
+          estimatedThreshold: false,
+          fairUp: 0.5,
+          fairDown: 0.5,
+        },
+      },
+    );
+
+    expect(evaluation.decisions).toHaveLength(0);
+    expect(evaluation.trace.xuanAtomicControlledPairCycle).not.toBe(true);
+    expect(evaluation.trace.candidates?.some((candidate) => candidate.xuanAtomicControlledPairCycle)).not.toBe(true);
   });
 
   it("blocks small post-merge paired recycle in the final seconds even when both legs are immediately fillable", () => {

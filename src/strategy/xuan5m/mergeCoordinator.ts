@@ -353,6 +353,7 @@ export function evaluateDelayedMergeGate(
     aggressivePublicFootprint &&
     fixedFiveProfileMaxLot > 0 &&
     fixedFiveProfileMaxLot <= 15 + 1e-9;
+  const fixedFiveQuickRecycleMatchedQtyCeil = fixedFiveProfileMaxLot + Math.max(state.market.minOrderSize, fixedFiveProfileMaxLot * 0.25);
   const fixedFiveQuickRecycleLossRelease =
     fixedFiveQuickRecycleProfile &&
     !exactMergePriorActive &&
@@ -360,11 +361,11 @@ export function evaluateDelayedMergeGate(
     basketEffectivePair <= Math.min(1.25, config.marketBasketMergeEffectivePairCap + 0.25) + 1e-9 &&
     metrics.completedCycles >= 1 &&
     metrics.pendingMatchedQty >= state.market.minOrderSize - 1e-9 &&
-    metrics.pendingMatchedQty <= fixedFiveProfileMaxLot + Math.max(0.5, state.market.minOrderSize * 0.1) + 1e-9 &&
+    metrics.pendingMatchedQty <= fixedFiveQuickRecycleMatchedQtyCeil + 1e-9 &&
     metrics.oldestMatchedAgeSec !== undefined &&
     metrics.oldestMatchedAgeSec >= Math.max(1, config.xuanRhythmMaxWaitSec) - 1e-9 &&
     Math.max(0, basketEffectivePair - 1) * metrics.pendingMatchedQty <=
-      Math.max(0.75, fixedFiveProfileMaxLot * 0.05) + 1e-9 &&
+      Math.max(0.75, fixedFiveQuickRecycleMatchedQtyCeil * 0.05) + 1e-9 &&
     args.secsToClose > Math.max(config.finalWindowCompletionOnlySec, 20);
   const fixedFiveStaleControlledLossRelease =
     fixedFiveQuickRecycleProfile &&
@@ -373,11 +374,11 @@ export function evaluateDelayedMergeGate(
     basketEffectivePair > config.marketBasketMergeEffectivePairCap + 1e-9 &&
     metrics.completedCycles >= 1 &&
     metrics.pendingMatchedQty >= state.market.minOrderSize - 1e-9 &&
-    metrics.pendingMatchedQty <= fixedFiveProfileMaxLot + Math.max(1, state.market.minOrderSize * 0.1) + 1e-9 &&
+    metrics.pendingMatchedQty <= fixedFiveQuickRecycleMatchedQtyCeil + 1e-9 &&
     metrics.oldestMatchedAgeSec !== undefined &&
     metrics.oldestMatchedAgeSec >= Math.max(15, config.xuanRhythmMaxWaitSec) - 1e-9 &&
     Math.max(0, basketEffectivePair - 1) * metrics.pendingMatchedQty <=
-      Math.max(1.25, fixedFiveProfileMaxLot * 0.35) + 1e-9 &&
+      Math.max(1.25, fixedFiveQuickRecycleMatchedQtyCeil * 0.35) + 1e-9 &&
     args.secsToClose > Math.max(config.finalWindowCompletionOnlySec, 30);
   const shouldHoldNegativeEconomics =
     aggressiveNormalRecycleNegativeEconomicsHold &&

@@ -126,6 +126,81 @@ describe("merge coordinator", () => {
     expect(gate.basketEffectivePair).toBeGreaterThan(1);
   });
 
+  it("does not let bounded overfill push a 15-share Xuan recycle basket out of quick merge release", () => {
+    const config = buildConfig({
+      BOT_MODE: "XUAN",
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+      XUAN_BASE_LOT_LADDER: "15",
+      LIVE_SMALL_LOT_LADDER: "15",
+      DEFAULT_LOT: "15",
+      MARKET_BASKET_MIN_MERGE_SHARES: "40",
+      MARKET_BASKET_MERGE_TARGET_MULTIPLIER: "3",
+      MARKET_BASKET_MERGE_TARGET_MAX_SHARES: "900",
+      MARKET_BASKET_MERGE_EFFECTIVE_PAIR_CAP: "1",
+      MERGE_BATCH_MODE: "HYBRID_DELAYED",
+      XUAN_RHYTHM_MAX_WAIT_SEC: "1",
+    });
+    const market = buildOfflineMarket(1713696000);
+    let state = createMarketState(market);
+    state = applyMerge(
+      applyFill(
+        applyFill(state, {
+          outcome: "UP",
+          side: "BUY",
+          price: 0.4,
+          size: 15,
+          timestamp: market.startTs + 5,
+          makerTaker: "taker",
+          executionMode: "PAIRGROUP_COVERED_SEED",
+        }),
+        {
+          outcome: "DOWN",
+          side: "BUY",
+          price: 0.55,
+          size: 15,
+          timestamp: market.startTs + 8,
+          makerTaker: "taker",
+          executionMode: "PARTIAL_FAST_COMPLETION",
+        },
+      ),
+      { amount: 15, timestamp: market.startTs + 20, simulated: true },
+    );
+    state = applyFill(state, {
+      outcome: "UP",
+      side: "BUY",
+      price: 0.41,
+      size: 16.925482,
+      timestamp: market.startTs + 160,
+      makerTaker: "taker",
+      executionMode: "PAIRGROUP_COVERED_SEED",
+    });
+    state = applyFill(state, {
+      outcome: "DOWN",
+      side: "BUY",
+      price: 0.6,
+      size: 16.925482,
+      timestamp: market.startTs + 161,
+      makerTaker: "taker",
+      executionMode: "PARTIAL_FAST_COMPLETION",
+    });
+    let tracker = createMergeBatchTracker();
+    tracker = syncMergeBatchTracker(tracker, 16.925482, market.startTs + 161);
+
+    const gate = evaluateDelayedMergeGate(config, state, {
+      nowTs: market.startTs + 172,
+      secsFromOpen: 172,
+      secsToClose: 128,
+      usdcBalance: 100,
+      tracker,
+    });
+
+    expect(config.mergeBatchMode).toBe("IMMEDIATE");
+    expect(gate.allow).toBe(true);
+    expect(gate.reason).toBe("cycle_target");
+    expect(gate.pendingMatchedQty).toBeCloseTo(16.925482, 6);
+  });
+
   it("does not immediately realize a fixed 5/5 basket with negative effective economics", () => {
     const config = buildConfig({
       BOT_MODE: "XUAN",

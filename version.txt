@@ -1,6 +1,17 @@
 
 ##############################################
 
+Version : V.0.0.79
+Date    : 02.05.2026
+Author  : Ali Hakan Çakır
+Changes : - XUAN atomic controlled pair cycle davranisi eklendi.
+          - Small-lot recycle merge toleransi bounded overfill icin genisletildi.
+          - Atomic pair ve merge regresyon testleri eklendi.
+
+##############################################
+
+##############################################
+
 Version : V.0.0.78
 Date    : 01.05.2026
 Author  : Ali Hakan Çakır

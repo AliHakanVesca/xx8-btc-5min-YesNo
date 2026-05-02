@@ -36,6 +36,7 @@ import {
   inferImmediateOrderResultFill,
   inferUserTradeFill,
   isNonBlockingOrderResultOverfillDust,
+  orderPairEntriesForPublicFootprint,
   orderResultOverfillDustThreshold,
   postMergeReentryResidualThreshold,
   postMergeResidualBlocksReentry,
@@ -46,6 +47,7 @@ import {
   shouldAllowControlledOverlap,
   shouldRegisterSubmittedIntentForResult,
   shouldPreserveCarryDrivenOverlap,
+  terminalBotOwnedCorrectionSuppressReason,
 } from "../../src/live/statefulBotSession.js";
 
 function buildConfig(overrides: Record<string, string> = {}) {
@@ -189,6 +191,42 @@ describe("stateful bot session helpers", () => {
     expect(evaluation.finalShares).toBe(12.5);
   });
 
+  it("blocks aggressive strict Xuan single-leg seed when the planned opposite is executable but not closeable by pair cost", () => {
+    const config = buildConfig({
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+      LIVE_SMALL_LOT_LADDER: "15",
+      XUAN_BASE_LOT_LADDER: "15",
+      DEFAULT_LOT: "15",
+    });
+    const state = createMarketState(buildOfflineMarket(1713696000));
+
+    const evaluation = evaluateSingleLegSeedClosePath({
+      config,
+      state,
+      books: booksWithAsks(0.52, 0.52),
+      usdcBalance: 100,
+      entryBuy: {
+        side: "DOWN",
+        size: 15,
+        mode: "TEMPORAL_SINGLE_LEG_SEED",
+        order: {
+          tokenId: state.market.tokens.DOWN.tokenId,
+          side: "BUY",
+          price: 0.52,
+          amount: 7.8,
+          shareTarget: 15,
+          orderType: "FAK",
+        },
+      },
+    });
+
+    expect(evaluation.block).toBe(true);
+    expect(evaluation.reason).toBe("opposite_completion_pair_cost_cap");
+    expect(evaluation.oppositeSide).toBe("UP");
+    expect(evaluation.projectedPairCost ?? 0).toBeGreaterThan(evaluation.closeablePairCostCap ?? 0);
+  });
+
   it("detects bridge completion raw-fill overrun risk from executable book depth", () => {
     const market = buildOfflineMarket(1713696000);
     const estimatedTakingShares = estimateMarketBuyTakingSharesForOrder({
@@ -205,6 +243,96 @@ describe("stateful bot session helpers", () => {
     });
 
     expect(estimatedTakingShares).toBe(20.4);
+  });
+
+  it("does not let tiny post-merge dust make Xuan pair sweep send the expensive child first", () => {
+    const market = buildOfflineMarket(1713696000);
+    const upEntry = {
+      side: "UP",
+      size: 15,
+      mode: "XUAN_SOFT_PAIR_SWEEP",
+      order: {
+        tokenId: market.tokens.UP.tokenId,
+        side: "BUY",
+        price: 0.09,
+        amount: 1.35,
+        shareTarget: 15,
+        orderType: "FAK",
+      },
+    } as any;
+    const downEntry = {
+      side: "DOWN",
+      size: 15,
+      mode: "XUAN_SOFT_PAIR_SWEEP",
+      order: {
+        tokenId: market.tokens.DOWN.tokenId,
+        side: "BUY",
+        price: 0.92,
+        amount: 13.8,
+        shareTarget: 15,
+        orderType: "FAK",
+      },
+    } as any;
+
+    const ordered = orderPairEntriesForPublicFootprint({
+      config: { botMode: "XUAN", xuanCloneMode: "PUBLIC_FOOTPRINT" },
+      state: { upShares: 0.51, downShares: 0.451175 },
+      group: { selectedMode: "XUAN_SOFT_PAIR_SWEEP" },
+      groupedEntries: [downEntry, upEntry],
+      controlledOverlapActive: false,
+      missingSide: "DOWN",
+      minOrderSize: 5,
+    });
+
+    expect(ordered.map((entry) => entry.side)).toEqual(["UP", "DOWN"]);
+  });
+
+  it("suppresses false external halt when a terminal wallet collapse consumes a persisted bot-owned lot", () => {
+    const config = buildConfig({
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+      POST_MERGE_FLAT_DUST_SHARES: "0.25",
+    });
+    const state = createMarketState(buildOfflineMarket(1713696000));
+
+    const reason = terminalBotOwnedCorrectionSuppressReason({
+      config,
+      state,
+      books: booksWithAsks(0.99, 0.03),
+      correction: {
+        outcome: "DOWN",
+        fromShares: 15.294116,
+        toShares: 0.004116,
+      },
+      persistedConsumedQty: 15.29,
+      botOwnedCorrection: false,
+    });
+
+    expect(reason).toBe("terminal_bot_owned_wallet_collapse");
+  });
+
+  it("does not suppress mid-market balance shrink as a terminal bot-owned wallet collapse", () => {
+    const config = buildConfig({
+      XUAN_CLONE_MODE: "PUBLIC_FOOTPRINT",
+      XUAN_CLONE_INTENSITY: "AGGRESSIVE",
+      POST_MERGE_FLAT_DUST_SHARES: "0.25",
+    });
+    const state = createMarketState(buildOfflineMarket(1713696000));
+
+    const reason = terminalBotOwnedCorrectionSuppressReason({
+      config,
+      state,
+      books: booksWithAsks(0.51, 0.5),
+      correction: {
+        outcome: "DOWN",
+        fromShares: 15,
+        toShares: 0,
+      },
+      persistedConsumedQty: 15,
+      botOwnedCorrection: false,
+    });
+
+    expect(reason).toBeUndefined();
   });
 
   it("counts duration from market open when the selected market has not started yet", () => {

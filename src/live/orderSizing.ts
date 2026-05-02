@@ -223,7 +223,40 @@ export function fitBuyOrderToUsdcBalance(
   const requestedCost = orderCostWithCushion(normalizedRequestedAmount, feeCushionRatio);
   const maxAffordableShares = normalizeShares(usdcBalance / (price * (1 + Math.max(0, feeCushionRatio))));
 
+  const shouldEnforceMinMarketBuyAmount =
+    !exactShareLimitRoutedBuy || options.enforceMinMarketBuyAmountForExactShareTarget === true;
   if (normalizedRequestedShares + EPSILON < minOrderSize) {
+    if (options.allowMinMarketBuyAmountBridge === true) {
+      const minNotionalShares = shouldEnforceMinMarketBuyAmount
+        ? minSharesForMarketBuyAmount(price, minMarketBuyAmount)
+        : 0;
+      const bridgedShares = normalizeShares(Math.max(minOrderSize, minNotionalShares));
+      const bridgeOvershootShares = normalizeShares(bridgedShares - normalizedRequestedShares);
+      const maxBridgeOvershootShares = Math.max(0, options.maxMinMarketBuyAmountBridgeOvershootShares ?? 0);
+      if (
+        bridgedShares >= minOrderSize - EPSILON &&
+        bridgedShares <= maxAffordableShares + EPSILON &&
+        bridgeOvershootShares <= maxBridgeOvershootShares + EPSILON
+      ) {
+        const bridgedOrder = withUserUsdcBalance(
+          normalizeExecutableBuyOrder({
+            ...order,
+            amount: normalizeAmount(bridgedShares * price),
+            shareTarget: bridgedShares,
+          }),
+          usdcBalance,
+        );
+        return {
+          order: bridgedOrder,
+          requestedShares: normalizedRequestedShares,
+          finalShares: normalizeShares(bridgedOrder.shareTarget ?? bridgedShares),
+          maxAffordableShares,
+          adjusted: true,
+          skipped: false,
+          reason: "bridged_to_min_market_buy_amount",
+        };
+      }
+    }
     return {
       requestedShares: normalizedRequestedShares,
       maxAffordableShares,
@@ -233,8 +266,6 @@ export function fitBuyOrderToUsdcBalance(
     };
   }
 
-  const shouldEnforceMinMarketBuyAmount =
-    !exactShareLimitRoutedBuy || options.enforceMinMarketBuyAmountForExactShareTarget === true;
   if (shouldEnforceMinMarketBuyAmount && normalizedRequestedAmount + EPSILON < minMarketBuyAmount) {
     const bridgedShares = minSharesForMarketBuyAmount(price, minMarketBuyAmount);
     const bridgeOvershootShares = normalizeShares(bridgedShares - normalizedRequestedShares);

@@ -134,6 +134,54 @@ describe("live order sizing", () => {
     expect(result.order).toBeUndefined();
   });
 
+  it("bridges the live 15 share at 5 cent repair to the one-dollar floor when overshoot is one CLOB minimum", () => {
+    const result = fitBuyOrderToUsdcBalance(
+      buyOrder({
+        price: 0.05,
+        amount: 0.75,
+        shareTarget: 15,
+      }),
+      {
+        usdcBalance: 10,
+        minOrderSize: 5,
+        sizeLadder: [15],
+        allowMinMarketBuyAmountBridge: true,
+        enforceMinMarketBuyAmountForExactShareTarget: true,
+        maxMinMarketBuyAmountBridgeOvershootShares: 5,
+      },
+    );
+
+    expect(result.skipped).toBe(false);
+    expect(result.reason).toBe("bridged_to_min_market_buy_amount");
+    expect(result.requestedShares).toBe(15);
+    expect(result.order?.amount).toBe(1);
+    expect(result.order?.shareTarget).toBe(20);
+  });
+
+  it("bridges sub-minimum residual repairs to the CLOB minimum when bounded", () => {
+    const result = fitBuyOrderToUsdcBalance(
+      buyOrder({
+        price: 0.4,
+        amount: 1.004378,
+        shareTarget: 2.510945,
+      }),
+      {
+        usdcBalance: 10,
+        minOrderSize: 5,
+        sizeLadder: [15, 5],
+        allowMinMarketBuyAmountBridge: true,
+        enforceMinMarketBuyAmountForExactShareTarget: true,
+        maxMinMarketBuyAmountBridgeOvershootShares: 5,
+      },
+    );
+
+    expect(result.skipped).toBe(false);
+    expect(result.reason).toBe("bridged_to_min_market_buy_amount");
+    expect(result.requestedShares).toBe(2.5);
+    expect(result.order?.shareTarget).toBe(5);
+    expect(result.order?.amount).toBe(2);
+  });
+
   it("blocks the live 11.5 share at 4 cent completion instead of sending a sub-dollar CLOB order", () => {
     const result = fitBuyOrderToUsdcBalance(
       buyOrder({

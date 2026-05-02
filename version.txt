@@ -1,6 +1,17 @@
 
 ##############################################
 
+Version : V.0.0.80
+Date    : 02.05.2026
+Author  : Ali Hakan Çakır
+Changes : - Sub-min residual completion bridge min market buy floor ile genisletildi.
+          - Strict XUAN single-leg close-path ve terminal wallet collapse guardlari eklendi.
+          - Live submit block loglari dedupe edilip regresyon testleri guncellendi.
+
+##############################################
+
+##############################################
+
 Version : V.0.0.79
 Date    : 02.05.2026
 Author  : Ali Hakan Çakır

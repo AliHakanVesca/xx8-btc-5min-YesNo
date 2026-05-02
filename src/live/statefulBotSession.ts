@@ -52,9 +52,12 @@ import {
   syncMergeBatchTracker,
 } from "../strategy/xuan5m/mergeCoordinator.js";
 import {
+  isAggressivePublicFootprint,
   shouldBlockSmallLotExpensiveCompletion,
+  strictXuanCloseablePairCostCap,
   xuanSmallLotCompletionHardStopCap,
 } from "../strategy/xuan5m/xuanStrictPlannedOppositePolicy.js";
+import { pairCostWithBothTaker } from "../strategy/xuan5m/sumAvgEngine.js";
 import {
   classifyFlowPressureBudget,
   classifyResidualSeverity,
@@ -2792,7 +2795,7 @@ function fitOrderToAvailableUsdcBalance(
 
 function completionMinNotionalBridgeMaxOvershootShares(config: XuanStrategyConfig, minOrderSize: number): number {
   const baseLot = Math.max(config.liveSmallLotLadder[0] ?? config.defaultLot, config.defaultLot, minOrderSize);
-  return normalizeShares(Math.max(config.maxCompletionOvershootShares, baseLot * 0.25));
+  return normalizeShares(Math.max(config.maxCompletionOvershootShares, minOrderSize, baseLot * 0.25));
 }
 
 function fitCompletionOrderToAvailableUsdcBalance(
@@ -2908,10 +2911,13 @@ export interface SingleLegSeedClosePathEvaluation {
     | "no_projected_gap"
     | "missing_opposite_price"
     | "opposite_completion_executable"
+    | "opposite_completion_pair_cost_cap"
     | "opposite_completion_overfill_risk"
     | ReturnType<typeof fitBuyOrderToUsdcBalance>["reason"];
   oppositeSide?: OutcomeSide | undefined;
   oppositePrice?: number | undefined;
+  projectedPairCost?: number | undefined;
+  closeablePairCostCap?: number | undefined;
   projectedMissingShares?: number | undefined;
   requestedShares?: number | undefined;
   finalShares?: number | undefined;
@@ -2925,7 +2931,8 @@ function strictXuanSingleLegSeedMode(mode: StrategyExecutionMode): boolean {
 }
 
 export function evaluateSingleLegSeedClosePath(args: {
-  entryBuy: Pick<EntryBuyDecision, "mode" | "order" | "side" | "size">;
+  entryBuy: Pick<EntryBuyDecision, "mode" | "order" | "side" | "size"> &
+    Partial<Pick<EntryBuyDecision, "expectedAveragePrice" | "pairCostWithFees">>;
   state: XuanMarketState;
   books: OrderBookState;
   config: XuanStrategyConfig;
@@ -2968,6 +2975,49 @@ export function evaluateSingleLegSeedClosePath(args: {
       projectedMissingShares,
       requestedShares: seedShares,
     };
+  }
+
+  if (isAggressivePublicFootprint(args.config)) {
+    const orderSeedPrice = args.entryBuy.order.price;
+    const seedPrice =
+      args.entryBuy.expectedAveragePrice !== undefined &&
+      Number.isFinite(args.entryBuy.expectedAveragePrice) &&
+      args.entryBuy.expectedAveragePrice > 0
+        ? args.entryBuy.expectedAveragePrice
+        : orderSeedPrice !== undefined && Number.isFinite(orderSeedPrice) && orderSeedPrice > 0
+          ? orderSeedPrice
+          : args.books.bestAsk(args.entryBuy.side);
+    const projectedPairCost =
+      args.entryBuy.pairCostWithFees !== undefined &&
+      Number.isFinite(args.entryBuy.pairCostWithFees) &&
+      args.entryBuy.pairCostWithFees > 0
+        ? args.entryBuy.pairCostWithFees
+        : pairCostWithBothTaker(
+            args.entryBuy.side === "UP" ? seedPrice : oppositePrice,
+            args.entryBuy.side === "DOWN" ? seedPrice : oppositePrice,
+            args.config.cryptoTakerFeeRate,
+          );
+    const closeablePairCostCap = strictXuanCloseablePairCostCap(args.config);
+    const strongDirectionalCheapSeed =
+      seedPrice <= oppositePrice + 1e-9 &&
+      seedPrice <= 0.35 + 1e-9 &&
+      Math.abs(seedPrice - oppositePrice) >= 0.18 - 1e-9;
+    if (
+      Number.isFinite(projectedPairCost) &&
+      projectedPairCost > closeablePairCostCap + 1e-9 &&
+      !strongDirectionalCheapSeed
+    ) {
+      return {
+        block: true,
+        reason: "opposite_completion_pair_cost_cap",
+        oppositeSide,
+        oppositePrice,
+        projectedPairCost,
+        closeablePairCostCap,
+        projectedMissingShares,
+        requestedShares: seedShares,
+      };
+    }
   }
 
   const probeBalance =
@@ -3020,6 +3070,45 @@ export function evaluateSingleLegSeedClosePath(args: {
     finalShares: completionSizing.finalShares,
     maxAffordableShares: completionSizing.maxAffordableShares,
   };
+}
+
+export function terminalBotOwnedCorrectionSuppressReason(args: {
+  config: Pick<XuanStrategyConfig, "botMode" | "xuanCloneMode" | "xuanCloneIntensity" | "postMergeFlatDustShares">;
+  state: XuanMarketState;
+  books: OrderBookState;
+  correction: BalanceCorrection;
+  persistedConsumedQty?: number | null | undefined;
+  botOwnedCorrection: boolean;
+}): "terminal_bot_owned_wallet_collapse" | undefined {
+  if (args.botOwnedCorrection || !isAggressivePublicFootprint(args.config)) {
+    return undefined;
+  }
+  const shortfall = Number((args.correction.fromShares - args.correction.toShares).toFixed(6));
+  if (shortfall <= 1e-6) {
+    return undefined;
+  }
+  const persistedConsumedQty =
+    args.persistedConsumedQty !== undefined && args.persistedConsumedQty !== null
+      ? Number(args.persistedConsumedQty)
+      : 0;
+  const consumedTolerance = Math.max(0.5, shortfall * 0.08);
+  if (persistedConsumedQty + consumedTolerance < shortfall) {
+    return undefined;
+  }
+  const remainingDustLimit = Math.max(args.config.postMergeFlatDustShares, args.state.market.minOrderSize * 0.01, 0.05);
+  if (args.correction.toShares > remainingDustLimit + 1e-9) {
+    return undefined;
+  }
+  const oppositeSide: OutcomeSide = args.correction.outcome === "UP" ? "DOWN" : "UP";
+  const ownAsk = args.books.bestAsk(args.correction.outcome);
+  const oppositeAsk = args.books.bestAsk(oppositeSide);
+  const ownSideTerminal = Number.isFinite(ownAsk) && ownAsk > 0 && ownAsk <= 0.05 + 1e-9;
+  const oppositeSideTerminal =
+    Number.isFinite(oppositeAsk) && oppositeAsk > 0 && oppositeAsk < 1 - 1e-9 && oppositeAsk >= 0.95 - 1e-9;
+  if (!ownSideTerminal && !oppositeSideTerminal) {
+    return undefined;
+  }
+  return "terminal_bot_owned_wallet_collapse";
 }
 
 function completionSizingBlockKey(args: {
@@ -3278,22 +3367,25 @@ function pairExecutionSideOrder(orderedEntries: EntryBuyDecision[]): OutcomeSide
   return sides.length > 0 ? sides : ["UP", "DOWN"];
 }
 
-function orderPairEntriesForPublicFootprint(args: {
+export function orderPairEntriesForPublicFootprint(args: {
   config: Pick<XuanStrategyConfig, "botMode" | "xuanCloneMode">;
   state: Pick<XuanMarketState, "upShares" | "downShares">;
   group: Pick<PairOrderGroup, "selectedMode">;
   groupedEntries: EntryBuyDecision[];
   controlledOverlapActive: boolean;
   missingSide: OutcomeSide;
+  minOrderSize: number;
 }): EntryBuyDecision[] {
   if (args.group.selectedMode === "PAIRGROUP_COVERED_SEED") {
     return args.groupedEntries;
   }
+  const residualImbalance = Math.abs(args.state.upShares - args.state.downShares);
+  const materialResidualForSidePriority = residualImbalance >= Math.max(args.minOrderSize, 1) - 1e-9;
   const shouldPrioritizeSide =
     args.controlledOverlapActive ||
     (args.config.botMode === "XUAN" &&
       args.config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
-      Math.abs(args.state.upShares - args.state.downShares) > 1e-6);
+      materialResidualForSidePriority);
   if (!shouldPrioritizeSide) {
     if (args.config.botMode === "XUAN" && args.config.xuanCloneMode === "PUBLIC_FOOTPRINT") {
       return [...args.groupedEntries].sort((left, right) => {
@@ -3585,6 +3677,7 @@ export async function runStatefulBotSession(
         expiresAtMs: number;
       }
     | undefined;
+  const entrySubmitBlockedDedupe = new Map<string, { lastWriteMs: number; suppressedCount: number }>();
   let partialOpenGroupLock: PartialOpenGroupLock | undefined;
   let runtimeProtectedResidualLock: RuntimeProtectedResidualLock | undefined;
   let arbitrationCarry: ArbitrationCarry | undefined;
@@ -3622,6 +3715,33 @@ export async function runStatefulBotSession(
       `SAFE_HALT aktif (${persistedSafeHalt.reason ?? "external_activity"}). Once npm run inventory:reconcile, sonra npm run inventory:report, en son npm run bot:resume --confirm calistir.`,
     );
   }
+
+  const writeEntrySubmitBlocked = async (payload: Record<string, unknown>): Promise<void> => {
+    const requestedSize =
+      typeof payload.requestedSize === "number" && Number.isFinite(payload.requestedSize)
+        ? Number(payload.requestedSize.toFixed(6))
+        : payload.requestedSize ?? null;
+    const key = JSON.stringify([
+      market.slug,
+      payload.reason ?? null,
+      payload.closePathReason ?? null,
+      payload.selectedMode ?? null,
+      payload.side ?? null,
+      requestedSize,
+    ]);
+    const nowMs = Date.now();
+    const existing = entrySubmitBlockedDedupe.get(key);
+    if (existing && nowMs - existing.lastWriteMs < 5000) {
+      existing.suppressedCount += 1;
+      return;
+    }
+    const suppressedCount = existing?.suppressedCount ?? 0;
+    entrySubmitBlockedDedupe.set(key, { lastWriteMs: nowMs, suppressedCount: 0 });
+    await traceLogger.write("orders", {
+      ...payload,
+      ...(suppressedCount > 0 ? { dedupeSuppressedCount: suppressedCount } : {}),
+    });
+  };
 
   const persistDailyBudget = (nextState: XuanMarketState): void => {
     stateStore.upsertRiskBudget({
@@ -4899,6 +5019,14 @@ export async function runStatefulBotSession(
         correction.toShares,
         args.nowTs,
       );
+      const suppressedExternalActivityReason = terminalBotOwnedCorrectionSuppressReason({
+        config,
+        state,
+        books: args.books,
+        correction,
+        persistedConsumedQty: persistedShrink?.consumedQty,
+        botOwnedCorrection,
+      });
       pushEvent(events, {
         timestamp: args.nowTs,
         type: "balance_sync_correction",
@@ -4917,9 +5045,11 @@ export async function runStatefulBotSession(
         persistedFromShares: persistedShrink?.fromShares ?? null,
         persistedToShares: persistedShrink?.toShares ?? null,
         persistedConsumedQty: persistedShrink?.consumedQty ?? null,
+        suppressedExternalActivityReason: suppressedExternalActivityReason ?? null,
       });
       if (
         !botOwnedCorrection &&
+        suppressedExternalActivityReason === undefined &&
         config.blockNewEntryOnExternalActivity &&
         correction.toShares + 1e-6 < correction.fromShares
       ) {
@@ -6533,7 +6663,7 @@ export async function runStatefulBotSession(
           decision.entryBuys.length > 0 &&
           shouldHoldRuntimeEntryForMergeFirstAfterCompletion(config, state, nowTs)
         ) {
-          await traceLogger.write("orders", {
+          await writeEntrySubmitBlocked({
             eventType: "entry_submit_blocked",
             selectedMode: decision.entryBuys[0]?.mode ?? null,
             side: decision.entryBuys[0]?.side ?? null,
@@ -6548,7 +6678,7 @@ export async function runStatefulBotSession(
       }
 
       if (completionCostHardStopBlockedThisTick && decision.entryBuys.length > 0) {
-        await traceLogger.write("orders", {
+        await writeEntrySubmitBlocked({
           eventType: "entry_submit_blocked",
           selectedMode: decision.entryBuys[0]?.mode ?? null,
           side: decision.entryBuys[0]?.side ?? null,
@@ -6564,7 +6694,7 @@ export async function runStatefulBotSession(
       if (decision.entryBuys.length > 0) {
         const hasFreshEntry = decision.entryBuys.some((entryBuy) => !completionLikeEntrySubmission(entryBuy.mode));
         if (hasFreshEntry && shouldHoldFreshEntryForMergeableBasket(config, state)) {
-          await traceLogger.write("orders", {
+          await writeEntrySubmitBlocked({
             eventType: "entry_submit_blocked",
             selectedMode: decision.entryBuys[0]?.mode ?? null,
             side: decision.entryBuys[0]?.side ?? null,
@@ -6622,6 +6752,7 @@ export async function runStatefulBotSession(
             groupedEntries,
             controlledOverlapActive,
             missingSide,
+            minOrderSize: state.market.minOrderSize,
           });
           const groupedEntryBySide = {
             UP: groupedEntries.find((entryBuy) => entryBuy.side === "UP")!,
@@ -6981,6 +7112,28 @@ export async function runStatefulBotSession(
           if (!rawEntryBuy) {
             throw new Error("Expected a single entry buy decision.");
           }
+          if (
+            config.botMode === "XUAN" &&
+            config.xuanCloneMode === "PUBLIC_FOOTPRINT" &&
+            rawEntryBuy.mode === "PAIRGROUP_COVERED_SEED"
+          ) {
+            await writeEntrySubmitBlocked({
+              eventType: "entry_submit_blocked",
+              selectedMode: rawEntryBuy.mode,
+              side: rawEntryBuy.side,
+              requestedSize: rawEntryBuy.size,
+              reason: "xuan_pairgroup_requires_two_executable_children",
+              minOrderSize: state.market.minOrderSize,
+            });
+            emitLiveMirror("entry_submit_blocked", {
+              marketSlug: market.slug,
+              selectedMode: rawEntryBuy.mode,
+              outcome: rawEntryBuy.side,
+              reason: "xuan_pairgroup_requires_two_executable_children",
+            });
+            await waitForDecisionPulse();
+            continue;
+          }
           if (pendingEntryRepairSubmission && nowTs > pendingEntryRepairSubmission.expiresAt) {
             pendingEntryRepairSubmission = undefined;
           }
@@ -7011,7 +7164,7 @@ export async function runStatefulBotSession(
               nowTs,
             })
           ) {
-            await traceLogger.write("orders", {
+            await writeEntrySubmitBlocked({
               eventType: "entry_submit_blocked",
               selectedMode: entryBuy.mode,
               side: entryBuy.side,
@@ -7033,7 +7186,7 @@ export async function runStatefulBotSession(
             usdcBalance: cachedUsdcBalance,
           });
           if (closePathEvaluation.block) {
-            await traceLogger.write("orders", {
+            await writeEntrySubmitBlocked({
               eventType: "entry_submit_blocked",
               selectedMode: entryBuy.mode,
               side: entryBuy.side,
@@ -7042,6 +7195,8 @@ export async function runStatefulBotSession(
               closePathReason: closePathEvaluation.reason,
               oppositeSide: closePathEvaluation.oppositeSide ?? null,
               oppositePrice: closePathEvaluation.oppositePrice ?? null,
+              projectedPairCost: closePathEvaluation.projectedPairCost ?? null,
+              closeablePairCostCap: closePathEvaluation.closeablePairCostCap ?? null,
               projectedMissingShares: closePathEvaluation.projectedMissingShares ?? null,
               completionRequestedShares: closePathEvaluation.requestedShares ?? null,
               completionFinalShares: closePathEvaluation.finalShares ?? null,
@@ -7059,6 +7214,8 @@ export async function runStatefulBotSession(
               closePathReason: closePathEvaluation.reason,
               oppositeSide: closePathEvaluation.oppositeSide ?? null,
               oppositePrice: closePathEvaluation.oppositePrice ?? null,
+              projectedPairCost: closePathEvaluation.projectedPairCost ?? null,
+              closeablePairCostCap: closePathEvaluation.closeablePairCostCap ?? null,
               projectedMissingShares: closePathEvaluation.projectedMissingShares ?? null,
               estimatedTakingShares: closePathEvaluation.estimatedTakingShares ?? null,
               maxAllowedExcessShares: closePathEvaluation.maxAllowedExcessShares ?? null,
